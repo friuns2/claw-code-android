@@ -111,8 +111,20 @@ jobs:
           python3 << 'PYEOF'
           import json, re, html, urllib.request, sys
           from datetime import datetime
+          from urllib.error import HTTPError
 
-          resp = urllib.request.urlopen("https://api.github.com/repos/instructkr/claw-code/releases/latest")
+          try:
+              req = urllib.request.Request(
+                  "https://api.github.com/repos/instructkr/claw-code/releases/latest",
+                  headers={"User-Agent": "claw-code-android-sync"}
+              )
+              resp = urllib.request.urlopen(req)
+          except HTTPError as e:
+              if e.code == 404:
+                  print("No releases found upstream, skipping.")
+                  sys.exit(0)
+              raise
+
           rel = json.loads(resp.read())
 
           name = rel.get("name", "")
@@ -173,6 +185,11 @@ jobs:
             {body_html}
             </div>
             <!-- RELEASE_END -->"""
+
+          import os
+          if not os.path.exists("docs/index.html"):
+              print("docs/index.html not found, skipping.")
+              sys.exit(0)
 
           with open("docs/index.html", "r") as f:
               content = f.read()
