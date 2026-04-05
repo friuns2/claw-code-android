@@ -22,7 +22,7 @@ jobs:
       - name: Sync upstream into main
         run: |
           git config --global user.name 'friuns2'
-          git config --global user.email 'nickolay.nickolay@gmail.com'
+          git config --global user.email 'soulkey4@gmail.com'
 
           git remote add upstream https://github.com/instructkr/claw-code.git
           git fetch upstream
@@ -209,7 +209,7 @@ jobs:
           PYEOF
 
           git config --global user.name 'friuns2'
-          git config --global user.email 'nickolay.nickolay@gmail.com'
+          git config --global user.email 'soulkey4@gmail.com'
 
           git add docs/index.html
           if git diff --cached --quiet; then
