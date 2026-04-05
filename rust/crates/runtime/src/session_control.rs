@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::struct_excessive_bools,
+    clippy::too_many_lines,
+    clippy::question_mark,
+    clippy::redundant_closure,
+    clippy::map_unwrap_or
+)]
 //! In-memory worker-boot state machine and control registry.
 //!
 //! This provides a foundational control plane for reliable worker startup:

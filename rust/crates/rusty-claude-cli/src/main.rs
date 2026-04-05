@@ -24,32 +24,34 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
-    handle_agents_slash_command, handle_mcp_slash_command, handle_plugins_slash_command,
-    handle_skills_slash_command, render_slash_command_help, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SlashCommand,
+    handle_agents_slash_command, handle_mcp_slash_command, handle_mcp_slash_command_json,
+    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
+    render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
+    validate_slash_command_input, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state, load_system_prompt,
-    parse_oauth_callback_request_target, pricing_for_model, resolve_sandbox_status,
-    save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager,
-    McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state,
+    load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
+    pricing_for_model, resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest,
+    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
+    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -87,6 +89,10 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
 ];
 
 type AllowedToolSet = BTreeSet<String>;
+type RuntimePluginStateBuildOutput = (
+    Option<Arc<Mutex<RuntimeMcpState>>>,
+    Vec<RuntimeToolDefinition>,
+);
 
 fn main() {
     if let Err(error) = run() {
@@ -107,13 +113,26 @@ Run `claw --help` for usage."
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
-        CliAction::DumpManifests => dump_manifests(),
-        CliAction::BootstrapPlan => print_bootstrap_plan(),
-        CliAction::Agents { args } => LiveCli::print_agents(args.as_deref())?,
-        CliAction::Mcp { args } => LiveCli::print_mcp(args.as_deref())?,
-        CliAction::Skills { args } => LiveCli::print_skills(args.as_deref())?,
-        CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
-        CliAction::Version => print_version(),
+        CliAction::DumpManifests { output_format } => dump_manifests(output_format)?,
+        CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
+        CliAction::Agents {
+            args,
+            output_format,
+        } => LiveCli::print_agents(args.as_deref(), output_format)?,
+        CliAction::Mcp {
+            args,
+            output_format,
+        } => LiveCli::print_mcp(args.as_deref(), output_format)?,
+        CliAction::Skills {
+            args,
+            output_format,
+        } => LiveCli::print_skills(args.as_deref(), output_format)?,
+        CliAction::PrintSystemPrompt {
+            cwd,
+            date,
+            output_format,
+        } => print_system_prompt(cwd, date, output_format)?,
+        CliAction::Version { output_format } => print_version(output_format)?,
         CliAction::ResumeSession {
             session_path,
             commands,
@@ -133,37 +152,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
         } => LiveCli::new(model, true, allowed_tools, permission_mode)?
             .run_turn_with_output(&prompt, output_format)?,
-        CliAction::Login => run_login()?,
-        CliAction::Logout => run_logout()?,
-        CliAction::Init => run_init()?,
+        CliAction::Login { output_format } => run_login(output_format)?,
+        CliAction::Logout { output_format } => run_logout(output_format)?,
+        CliAction::Doctor { output_format } => run_doctor(output_format)?,
+        CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Repl {
             model,
             allowed_tools,
             permission_mode,
         } => run_repl(model, allowed_tools, permission_mode)?,
-        CliAction::Help => print_help(),
+        CliAction::HelpTopic(topic) => print_help_topic(topic),
+        CliAction::Help { output_format } => print_help(output_format)?,
     }
     Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
-    DumpManifests,
-    BootstrapPlan,
+    DumpManifests {
+        output_format: CliOutputFormat,
+    },
+    BootstrapPlan {
+        output_format: CliOutputFormat,
+    },
     Agents {
         args: Option<String>,
+        output_format: CliOutputFormat,
     },
     Mcp {
         args: Option<String>,
+        output_format: CliOutputFormat,
     },
     Skills {
         args: Option<String>,
+        output_format: CliOutputFormat,
     },
     PrintSystemPrompt {
         cwd: PathBuf,
         date: String,
+        output_format: CliOutputFormat,
     },
-    Version,
+    Version {
+        output_format: CliOutputFormat,
+    },
     ResumeSession {
         session_path: PathBuf,
         commands: Vec<String>,
@@ -184,16 +215,35 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     },
-    Login,
-    Logout,
-    Init,
+    Login {
+        output_format: CliOutputFormat,
+    },
+    Logout {
+        output_format: CliOutputFormat,
+    },
+    Doctor {
+        output_format: CliOutputFormat,
+    },
+    Init {
+        output_format: CliOutputFormat,
+    },
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     },
+    HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
-    Help,
+    Help {
+        output_format: CliOutputFormat,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalHelpTopic {
+    Status,
+    Sandbox,
+    Doctor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,11 +377,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     if wants_help {
-        return Ok(CliAction::Help);
+        return Ok(CliAction::Help { output_format });
     }
 
     if wants_version {
-        return Ok(CliAction::Version);
+        return Ok(CliAction::Version { output_format });
     }
 
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
@@ -347,6 +397,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..], output_format);
     }
+    if let Some(action) = parse_local_help_action(&rest) {
+        return action;
+    }
     if let Some(action) =
         parse_single_word_command_alias(&rest, &model, permission_mode_override, output_format)
     {
@@ -356,21 +409,24 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
-        "dump-manifests" => Ok(CliAction::DumpManifests),
-        "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
+        "dump-manifests" => Ok(CliAction::DumpManifests { output_format }),
+        "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
+            output_format,
         }),
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
+            output_format,
         }),
         "skills" => Ok(CliAction::Skills {
             args: join_optional_args(&rest[1..]),
+            output_format,
         }),
-        "system-prompt" => parse_system_prompt_args(&rest[1..]),
-        "login" => Ok(CliAction::Login),
-        "logout" => Ok(CliAction::Logout),
-        "init" => Ok(CliAction::Init),
+        "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
+        "login" => Ok(CliAction::Login { output_format }),
+        "logout" => Ok(CliAction::Logout { output_format }),
+        "init" => Ok(CliAction::Init { output_format }),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -384,7 +440,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
             })
         }
-        other if other.starts_with('/') => parse_direct_slash_cli_action(&rest),
+        other if other.starts_with('/') => parse_direct_slash_cli_action(&rest, output_format),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
             model,
@@ -393,6 +449,24 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
         }),
     }
+}
+
+fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
+    if rest.len() != 2 || !is_help_flag(&rest[1]) {
+        return None;
+    }
+
+    let topic = match rest[0].as_str() {
+        "status" => LocalHelpTopic::Status,
+        "sandbox" => LocalHelpTopic::Sandbox,
+        "doctor" => LocalHelpTopic::Doctor,
+        _ => return None,
+    };
+    Some(Ok(CliAction::HelpTopic(topic)))
+}
+
+fn is_help_flag(value: &str) -> bool {
+    matches!(value, "--help" | "-h")
 }
 
 fn parse_single_word_command_alias(
@@ -406,14 +480,15 @@ fn parse_single_word_command_alias(
     }
 
     match rest[0].as_str() {
-        "help" => Some(Ok(CliAction::Help)),
-        "version" => Some(Ok(CliAction::Version)),
+        "help" => Some(Ok(CliAction::Help { output_format })),
+        "version" => Some(Ok(CliAction::Version { output_format })),
         "status" => Some(Ok(CliAction::Status {
             model: model.to_string(),
             permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
             output_format,
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
+        "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -455,11 +530,17 @@ fn join_optional_args(args: &[String]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
+fn parse_direct_slash_cli_action(
+    rest: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
-        Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help),
-        Ok(Some(SlashCommand::Agents { args })) => Ok(CliAction::Agents { args }),
+        Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help { output_format }),
+        Ok(Some(SlashCommand::Agents { args })) => Ok(CliAction::Agents {
+            args,
+            output_format,
+        }),
         Ok(Some(SlashCommand::Mcp { action, target })) => Ok(CliAction::Mcp {
             args: match (action, target) {
                 (None, None) => None,
@@ -467,8 +548,12 @@ fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
                 (Some(action), Some(target)) => Some(format!("{action} {target}")),
                 (None, Some(target)) => Some(target),
             },
+            output_format,
         }),
-        Ok(Some(SlashCommand::Skills { args })) => Ok(CliAction::Skills { args }),
+        Ok(Some(SlashCommand::Skills { args })) => Ok(CliAction::Skills {
+            args,
+            output_format,
+        }),
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
             let _ = command;
@@ -679,7 +764,10 @@ fn filter_tool_specs(
     tool_registry.definitions(allowed_tools)
 }
 
-fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
+fn parse_system_prompt_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
     let mut date = DEFAULT_DATE.to_string();
     let mut index = 0;
@@ -704,7 +792,11 @@ fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
         }
     }
 
-    Ok(CliAction::PrintSystemPrompt { cwd, date })
+    Ok(CliAction::PrintSystemPrompt {
+        cwd,
+        date,
+        output_format,
+    })
 }
 
 fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
@@ -751,6 +843,408 @@ fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticLevel {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl DiagnosticLevel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+
+    fn is_failure(self) -> bool {
+        matches!(self, Self::Fail)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticCheck {
+    name: &'static str,
+    level: DiagnosticLevel,
+    summary: String,
+    details: Vec<String>,
+}
+
+impl DiagnosticCheck {
+    fn new(name: &'static str, level: DiagnosticLevel, summary: impl Into<String>) -> Self {
+        Self {
+            name,
+            level,
+            summary: summary.into(),
+            details: Vec::new(),
+        }
+    }
+
+    fn with_details(mut self, details: Vec<String>) -> Self {
+        self.details = details;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorReport {
+    checks: Vec<DiagnosticCheck>,
+}
+
+impl DoctorReport {
+    fn has_failures(&self) -> bool {
+        self.checks.iter().any(|check| check.level.is_failure())
+    }
+
+    fn render(&self) -> String {
+        let ok_count = self
+            .checks
+            .iter()
+            .filter(|check| check.level == DiagnosticLevel::Ok)
+            .count();
+        let warn_count = self
+            .checks
+            .iter()
+            .filter(|check| check.level == DiagnosticLevel::Warn)
+            .count();
+        let fail_count = self
+            .checks
+            .iter()
+            .filter(|check| check.level == DiagnosticLevel::Fail)
+            .count();
+        let mut lines = vec![
+            "Doctor".to_string(),
+            format!(
+                "Summary\n  OK               {ok_count}\n  Warnings         {warn_count}\n  Failures         {fail_count}"
+            ),
+        ];
+        lines.extend(self.checks.iter().map(render_diagnostic_check));
+        lines.join("\n\n")
+    }
+}
+
+fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
+    let mut lines = vec![format!(
+        "{}\n  Status           {}\n  Summary          {}",
+        check.name,
+        check.level.label(),
+        check.summary
+    )];
+    if !check.details.is_empty() {
+        lines.push("  Details".to_string());
+        lines.extend(check.details.iter().map(|detail| format!("    - {detail}")));
+    }
+    lines.join("\n")
+}
+
+fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let config_loader = ConfigLoader::default_for(&cwd);
+    let config = config_loader.load();
+    let discovered_config = config_loader.discover();
+    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let (project_root, git_branch) =
+        parse_git_status_metadata(project_context.git_status.as_deref());
+    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let empty_config = runtime::RuntimeConfig::empty();
+    let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
+    let context = StatusContext {
+        cwd: cwd.clone(),
+        session_path: None,
+        loaded_config_files: config
+            .as_ref()
+            .ok()
+            .map_or(0, |runtime_config| runtime_config.loaded_entries().len()),
+        discovered_config_files: discovered_config.len(),
+        memory_file_count: project_context.instruction_files.len(),
+        project_root,
+        git_branch,
+        git_summary,
+        sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
+    };
+    Ok(DoctorReport {
+        checks: vec![
+            check_auth_health(),
+            check_config_health(&config_loader, config.as_ref()),
+            check_workspace_health(&context),
+            check_sandbox_health(&context.sandbox_status),
+            check_system_health(&cwd, config.as_ref().ok()),
+        ],
+    })
+}
+
+fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let report = render_doctor_report()?;
+    let message = report.render();
+    match output_format {
+        CliOutputFormat::Text => println!("{message}"),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "doctor",
+                "message": message,
+                "report": message,
+                "has_failures": report.has_failures(),
+            }))?
+        ),
+    }
+    if report.has_failures() {
+        return Err("doctor found failing checks".into());
+    }
+    Ok(())
+}
+
+fn check_auth_health() -> DiagnosticCheck {
+    let api_key_present = env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    match load_oauth_credentials() {
+        Ok(Some(token_set)) => {
+            let expired = oauth_token_is_expired(&api::OAuthTokenSet {
+                access_token: token_set.access_token.clone(),
+                refresh_token: token_set.refresh_token.clone(),
+                expires_at: token_set.expires_at,
+                scopes: token_set.scopes.clone(),
+            });
+            let mut details = vec![
+                format!(
+                    "Environment       api_key={} auth_token={}",
+                    if api_key_present { "present" } else { "absent" },
+                    if auth_token_present {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                ),
+                format!(
+                    "Saved OAuth       expires_at={} refresh_token={} scopes={}",
+                    token_set
+                        .expires_at
+                        .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
+                    if token_set.refresh_token.is_some() {
+                        "present"
+                    } else {
+                        "absent"
+                    },
+                    if token_set.scopes.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        token_set.scopes.join(",")
+                    }
+                ),
+            ];
+            if expired {
+                details.push(
+                    "Suggested action  claw login to refresh local OAuth credentials".to_string(),
+                );
+            }
+            DiagnosticCheck::new(
+                "Auth",
+                if expired {
+                    DiagnosticLevel::Warn
+                } else {
+                    DiagnosticLevel::Ok
+                },
+                if expired {
+                    "saved OAuth credentials are present but expired"
+                } else if api_key_present || auth_token_present {
+                    "environment and saved credentials are available"
+                } else {
+                    "saved OAuth credentials are available"
+                },
+            )
+            .with_details(details)
+        }
+        Ok(None) => DiagnosticCheck::new(
+            "Auth",
+            if api_key_present || auth_token_present {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Warn
+            },
+            if api_key_present || auth_token_present {
+                "environment credentials are configured"
+            } else {
+                "no API key or saved OAuth credentials were found"
+            },
+        )
+        .with_details(vec![format!(
+            "Environment       api_key={} auth_token={}",
+            if api_key_present { "present" } else { "absent" },
+            if auth_token_present {
+                "present"
+            } else {
+                "absent"
+            }
+        )]),
+        Err(error) => DiagnosticCheck::new(
+            "Auth",
+            DiagnosticLevel::Fail,
+            format!("failed to inspect saved credentials: {error}"),
+        ),
+    }
+}
+
+fn check_config_health(
+    config_loader: &ConfigLoader,
+    config: Result<&runtime::RuntimeConfig, &runtime::ConfigError>,
+) -> DiagnosticCheck {
+    let discovered = config_loader.discover();
+    let discovered_count = discovered.len();
+    let discovered_paths = discovered
+        .iter()
+        .map(|entry| entry.path.display().to_string())
+        .collect::<Vec<_>>();
+    match config {
+        Ok(runtime_config) => {
+            let loaded_entries = runtime_config.loaded_entries();
+            let mut details = vec![format!(
+                "Config files      loaded {}/{}",
+                loaded_entries.len(),
+                discovered_count
+            )];
+            if let Some(model) = runtime_config.model() {
+                details.push(format!("Resolved model    {model}"));
+            }
+            details.push(format!(
+                "MCP servers       {}",
+                runtime_config.mcp().servers().len()
+            ));
+            if discovered_paths.is_empty() {
+                details.push("Discovered files  <none>".to_string());
+            } else {
+                details.extend(
+                    discovered_paths
+                        .into_iter()
+                        .map(|path| format!("Discovered file   {path}")),
+                );
+            }
+            DiagnosticCheck::new(
+                "Config",
+                if discovered_count == 0 {
+                    DiagnosticLevel::Warn
+                } else {
+                    DiagnosticLevel::Ok
+                },
+                if discovered_count == 0 {
+                    "no config files were found; defaults are active"
+                } else {
+                    "runtime config loaded successfully"
+                },
+            )
+            .with_details(details)
+        }
+        Err(error) => DiagnosticCheck::new(
+            "Config",
+            DiagnosticLevel::Fail,
+            format!("runtime config failed to load: {error}"),
+        )
+        .with_details(if discovered_paths.is_empty() {
+            vec!["Discovered files  <none>".to_string()]
+        } else {
+            discovered_paths
+                .into_iter()
+                .map(|path| format!("Discovered file   {path}"))
+                .collect()
+        }),
+    }
+}
+
+fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
+    let in_repo = context.project_root.is_some();
+    DiagnosticCheck::new(
+        "Workspace",
+        if in_repo {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Warn
+        },
+        if in_repo {
+            format!(
+                "project root detected on branch {}",
+                context.git_branch.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            "current directory is not inside a git project".to_string()
+        },
+    )
+    .with_details(vec![
+        format!("Cwd              {}", context.cwd.display()),
+        format!(
+            "Project root     {}",
+            context
+                .project_root
+                .as_ref()
+                .map_or_else(|| "<none>".to_string(), |path| path.display().to_string())
+        ),
+        format!(
+            "Git branch       {}",
+            context.git_branch.as_deref().unwrap_or("unknown")
+        ),
+        format!("Git state        {}", context.git_summary.headline()),
+        format!("Changed files    {}", context.git_summary.changed_files),
+        format!(
+            "Memory files     {} · config files loaded {}/{}",
+            context.memory_file_count, context.loaded_config_files, context.discovered_config_files
+        ),
+    ])
+}
+
+fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
+    let degraded = status.enabled && !status.active;
+    let mut details = vec![
+        format!("Enabled          {}", status.enabled),
+        format!("Active           {}", status.active),
+        format!("Supported        {}", status.supported),
+        format!("Filesystem mode  {}", status.filesystem_mode.as_str()),
+        format!("Filesystem live  {}", status.filesystem_active),
+    ];
+    if let Some(reason) = &status.fallback_reason {
+        details.push(format!("Fallback reason  {reason}"));
+    }
+    DiagnosticCheck::new(
+        "Sandbox",
+        if degraded {
+            DiagnosticLevel::Warn
+        } else {
+            DiagnosticLevel::Ok
+        },
+        if degraded {
+            "sandbox was requested but is not currently active"
+        } else if status.active {
+            "sandbox protections are active"
+        } else {
+            "sandbox is not active for this session"
+        },
+    )
+    .with_details(details)
+}
+
+fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+    let mut details = vec![
+        format!("OS               {} {}", env::consts::OS, env::consts::ARCH),
+        format!("Working dir      {}", cwd.display()),
+        format!("Version          {}", VERSION),
+        format!("Build target     {}", BUILD_TARGET.unwrap_or("<unknown>")),
+        format!("Git SHA          {}", GIT_SHA.unwrap_or("<unknown>")),
+    ];
+    if let Some(model) = config.and_then(runtime::RuntimeConfig::model) {
+        details.push(format!("Default model    {model}"));
+    }
+    DiagnosticCheck::new(
+        "System",
+        DiagnosticLevel::Ok,
+        "captured local runtime metadata",
+    )
+    .with_details(details)
+}
+
 fn resume_command_can_absorb_token(current_command: &str, token: &str) -> bool {
     matches!(
         SlashCommand::parse(current_command),
@@ -775,26 +1269,54 @@ fn looks_like_slash_command_token(token: &str) -> bool {
         .any(|spec| spec.name == name || spec.aliases.contains(&name))
 }
 
-fn dump_manifests() {
+fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let paths = UpstreamPaths::from_workspace_dir(&workspace_dir);
     match extract_manifest(&paths) {
         Ok(manifest) => {
-            println!("commands: {}", manifest.commands.entries().len());
-            println!("tools: {}", manifest.tools.entries().len());
-            println!("bootstrap phases: {}", manifest.bootstrap.phases().len());
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("commands: {}", manifest.commands.entries().len());
+                    println!("tools: {}", manifest.tools.entries().len());
+                    println!("bootstrap phases: {}", manifest.bootstrap.phases().len());
+                }
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "kind": "dump-manifests",
+                        "commands": manifest.commands.entries().len(),
+                        "tools": manifest.tools.entries().len(),
+                        "bootstrap_phases": manifest.bootstrap.phases().len(),
+                    }))?
+                ),
+            }
+            Ok(())
         }
-        Err(error) => {
-            eprintln!("failed to extract manifests: {error}");
-            std::process::exit(1);
-        }
+        Err(error) => Err(format!("failed to extract manifests: {error}").into()),
     }
 }
 
-fn print_bootstrap_plan() {
-    for phase in runtime::BootstrapPlan::claude_code_default().phases() {
-        println!("- {phase:?}");
+fn print_bootstrap_plan(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let phases = runtime::BootstrapPlan::claude_code_default()
+        .phases()
+        .iter()
+        .map(|phase| format!("{phase:?}"))
+        .collect::<Vec<_>>();
+    match output_format {
+        CliOutputFormat::Text => {
+            for phase in &phases {
+                println!("- {phase}");
+            }
+        }
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "bootstrap-plan",
+                "phases": phases,
+            }))?
+        ),
     }
+    Ok(())
 }
 
 fn default_oauth_config() -> OAuthConfig {
@@ -812,7 +1334,7 @@ fn default_oauth_config() -> OAuthConfig {
     }
 }
 
-fn run_login() -> Result<(), Box<dyn std::error::Error>> {
+fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let config = ConfigLoader::default_for(&cwd).load()?;
     let default_oauth = default_oauth_config();
@@ -825,8 +1347,10 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         OAuthAuthorizationRequest::from_config(oauth, redirect_uri.clone(), state.clone(), &pkce)
             .build_url();
 
-    println!("Starting Claude OAuth login...");
-    println!("Listening for callback on {redirect_uri}");
+    if output_format == CliOutputFormat::Text {
+        println!("Starting Claude OAuth login...");
+        println!("Listening for callback on {redirect_uri}");
+    }
     if let Err(error) = open_browser(&authorize_url) {
         eprintln!("warning: failed to open browser automatically: {error}");
         println!("Open this URL manually:\n{authorize_url}");
@@ -850,8 +1374,13 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let client = AnthropicClient::from_auth(AuthSource::None).with_base_url(api::read_base_url());
-    let exchange_request =
-        OAuthTokenExchangeRequest::from_config(oauth, code, state, pkce.verifier, redirect_uri);
+    let exchange_request = OAuthTokenExchangeRequest::from_config(
+        oauth,
+        code,
+        state,
+        pkce.verifier,
+        redirect_uri.clone(),
+    );
     let runtime = tokio::runtime::Runtime::new()?;
     let token_set = runtime.block_on(client.exchange_oauth_code(oauth, &exchange_request))?;
     save_oauth_credentials(&runtime::OAuthTokenSet {
@@ -860,13 +1389,33 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         expires_at: token_set.expires_at,
         scopes: token_set.scopes,
     })?;
-    println!("Claude OAuth login complete.");
+    match output_format {
+        CliOutputFormat::Text => println!("Claude OAuth login complete."),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "login",
+                "callback_port": callback_port,
+                "redirect_uri": redirect_uri,
+                "message": "Claude OAuth login complete.",
+            }))?
+        ),
+    }
     Ok(())
 }
 
-fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
+fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     clear_oauth_credentials()?;
-    println!("Claude OAuth credentials cleared.");
+    match output_format {
+        CliOutputFormat::Text => println!("Claude OAuth credentials cleared."),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "logout",
+                "message": "Claude OAuth credentials cleared.",
+            }))?
+        ),
+    }
     Ok(())
 }
 
@@ -924,18 +1473,47 @@ fn wait_for_oauth_callback(
     Ok(callback)
 }
 
-fn print_system_prompt(cwd: PathBuf, date: String) {
-    match load_system_prompt(cwd, date, env::consts::OS, "unknown") {
-        Ok(sections) => println!("{}", sections.join("\n\n")),
-        Err(error) => {
-            eprintln!("failed to build system prompt: {error}");
-            std::process::exit(1);
-        }
+fn print_system_prompt(
+    cwd: PathBuf,
+    date: String,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
+    let message = sections.join(
+        "
+
+",
+    );
+    match output_format {
+        CliOutputFormat::Text => println!("{message}"),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "system-prompt",
+                "message": message,
+                "sections": sections,
+            }))?
+        ),
     }
+    Ok(())
 }
 
-fn print_version() {
-    println!("{}", render_version_report());
+fn print_version(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let report = render_version_report();
+    match output_format {
+        CliOutputFormat::Text => println!("{report}"),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "version",
+                "message": report,
+                "version": VERSION,
+                "git_sha": GIT_SHA,
+                "target": BUILD_TARGET,
+            }))?
+        ),
+    }
+    Ok(())
 }
 
 fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
@@ -960,31 +1538,15 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
     };
 
     if commands.is_empty() {
-        match output_format {
-            CliOutputFormat::Text => {
-                println!(
-                    "Restored session from {} ({} messages).",
-                    resolved_path.display(),
-                    session.messages.len()
-                );
-            }
-            CliOutputFormat::Json => {
-                println!(
-                    "{}",
-                    serialize_json_output(&json!({
-                        "kind": "resume",
-                        "session_file": resolved_path.display().to_string(),
-                        "messages": session.messages.len(),
-                    }))
-                    .unwrap_or_else(|error| format!(r#"{{"kind":"error","message":"{error}"}}"#))
-                );
-            }
-        }
+        println!(
+            "Restored session from {} ({} messages).",
+            resolved_path.display(),
+            session.messages.len()
+        );
         return;
     }
 
     let mut session = session;
-    let mut json_outputs = Vec::new();
     for raw_command in commands {
         let command = match SlashCommand::parse(raw_command) {
             Ok(Some(command)) => command,
@@ -997,18 +1559,41 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 std::process::exit(2);
             }
         };
-        match run_resume_command(&resolved_path, &session, &command, output_format) {
+        match run_resume_command(&resolved_path, &session, &command) {
             Ok(ResumeCommandOutcome {
                 session: next_session,
                 message,
             }) => {
                 session = next_session;
                 if let Some(message) = message {
-                    match output_format {
-                        CliOutputFormat::Text => {
-                            println!("{}", render_resume_text_output(&message))
-                        }
-                        CliOutputFormat::Json => json_outputs.push(message),
+                    if output_format == CliOutputFormat::Json
+                        && matches!(command, SlashCommand::Status)
+                    {
+                        let tracker = UsageTracker::from_session(&session);
+                        let usage = tracker.cumulative_usage();
+                        let context = status_context(Some(&resolved_path)).expect("status context");
+                        let value = json!({
+                            "kind": "status",
+                            "messages": session.messages.len(),
+                            "turns": tracker.turns(),
+                            "latest_total": tracker.current_turn_usage().total_tokens(),
+                            "cumulative_input": usage.input_tokens,
+                            "cumulative_output": usage.output_tokens,
+                            "cumulative_total": usage.total_tokens(),
+                            "workspace": {
+                                "cwd": context.cwd,
+                                "project_root": context.project_root,
+                                "git_branch": context.git_branch,
+                                "git_state": context.git_summary.headline(),
+                                "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+                            }
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).expect("status json")
+                        );
+                    } else {
+                        println!("{message}");
                     }
                 }
             }
@@ -1018,27 +1603,12 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             }
         }
     }
-
-    if matches!(output_format, CliOutputFormat::Json) {
-        let payload = if json_outputs.len() == 1 {
-            json_outputs.pop().expect("single json output")
-        } else {
-            Value::Array(json_outputs)
-        };
-        match serialize_json_output(&payload) {
-            Ok(rendered) => println!("{rendered}"),
-            Err(error) => {
-                eprintln!("failed to render json output: {error}");
-                std::process::exit(2);
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 struct ResumeCommandOutcome {
     session: Session,
-    message: Option<Value>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1363,28 +1933,16 @@ fn parse_git_status_metadata_for(
     (project_root, branch)
 }
 
-fn serialize_json_output(value: &Value) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(value)
-}
-
-fn render_resume_text_output(value: &Value) -> String {
-    value.get("message").and_then(Value::as_str).map_or_else(
-        || serialize_json_output(value).unwrap_or_else(|_| value.to_string()),
-        ToString::to_string,
-    )
-}
-
 #[allow(clippy::too_many_lines)]
 fn run_resume_command(
     session_path: &Path,
     session: &Session,
     command: &SlashCommand,
-    output_format: CliOutputFormat,
 ) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
     match command {
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(json!({ "kind": "help", "message": render_repl_help() })),
+            message: Some(render_repl_help()),
         }),
         SlashCommand::Compact => {
             let result = runtime::compact_session(
@@ -1400,20 +1958,16 @@ fn run_resume_command(
             result.compacted_session.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
-                message: Some(json!({
-                    "kind": "compact",
-                    "message": format_compact_report(removed, kept, skipped),
-                })),
+                message: Some(format_compact_report(removed, kept, skipped)),
             })
         }
         SlashCommand::Clear { confirm } => {
             if !confirm {
                 return Ok(ResumeCommandOutcome {
                     session: session.clone(),
-                    message: Some(json!({
-                        "kind": "clear",
-                        "message": "clear: confirmation required; rerun with /clear --confirm",
-                    })),
+                    message: Some(
+                        "clear: confirmation required; rerun with /clear --confirm".to_string(),
+                    ),
                 });
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
@@ -1423,85 +1977,55 @@ fn run_resume_command(
             cleared.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: cleared,
-                message: Some(json!({
-                    "kind": "clear",
-                    "message": format!(
-                        "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  claw --resume {}\n  New session      {new_session_id}\n  Session file     {}",
-                        backup_path.display(),
-                        backup_path.display(),
-                        session_path.display()
-                    ),
-                })),
+                message: Some(format!(
+                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  claw --resume {}\n  New session      {new_session_id}\n  Session file     {}",
+                    backup_path.display(),
+                    backup_path.display(),
+                    session_path.display()
+                )),
             })
         }
         SlashCommand::Status => {
             let tracker = UsageTracker::from_session(session);
             let usage = tracker.cumulative_usage();
-            let status_usage = StatusUsage {
-                message_count: session.messages.len(),
-                turns: tracker.turns(),
-                latest: tracker.current_turn_usage(),
-                cumulative: usage,
-                estimated_tokens: 0,
-            };
-            let context = status_context(Some(session_path))?;
-            let status_json = status_report_json(
-                "restored-session",
-                status_usage,
-                default_permission_mode().as_str(),
-                &context,
-            );
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(match output_format {
-                    CliOutputFormat::Text => json!({
-                        "kind": "status-text",
-                        "message": format_status_report(
-                            "restored-session",
-                            status_usage,
-                            default_permission_mode().as_str(),
-                            &context,
-                        ),
-                    }),
-                    CliOutputFormat::Json => status_json,
-                }),
+                message: Some(format_status_report(
+                    "restored-session",
+                    StatusUsage {
+                        message_count: session.messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: usage,
+                        estimated_tokens: 0,
+                    },
+                    default_permission_mode().as_str(),
+                    &status_context(Some(session_path))?,
+                )),
             })
         }
         SlashCommand::Sandbox => {
             let cwd = env::current_dir()?;
             let loader = ConfigLoader::default_for(&cwd);
             let runtime_config = loader.load()?;
-            let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(match output_format {
-                    CliOutputFormat::Text => json!({
-                        "kind": "sandbox-text",
-                        "message": format_sandbox_report(&sandbox_status),
-                    }),
-                    CliOutputFormat::Json => json!({
-                        "kind": "sandbox",
-                        "sandbox": sandbox_status_json(&sandbox_status),
-                    }),
-                }),
+                message: Some(format_sandbox_report(&resolve_sandbox_status(
+                    runtime_config.sandbox(),
+                    &cwd,
+                ))),
             })
         }
         SlashCommand::Cost => {
             let usage = UsageTracker::from_session(session).cumulative_usage();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(json!({
-                    "kind": "cost",
-                    "message": format_cost_report(usage),
-                })),
+                message: Some(format_cost_report(usage)),
             })
         }
         SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(json!({
-                "kind": "config",
-                "message": render_config_report(section.as_deref())?,
-            })),
+            message: Some(render_config_report(section.as_deref())?),
         }),
         SlashCommand::Mcp { action, target } => {
             let cwd = env::current_dir()?;
@@ -1513,77 +2037,57 @@ fn run_resume_command(
             };
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(json!({
-                    "kind": "mcp",
-                    "message": handle_mcp_slash_command(args.as_deref(), &cwd)?,
-                })),
+                message: Some(handle_mcp_slash_command(args.as_deref(), &cwd)?),
             })
         }
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(json!({
-                "kind": "memory",
-                "message": render_memory_report()?,
-            })),
+            message: Some(render_memory_report()?),
         }),
         SlashCommand::Init => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(json!({
-                "kind": "init",
-                "message": init_claude_md()?,
-            })),
+            message: Some(init_claude_md()?),
         }),
         SlashCommand::Diff => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(json!({
-                "kind": "diff",
-                "message": render_diff_report_for(
-                    session_path.parent().unwrap_or_else(|| Path::new(".")),
-                )?,
-            })),
+            message: Some(render_diff_report_for(
+                session_path.parent().unwrap_or_else(|| Path::new(".")),
+            )?),
         }),
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(json!({
-                "kind": "version",
-                "message": render_version_report(),
-            })),
+            message: Some(render_version_report()),
         }),
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
             fs::write(&export_path, render_export_text(session))?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(json!({
-                    "kind": "export",
-                    "message": format!(
-                        "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
-                        export_path.display(),
-                        session.messages.len(),
-                    ),
-                })),
+                message: Some(format!(
+                    "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
+                    export_path.display(),
+                    session.messages.len(),
+                )),
             })
         }
         SlashCommand::Agents { args } => {
             let cwd = env::current_dir()?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(json!({
-                    "kind": "agents",
-                    "message": handle_agents_slash_command(args.as_deref(), &cwd)?,
-                })),
+                message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
             })
         }
         SlashCommand::Skills { args } => {
             let cwd = env::current_dir()?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(json!({
-                    "kind": "skills",
-                    "message": handle_skills_slash_command(args.as_deref(), &cwd)?,
-                })),
+                message: Some(handle_skills_slash_command(args.as_deref(), &cwd)?),
             })
         }
+        SlashCommand::Doctor => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_doctor_report()?.render()),
+        }),
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -1597,7 +2101,6 @@ fn run_resume_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
-        | SlashCommand::Doctor
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -2023,13 +2526,7 @@ impl RuntimeMcpState {
 
 fn build_runtime_mcp_state(
     runtime_config: &runtime::RuntimeConfig,
-) -> Result<
-    (
-        Option<Arc<Mutex<RuntimeMcpState>>>,
-        Vec<RuntimeToolDefinition>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
         return Ok((None, Vec::new()));
     };
@@ -2467,7 +2964,7 @@ impl LiveCli {
                     (Some(action), Some(target)) => Some(format!("{action} {target}")),
                     (None, Some(target)) => Some(target.to_string()),
                 };
-                Self::print_mcp(args.as_deref())?;
+                Self::print_mcp(args.as_deref(), CliOutputFormat::Text)?;
                 false
             }
             SlashCommand::Memory => {
@@ -2475,7 +2972,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Init => {
-                run_init()?;
+                run_init(CliOutputFormat::Text)?;
                 false
             }
             SlashCommand::Diff => {
@@ -2483,7 +2980,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Version => {
-                Self::print_version();
+                Self::print_version(CliOutputFormat::Text);
                 false
             }
             SlashCommand::Export { path } => {
@@ -2497,15 +2994,18 @@ impl LiveCli {
                 self.handle_plugins_command(action.as_deref(), target.as_deref())?
             }
             SlashCommand::Agents { args } => {
-                Self::print_agents(args.as_deref())?;
+                Self::print_agents(args.as_deref(), CliOutputFormat::Text)?;
                 false
             }
             SlashCommand::Skills { args } => {
-                Self::print_skills(args.as_deref())?;
+                Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
                 false
             }
-            SlashCommand::Doctor
-            | SlashCommand::Login
+            SlashCommand::Doctor => {
+                println!("{}", render_doctor_report()?.render());
+                false
+            }
+            SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Upgrade
@@ -2776,21 +3276,53 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_agents(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    fn print_agents(
+        args: Option<&str>,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        println!("{}", handle_agents_slash_command(args, &cwd)?);
+        let message = handle_agents_slash_command(args, &cwd)?;
+        match output_format {
+            CliOutputFormat::Text => println!("{message}"),
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "agents",
+                    "message": message,
+                    "args": args,
+                }))?
+            ),
+        }
         Ok(())
     }
 
-    fn print_mcp(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    fn print_mcp(
+        args: Option<&str>,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        println!("{}", handle_mcp_slash_command(args, &cwd)?);
+        match output_format {
+            CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&handle_mcp_slash_command_json(args, &cwd)?)?
+            ),
+        }
         Ok(())
     }
 
-    fn print_skills(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    fn print_skills(
+        args: Option<&str>,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        println!("{}", handle_skills_slash_command(args, &cwd)?);
+        match output_format {
+            CliOutputFormat::Text => println!("{}", handle_skills_slash_command(args, &cwd)?),
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
+            ),
+        }
         Ok(())
     }
 
@@ -2799,8 +3331,8 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_version() {
-        println!("{}", render_version_report());
+    fn print_version(output_format: CliOutputFormat) {
+        let _ = crate::print_version(output_format);
     }
 
     fn export_session(
@@ -3313,12 +3845,49 @@ fn print_status_snapshot(
         ),
         CliOutputFormat::Json => println!(
             "{}",
-            serialize_json_output(&status_report_json(
-                model,
-                usage,
-                permission_mode.as_str(),
-                &context,
-            ))?
+            serde_json::to_string_pretty(&json!({
+                "kind": "status",
+                "model": model,
+                "permission_mode": permission_mode.as_str(),
+                "usage": {
+                    "messages": usage.message_count,
+                    "turns": usage.turns,
+                    "latest_total": usage.latest.total_tokens(),
+                    "cumulative_input": usage.cumulative.input_tokens,
+                    "cumulative_output": usage.cumulative.output_tokens,
+                    "cumulative_total": usage.cumulative.total_tokens(),
+                    "estimated_tokens": usage.estimated_tokens,
+                },
+                "workspace": {
+                    "cwd": context.cwd,
+                    "project_root": context.project_root,
+                    "git_branch": context.git_branch,
+                    "git_state": context.git_summary.headline(),
+                    "changed_files": context.git_summary.changed_files,
+                    "staged_files": context.git_summary.staged_files,
+                    "unstaged_files": context.git_summary.unstaged_files,
+                    "untracked_files": context.git_summary.untracked_files,
+                    "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+                    "loaded_config_files": context.loaded_config_files,
+                    "discovered_config_files": context.discovered_config_files,
+                    "memory_file_count": context.memory_file_count,
+                },
+                "sandbox": {
+                    "enabled": context.sandbox_status.enabled,
+                    "active": context.sandbox_status.active,
+                    "supported": context.sandbox_status.supported,
+                    "in_container": context.sandbox_status.in_container,
+                    "requested_namespace": context.sandbox_status.requested.namespace_restrictions,
+                    "active_namespace": context.sandbox_status.namespace_active,
+                    "requested_network": context.sandbox_status.requested.network_isolation,
+                    "active_network": context.sandbox_status.network_active,
+                    "filesystem_mode": context.sandbox_status.filesystem_mode.as_str(),
+                    "filesystem_active": context.sandbox_status.filesystem_active,
+                    "allowed_mounts": context.sandbox_status.allowed_mounts,
+                    "markers": context.sandbox_status.container_markers,
+                    "fallback_reason": context.sandbox_status.fallback_reason,
+                }
+            }))?
         ),
     }
     Ok(())
@@ -3418,61 +3987,6 @@ fn format_status_report(
     )
 }
 
-fn status_report_json(
-    model: &str,
-    usage: StatusUsage,
-    permission_mode: &str,
-    context: &StatusContext,
-) -> Value {
-    json!({
-        "kind": "status",
-        "model": model,
-        "permission_mode": permission_mode,
-        "messages": usage.message_count,
-        "turns": usage.turns,
-        "estimated_tokens": usage.estimated_tokens,
-        "usage": {
-            "latest": token_usage_json(usage.latest),
-            "cumulative": token_usage_json(usage.cumulative),
-        },
-        "workspace": {
-            "cwd": context.cwd.display().to_string(),
-            "project_root": context.project_root.as_ref().map(|path| path.display().to_string()),
-            "git_branch": context.git_branch.clone(),
-            "git_state": context.git_summary.headline(),
-            "changed_files": context.git_summary.changed_files,
-            "staged_files": context.git_summary.staged_files,
-            "unstaged_files": context.git_summary.unstaged_files,
-            "untracked_files": context.git_summary.untracked_files,
-            "session": status_session_label(context.session_path.as_deref()),
-            "config_files": {
-                "loaded": context.loaded_config_files,
-                "discovered": context.discovered_config_files,
-            },
-            "memory_files": context.memory_file_count,
-            "suggested_flow": ["/status", "/diff", "/commit"],
-        },
-        "sandbox": sandbox_status_json(&context.sandbox_status),
-    })
-}
-
-fn token_usage_json(usage: TokenUsage) -> Value {
-    json!({
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-        "cache_read_input_tokens": usage.cache_read_input_tokens,
-        "total_tokens": usage.total_tokens(),
-    })
-}
-
-fn status_session_label(session_path: Option<&Path>) -> String {
-    session_path.map_or_else(
-        || "live-repl".to_string(),
-        |path| path.display().to_string(),
-    )
-}
-
 fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
     format!(
         "Sandbox
@@ -3516,31 +4030,6 @@ fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
     )
 }
 
-fn sandbox_status_json(status: &runtime::SandboxStatus) -> Value {
-    json!({
-        "enabled": status.enabled,
-        "active": status.active,
-        "supported": status.supported,
-        "namespace_supported": status.namespace_supported,
-        "namespace_active": status.namespace_active,
-        "network_supported": status.network_supported,
-        "network_active": status.network_active,
-        "filesystem_mode": status.filesystem_mode.as_str(),
-        "filesystem_active": status.filesystem_active,
-        "allowed_mounts": status.allowed_mounts.clone(),
-        "in_container": status.in_container,
-        "container_markers": status.container_markers.clone(),
-        "fallback_reason": status.fallback_reason.clone(),
-        "requested": {
-            "enabled": status.requested.enabled,
-            "namespace_restrictions": status.requested.namespace_restrictions,
-            "network_isolation": status.requested.network_isolation,
-            "filesystem_mode": status.requested.filesystem_mode.as_str(),
-            "allowed_mounts": status.requested.allowed_mounts.clone(),
-        }
-    })
-}
-
 fn format_commit_preflight_report(branch: Option<&str>, summary: GitWorkspaceSummary) -> String {
     format!(
         "Commit
@@ -3572,18 +4061,57 @@ fn print_sandbox_status_snapshot(
     let runtime_config = loader
         .load()
         .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
-    let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+    let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
     match output_format {
-        CliOutputFormat::Text => println!("{}", format_sandbox_report(&sandbox_status)),
+        CliOutputFormat::Text => println!("{}", format_sandbox_report(&status)),
         CliOutputFormat::Json => println!(
             "{}",
-            serialize_json_output(&json!({
+            serde_json::to_string_pretty(&json!({
                 "kind": "sandbox",
-                "sandbox": sandbox_status_json(&sandbox_status),
+                "enabled": status.enabled,
+                "active": status.active,
+                "supported": status.supported,
+                "in_container": status.in_container,
+                "requested_namespace": status.requested.namespace_restrictions,
+                "active_namespace": status.namespace_active,
+                "requested_network": status.requested.network_isolation,
+                "active_network": status.network_active,
+                "filesystem_mode": status.filesystem_mode.as_str(),
+                "filesystem_active": status.filesystem_active,
+                "allowed_mounts": status.allowed_mounts,
+                "markers": status.container_markers,
+                "fallback_reason": status.fallback_reason,
             }))?
         ),
     }
     Ok(())
+}
+
+fn render_help_topic(topic: LocalHelpTopic) -> String {
+    match topic {
+        LocalHelpTopic::Status => "Status
+  Usage            claw status
+  Purpose          show the local workspace snapshot without entering the REPL
+  Output           model, permissions, git state, config files, and sandbox status
+  Related          /status · claw --resume latest /status"
+            .to_string(),
+        LocalHelpTopic::Sandbox => "Sandbox
+  Usage            claw sandbox
+  Purpose          inspect the resolved sandbox and isolation state for the current directory
+  Output           namespace, network, filesystem, and fallback details
+  Related          /sandbox · claw status"
+            .to_string(),
+        LocalHelpTopic::Doctor => "Doctor
+  Usage            claw doctor
+  Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
+  Output           local-only health report; no provider request or session resume required
+  Related          /doctor · claw --resume latest /doctor"
+            .to_string(),
+    }
+}
+
+fn print_help_topic(topic: LocalHelpTopic) {
+    println!("{}", render_help_topic(topic));
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -3709,8 +4237,18 @@ fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     Ok(initialize_repo(&cwd)?.render())
 }
 
-fn run_init() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", init_claude_md()?);
+fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let message = init_claude_md()?;
+    match output_format {
+        CliOutputFormat::Text => println!("{message}"),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "init",
+                "message": message,
+            }))?
+        ),
+    }
     Ok(())
 }
 
@@ -5565,16 +6103,13 @@ impl CliToolExecutor {
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: ToolSearchRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let (pending_mcp_servers, mcp_degraded) = self
-            .mcp_state
-            .as_ref()
-            .map(|state| {
+        let (pending_mcp_servers, mcp_degraded) =
+            self.mcp_state.as_ref().map_or((None, None), |state| {
                 let state = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (state.pending_servers(), state.degraded_report())
-            })
-            .unwrap_or((None, None));
+            });
         serde_json::to_string_pretty(&self.tool_registry.search(
             &input.query,
             input.max_results.unwrap_or(5),
@@ -5764,6 +6299,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
+    writeln!(out, "  claw doctor")?;
+    writeln!(
+        out,
+        "      Diagnose local auth, config, workspace, and sandbox health"
+    )?;
     writeln!(out, "  claw dump-manifests")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
@@ -5841,13 +6381,27 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
+    writeln!(out, "  claw doctor")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw init")?;
     Ok(())
 }
 
-fn print_help() {
-    let _ = print_help_to(&mut io::stdout());
+fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buffer = Vec::new();
+    print_help_to(&mut buffer)?;
+    let message = String::from_utf8(buffer)?;
+    match output_format {
+        CliOutputFormat::Text => print!("{message}"),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "help",
+                "message": message,
+            }))?
+        ),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5865,11 +6419,11 @@ mod tests {
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         permission_policy, print_help_to, push_output_block, render_config_report,
         render_diff_report, render_diff_report_for, render_memory_report, render_repl_help,
-        render_resume_text_output, render_resume_usage, resolve_model_alias,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, slash_command_completion_candidates_with_sessions, status_context,
-        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command,
+        slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
@@ -6156,11 +6710,15 @@ mod tests {
     fn parses_version_flags_without_initializing_prompt_mode() {
         assert_eq!(
             parse_args(&["--version".to_string()]).expect("args should parse"),
-            CliAction::Version
+            CliAction::Version {
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["-V".to_string()]).expect("args should parse"),
-            CliAction::Version
+            CliAction::Version {
+                output_format: CliOutputFormat::Text,
+            }
         );
     }
 
@@ -6222,6 +6780,7 @@ mod tests {
             CliAction::PrintSystemPrompt {
                 cwd: PathBuf::from("/tmp/project"),
                 date: "2026-04-01".to_string(),
+                output_format: CliOutputFormat::Text,
             }
         );
     }
@@ -6230,34 +6789,75 @@ mod tests {
     fn parses_login_and_logout_subcommands() {
         assert_eq!(
             parse_args(&["login".to_string()]).expect("login should parse"),
-            CliAction::Login
+            CliAction::Login {
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["logout".to_string()]).expect("logout should parse"),
-            CliAction::Logout
+            CliAction::Logout {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["doctor".to_string()]).expect("doctor should parse"),
+            CliAction::Doctor {
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["init".to_string()]).expect("init should parse"),
-            CliAction::Init
+            CliAction::Init {
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["agents".to_string()]).expect("agents should parse"),
-            CliAction::Agents { args: None }
+            CliAction::Agents {
+                args: None,
+                output_format: CliOutputFormat::Text
+            }
         );
         assert_eq!(
             parse_args(&["mcp".to_string()]).expect("mcp should parse"),
-            CliAction::Mcp { args: None }
+            CliAction::Mcp {
+                args: None,
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["skills".to_string()]).expect("skills should parse"),
-            CliAction::Skills { args: None }
+            CliAction::Skills {
+                args: None,
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
             CliAction::Agents {
-                args: Some("--help".to_string())
+                args: Some("--help".to_string()),
+                output_format: CliOutputFormat::Text,
             }
+        );
+    }
+
+    #[test]
+    fn local_command_help_flags_stay_on_the_local_parser_path() {
+        assert_eq!(
+            parse_args(&["status".to_string(), "--help".to_string()])
+                .expect("status help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Status)
+        );
+        assert_eq!(
+            parse_args(&["sandbox".to_string(), "-h".to_string()])
+                .expect("sandbox help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Sandbox)
+        );
+        assert_eq!(
+            parse_args(&["doctor".to_string(), "--help".to_string()])
+                .expect("doctor help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Doctor)
         );
     }
 
@@ -6267,11 +6867,15 @@ mod tests {
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["help".to_string()]).expect("help should parse"),
-            CliAction::Help
+            CliAction::Help {
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["version".to_string()]).expect("version should parse"),
-            CliAction::Version
+            CliAction::Version {
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["status".to_string()]).expect("status should parse"),
@@ -6290,22 +6894,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_json_output_for_status_and_sandbox_aliases() {
-        let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+    fn parses_json_output_for_mcp_and_skills_commands() {
         assert_eq!(
-            parse_args(&["--output-format=json".to_string(), "status".to_string()])
-                .expect("json status should parse"),
-            CliAction::Status {
-                model: DEFAULT_MODEL.to_string(),
-                permission_mode: PermissionMode::DangerFullAccess,
+            parse_args(&["--output-format=json".to_string(), "mcp".to_string()])
+                .expect("json mcp should parse"),
+            CliAction::Mcp {
+                args: None,
                 output_format: CliOutputFormat::Json,
             }
         );
         assert_eq!(
-            parse_args(&["--output-format=json".to_string(), "sandbox".to_string()])
-                .expect("json sandbox should parse"),
-            CliAction::Sandbox {
+            parse_args(&[
+                "--output-format=json".to_string(),
+                "/skills".to_string(),
+                "help".to_string(),
+            ])
+            .expect("json /skills help should parse"),
+            CliAction::Skills {
+                args: Some("help".to_string()),
                 output_format: CliOutputFormat::Json,
             }
         );
@@ -6339,24 +6945,32 @@ mod tests {
     fn parses_direct_agents_mcp_and_skills_slash_commands() {
         assert_eq!(
             parse_args(&["/agents".to_string()]).expect("/agents should parse"),
-            CliAction::Agents { args: None }
+            CliAction::Agents {
+                args: None,
+                output_format: CliOutputFormat::Text
+            }
         );
         assert_eq!(
             parse_args(&["/mcp".to_string(), "show".to_string(), "demo".to_string()])
                 .expect("/mcp show demo should parse"),
             CliAction::Mcp {
-                args: Some("show demo".to_string())
+                args: Some("show demo".to_string()),
+                output_format: CliOutputFormat::Text,
             }
         );
         assert_eq!(
             parse_args(&["/skills".to_string()]).expect("/skills should parse"),
-            CliAction::Skills { args: None }
+            CliAction::Skills {
+                args: None,
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["/skills".to_string(), "help".to_string()])
                 .expect("/skills help should parse"),
             CliAction::Skills {
-                args: Some("help".to_string())
+                args: Some("help".to_string()),
+                output_format: CliOutputFormat::Text,
             }
         );
         assert_eq!(
@@ -6367,7 +6981,8 @@ mod tests {
             ])
             .expect("/skills install should parse"),
             CliAction::Skills {
-                args: Some("install ./fixtures/help-skill".to_string())
+                args: Some("install ./fixtures/help-skill".to_string()),
+                output_format: CliOutputFormat::Text,
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -6508,24 +7123,6 @@ mod tests {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/export /tmp/notes.txt".to_string(), "/status".to_string()],
                 output_format: CliOutputFormat::Text,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_json_output_for_resumed_status_queries() {
-        let args = vec![
-            "--output-format=json".to_string(),
-            "--resume".to_string(),
-            "session.jsonl".to_string(),
-            "/status".to_string(),
-        ];
-        assert_eq!(
-            parse_args(&args).expect("json resume status should parse"),
-            CliAction::ResumeSession {
-                session_path: PathBuf::from("session.jsonl"),
-                commands: vec!["/status".to_string()],
-                output_format: CliOutputFormat::Json,
             }
         );
     }
@@ -7046,16 +7643,10 @@ UU conflicted.rs",
 
         let session = Session::load_from_path(&session_path).expect("session should load");
         let outcome = with_current_dir(&root, || {
-            run_resume_command(
-                &session_path,
-                &session,
-                &SlashCommand::Diff,
-                CliOutputFormat::Text,
-            )
-            .expect("resume diff should work")
+            run_resume_command(&session_path, &session, &SlashCommand::Diff)
+                .expect("resume diff should work")
         });
-        let message =
-            render_resume_text_output(&outcome.message.expect("diff message should exist"));
+        let message = outcome.message.expect("diff message should exist");
         assert!(message.contains("Unstaged changes:"));
         assert!(message.contains("tracked.txt"));
 
@@ -7641,6 +8232,7 @@ UU conflicted.rs",
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
         let config_home = temp_dir();
         let workspace = temp_dir();
