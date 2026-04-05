@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Claw Code Mobile — AI Coding Agent on Your Phone</title>
+<meta name="description" content="Run Claude Code on your phone. Full Linux environment, Rust core, 19 tools, zero dependencies. No server. No PC. Just your pocket." />
+<meta property="og:title" content="Claw Code Mobile" />
+<meta property="og:description" content="Claude Code architecture running natively on Android. Full Linux. No server. No PC. Your pocket is a dev workstation." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://friuns2.github.io/claw-code-android/" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦀</text></svg>" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #08080c;
+    --surface: #0f0f15;
+    --surface-raised: #151520;
+    --border: #1c1c2a;
+    --border-glow: #1a1020;
+    --text: #e8e4df;
+    --text-dim: #8a8680;
+    --accent: #c45aff;
+    --accent-soft: #9a3ad4;
+    --accent-deep: #6b1fa0;
+    --crimson: #ff4444;
+    --cream: #f0e6f6;
+    --green: #22c55e;
+    --amber: #e8941a;
+    --mono: 'DM Mono', 'SF Mono', monospace;
+    --display: 'Instrument Serif', Georgia, serif;
+    --body: 'Syne', sans-serif;
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    font-family: var(--body);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.65;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent); text-decoration: none; transition: color .2s; }
+  a:hover { color: var(--cream); }
+
+  .grain {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 9999;
+    opacity: .035;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  /* ─── HERO ─── */
+  .hero {
+    position: relative;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 4rem 1.5rem;
+    overflow: hidden;
+  }
+
+  .hero::before {
+    content: '';
+    position: absolute;
+    top: -30%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 140%;
+    height: 80%;
+    background: radial-gradient(ellipse at center, rgba(196, 90, 255, .08) 0%, rgba(255, 68, 68, .03) 40%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .hero::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, var(--border-glow) 30%, var(--accent-soft) 50%, var(--border-glow) 70%, transparent 100%);
+  }
+
+  .hero-claw {
+    font-size: clamp(4rem, 12vw, 8rem);
+    line-height: 1;
+    margin-bottom: 1rem;
+    animation: float 6s ease-in-out infinite;
+    filter: drop-shadow(0 0 40px rgba(196, 90, 255, .2));
+  }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-12px); }
+  }
+
+  .hero h1 {
+    font-family: var(--display);
+    font-size: clamp(3rem, 10vw, 7rem);
+    font-weight: 400;
+    letter-spacing: -.03em;
+    line-height: .9;
+    color: var(--cream);
+    margin-bottom: .75rem;
+  }
+
+  .hero h1 em {
+    font-style: italic;
+    color: var(--accent);
+  }
+
+  .hero-sub {
+    font-family: var(--mono);
+    font-size: clamp(.7rem, 1.4vw, .85rem);
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: .2em;
+    margin-bottom: 2.5rem;
+  }
+
+  .hero-desc {
+    max-width: 580px;
+    font-size: clamp(1rem, 2vw, 1.15rem);
+    color: var(--text-dim);
+    margin-bottom: 3rem;
+    line-height: 1.75;
+  }
+
+  .hero-desc strong { color: var(--text); font-weight: 600; }
+
+  .cta-group { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: .6rem;
+    padding: .85rem 2rem;
+    border-radius: 4px;
+    font-family: var(--body);
+    font-weight: 600;
+    font-size: .95rem;
+    letter-spacing: .02em;
+    transition: all .25s ease;
+    cursor: pointer;
+    border: none;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+  }
+  .btn-primary:hover {
+    background: var(--cream);
+    color: #080808;
+    transform: translateY(-2px);
+    box-shadow: 0 8px 30px rgba(196, 90, 255, .3);
+  }
+
+  .btn-ghost {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-ghost:hover {
+    border-color: var(--accent-soft);
+    color: var(--accent);
+    transform: translateY(-2px);
+  }
+
+  .btn-play {
+    background: #22c55e;
+    color: #fff;
+  }
+  .btn-play:hover {
+    background: #16a34a;
+    transform: translateY(-2px);
+    box-shadow: 0 8px 30px rgba(34, 197, 94, .25);
+  }
+
+  /* ─── STATS BAR ─── */
+  .stats-bar {
+    display: flex;
+    justify-content: center;
+    gap: 3rem;
+    padding: 2.5rem 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .stat {
+    text-align: center;
+  }
+
+  .stat-num {
+    font-family: var(--display);
+    font-size: 2.5rem;
+    color: var(--accent);
+    line-height: 1;
+    margin-bottom: .25rem;
+  }
+
+  .stat-label {
+    font-family: var(--mono);
+    font-size: .7rem;
+    text-transform: uppercase;
+    letter-spacing: .2em;
+    color: var(--text-dim);
+  }
+
+  /* ─── SECTION ─── */
+  .section {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 6rem 1.5rem;
+  }
+
+  .section-label {
+    font-family: var(--mono);
+    font-size: .75rem;
+    text-transform: uppercase;
+    letter-spacing: .25em;
+    color: var(--accent-soft);
+    margin-bottom: .75rem;
+  }
+
+  .section h2 {
+    font-family: var(--display);
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    font-weight: 400;
+    color: var(--cream);
+    margin-bottom: 1.5rem;
+    line-height: 1.1;
+  }
+
+  .section h2 em { font-style: italic; color: var(--accent); }
+
+  .section-intro {
+    max-width: 640px;
+    color: var(--text-dim);
+    font-size: 1.05rem;
+    line-height: 1.75;
+    margin-bottom: 3rem;
+  }
+
+  /* ─── FEATURE GRID ─── */
+  .feat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .feat {
+    background: var(--surface);
+    padding: 2rem;
+    transition: background .3s;
+  }
+
+  .feat:hover {
+    background: var(--surface-raised);
+  }
+
+  .feat-icon {
+    font-size: 1.6rem;
+    margin-bottom: .75rem;
+    display: block;
+  }
+
+  .feat h3 {
+    font-family: var(--body);
+    font-size: .95rem;
+    font-weight: 700;
+    margin-bottom: .5rem;
+    color: var(--cream);
+  }
+
+  .feat p {
+    font-size: .85rem;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  /* ─── ARCH ─── */
+  .arch-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .arch-header {
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+  }
+
+  .arch-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+  }
+  .arch-dot:nth-child(1) { background: var(--crimson); }
+  .arch-dot:nth-child(2) { background: var(--amber); }
+  .arch-dot:nth-child(3) { background: var(--green); }
+
+  .arch-body {
+    padding: 1.5rem;
+    overflow-x: auto;
+  }
+
+  .arch-body pre {
+    font-family: var(--mono);
+    font-size: .78rem;
+    line-height: 1.7;
+    color: var(--accent-soft);
+    white-space: pre;
+    margin: 0;
+  }
+
+  .arch-body .hl { color: var(--accent); }
+  .arch-body .dim { color: var(--text-dim); }
+  .arch-body .grn { color: var(--green); }
+
+  /* ─── STEPS ─── */
+  .steps {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    counter-reset: step;
+  }
+
+  .step {
+    background: var(--surface);
+    padding: 2rem;
+    counter-increment: step;
+    position: relative;
+    transition: background .3s;
+  }
+
+  .step:hover { background: var(--surface-raised); }
+
+  .step::before {
+    content: counter(step, decimal-leading-zero);
+    font-family: var(--mono);
+    font-size: .7rem;
+    color: var(--accent-soft);
+    letter-spacing: .1em;
+    display: block;
+    margin-bottom: .75rem;
+  }
+
+  .step h3 {
+    font-size: .95rem;
+    font-weight: 700;
+    margin-bottom: .4rem;
+    color: var(--cream);
+  }
+
+  .step p {
+    font-size: .85rem;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  /* ─── CODE ─── */
+  .code-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .code-tab {
+    padding: .75rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: .75rem;
+    color: var(--text-dim);
+    letter-spacing: .05em;
+  }
+
+  .code-body {
+    padding: 1.5rem;
+    overflow-x: auto;
+  }
+
+  .code-body code {
+    font-family: var(--mono);
+    font-size: .82rem;
+    line-height: 1.8;
+    color: var(--green);
+    white-space: pre;
+  }
+  .code-body .cmt { color: var(--text-dim); }
+
+  /* ─── COMPARISON TABLE ─── */
+  .stack-table {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .stack-table th,
+  .stack-table td {
+    padding: .85rem 1.25rem;
+    text-align: left;
+    font-size: .88rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .stack-table th {
+    background: var(--surface);
+    font-family: var(--mono);
+    font-size: .7rem;
+    text-transform: uppercase;
+    letter-spacing: .15em;
+    color: var(--text-dim);
+    font-weight: 500;
+  }
+
+  .stack-table td { background: var(--surface); }
+  .stack-table tr:hover td { background: var(--surface-raised); }
+  .stack-table td:first-child { font-weight: 600; color: var(--cream); }
+
+  /* ─── PHONE MOCKUP ─── */
+  .phone-section {
+    text-align: center;
+    padding: 4rem 1.5rem;
+  }
+
+  .phone-grid {
+    display: flex;
+    gap: 2rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-top: 2rem;
+  }
+
+  .phone-grid img {
+    width: 260px;
+    border-radius: 16px;
+    border: 2px solid var(--border);
+    box-shadow: 0 12px 50px rgba(196, 90, 255, .15), 0 4px 20px rgba(0,0,0,.5);
+    transition: transform .3s, box-shadow .3s;
+  }
+
+  .phone-grid img:hover {
+    transform: translateY(-8px) scale(1.02);
+    box-shadow: 0 20px 60px rgba(196, 90, 255, .25), 0 8px 30px rgba(0,0,0,.5);
+  }
+
+  /* ─── KILLER FEATURES ─── */
+  .killer-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-top: 2rem;
+  }
+
+  .killer {
+    background: var(--surface);
+    padding: 1.5rem;
+    text-align: center;
+    transition: background .3s;
+  }
+
+  .killer:hover { background: var(--surface-raised); }
+
+  .killer-num {
+    font-family: var(--display);
+    font-size: 2rem;
+    color: var(--accent);
+    line-height: 1;
+    margin-bottom: .25rem;
+  }
+
+  .killer-label {
+    font-family: var(--mono);
+    font-size: .65rem;
+    text-transform: uppercase;
+    letter-spacing: .15em;
+    color: var(--text-dim);
+  }
+
+  /* ─── VS SECTION ─── */
+  .vs-table {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .vs-table th,
+  .vs-table td {
+    padding: .85rem 1.25rem;
+    text-align: left;
+    font-size: .85rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .vs-table th {
+    background: var(--surface);
+    font-family: var(--mono);
+    font-size: .7rem;
+    text-transform: uppercase;
+    letter-spacing: .15em;
+    color: var(--text-dim);
+    font-weight: 500;
+  }
+
+  .vs-table td { background: var(--surface); }
+  .vs-table tr:hover td { background: var(--surface-raised); }
+  .vs-table td:first-child { font-weight: 600; color: var(--cream); }
+
+  .vs-table .win { color: var(--green); font-weight: 600; }
+
+  /* ─── RELEASE NOTES ─── */
+  .release-body h3 {
+    font-family: var(--body);
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 1.5rem 0 .5rem;
+  }
+
+  .release-body ul {
+    list-style: none;
+    padding: 0;
+  }
+
+  .release-body li {
+    position: relative;
+    padding-left: 1.2em;
+    margin-bottom: .4rem;
+  }
+
+  .release-body li::before {
+    content: '›';
+    position: absolute;
+    left: 0;
+    color: var(--accent-soft);
+    font-weight: 700;
+  }
+
+  .release-body code {
+    font-family: var(--mono);
+    font-size: .82em;
+    color: var(--accent);
+    background: var(--surface);
+    padding: .1em .4em;
+    border-radius: 3px;
+  }
+
+  /* ─── DIVIDER ─── */
+  .divider {
+    max-width: 1000px;
+    margin: 0 auto;
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, var(--border) 20%, var(--accent-deep) 50%, var(--border) 80%, transparent 100%);
+  }
+
+  /* ─── FOOTER ─── */
+  footer {
+    text-align: center;
+    padding: 5rem 1.5rem 4rem;
+    color: var(--text-dim);
+    font-size: .9rem;
+  }
+
+  footer .tagline {
+    font-family: var(--display);
+    font-size: 1.5rem;
+    font-style: italic;
+    color: var(--accent-soft);
+    margin-bottom: .75rem;
+  }
+
+  footer .sub { font-family: var(--mono); font-size: .75rem; letter-spacing: .1em; }
+
+  footer .links {
+    margin-top: 2rem;
+    display: flex;
+    gap: 2rem;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  footer .links a {
+    font-family: var(--mono);
+    font-size: .8rem;
+    color: var(--text-dim);
+    letter-spacing: .05em;
+    transition: color .2s;
+  }
+  footer .links a:hover { color: var(--accent); }
+
+  /* ─── ANIMATIONS ─── */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(24px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .fade-in {
+    opacity: 0;
+    animation: fadeUp .7s ease forwards;
+  }
+  .d1 { animation-delay: .1s; }
+  .d2 { animation-delay: .2s; }
+  .d3 { animation-delay: .35s; }
+  .d4 { animation-delay: .5s; }
+  .d5 { animation-delay: .65s; }
+
+  /* ─── RESPONSIVE ─── */
+  @media (max-width: 768px) {
+    .feat-grid { grid-template-columns: 1fr; }
+    .steps { grid-template-columns: 1fr; }
+    .killer-grid { grid-template-columns: repeat(2, 1fr); }
+    .hero { min-height: auto; padding: 6rem 1rem 4rem; }
+    .section { padding: 4rem 1rem; }
+    .stats-bar { gap: 1.5rem; }
+    .stat-num { font-size: 1.8rem; }
+  }
+
+  @media (max-width: 480px) {
+    .cta-group { flex-direction: column; align-items: stretch; }
+    .btn { justify-content: center; }
+    .killer-grid { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="grain"></div>
+
+<!-- ═══════════════ HERO ═══════════════ -->
+<div class="hero">
+  <div class="hero-claw fade-in d1">🦀</div>
+  <h1 class="fade-in d2">Claw Code <em>Mobile</em></h1>
+  <p class="hero-sub fade-in d3">Claude Code Architecture · On Your Phone · No Server Required</p>
+  <p class="hero-desc fade-in d4">
+    The <strong>48K+ star</strong> open-source AI coding agent framework
+    — running natively on Android in a <strong>full Linux environment</strong>.
+    No Mac. No PC. No server. <strong>Just your phone.</strong>
+  </p>
+  <div class="cta-group fade-in d5">
+    <a href="https://github.com/friuns2/claw-code-android/releases/latest/download/app-prod-release.apk" class="btn btn-primary">⬇ Download APK</a>
+    <a href="https://play.google.com/store/apps/details?id=gptos.intelligence.assistant&hl=en" class="btn btn-play">▶ Google Play</a>
+    <a href="https://github.com/friuns2/claw-code-android" class="btn btn-ghost">GitHub</a>
+  </div>
+</div>
+
+<!-- ═══════════════ STATS ═══════════════ -->
+<div class="stats-bar">
+  <div class="stat">
+    <div class="stat-num">48K+</div>
+    <div class="stat-label">Upstream Stars</div>
+  </div>
+  <div class="stat">
+    <div class="stat-num">19</div>
+    <div class="stat-label">Built-in Tools</div>
+  </div>
+  <div class="stat">
+    <div class="stat-num">15</div>
+    <div class="stat-label">Slash Commands</div>
+  </div>
+  <div class="stat">
+    <div class="stat-num">0</div>
+    <div class="stat-label">Servers Needed</div>
+  </div>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ SCREENSHOTS ═══════════════ -->
+<div class="section phone-section">
+  <p class="section-label">In action</p>
+  <h2>See it <em>running</em> on a phone</h2>
+  <p style="color:var(--text-dim);max-width:500px;margin:0 auto 1rem;font-size:.95rem">This is not a mockup. This is an actual AI coding agent running autonomously on an Android device.</p>
+  <div class="phone-grid">
+    <img src="https://raw.githubusercontent.com/friuns2/claw-code-android/main/screenshots/screenshot.png" alt="Claw Code Mobile — Coding Agent" />
+    <img src="https://raw.githubusercontent.com/friuns2/claw-code-android/main/screenshots/screenshot2.png" alt="Claw Code Mobile — Dashboard" />
+  </div>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ WHY MOBILE ═══════════════ -->
+<div class="section">
+  <p class="section-label">The pitch</p>
+  <h2>Why run Claw Code on a <em>phone</em>?</h2>
+  <p class="section-intro">
+    They said AI coding agents need powerful machines. They were wrong.
+    Modern phones have 8+ cores, 8GB+ RAM, and ARM64 chips that outperform
+    many laptops from a few years ago. All they needed was the right software.
+  </p>
+
+  <div class="feat-grid">
+    <div class="feat">
+      <span class="feat-icon">🚫</span>
+      <h3>No Server Costs</h3>
+      <p>$0/month. No cloud VMs. No SSH tunnels. No port forwarding. Your phone is the server.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">📱</span>
+      <h3>Always With You</h3>
+      <p>Code on the bus. In a café. At the dentist. Wherever your phone goes, your AI agent goes.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">⚡</span>
+      <h3>Instant Setup</h3>
+      <p>Download APK → Open → Login → Code. No terminal. No pip install. No dependency hell.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">🔐</span>
+      <h3>Your Data, Your Device</h3>
+      <p>Everything runs locally. No third-party servers seeing your code. Privacy by architecture.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">🐧</span>
+      <h3>Real Linux</h3>
+      <p>Not a simulation. Full Termux-derived userland with sh, apt, Node.js, Python, and SSL certs.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">🦀</span>
+      <h3>Rust Performance Core</h3>
+      <p>73MB native aarch64-musl binary. 6 Rust crates. 16 runtime modules. Raw native speed.</p>
+    </div>
+  </div>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ CAPABILITIES ═══════════════ -->
+<div class="section">
+  <p class="section-label">Capabilities</p>
+  <h2>Everything Claude Code does, <em>in your pocket</em></h2>
+
+  <div class="killer-grid">
+    <div class="killer">
+      <div class="killer-num">19</div>
+      <div class="killer-label">Built-in Tools</div>
+    </div>
+    <div class="killer">
+      <div class="killer-num">15</div>
+      <div class="killer-label">Slash Commands</div>
+    </div>
+    <div class="killer">
+      <div class="killer-num">6</div>
+      <div class="killer-label">MCP Transports</div>
+    </div>
+    <div class="killer">
+      <div class="killer-num">∞</div>
+      <div class="killer-label">Portability</div>
+    </div>
+  </div>
+
+  <div class="feat-grid" style="margin-top:2rem">
+    <div class="feat">
+      <span class="feat-icon">🔧</span>
+      <h3>19 Agent Tools</h3>
+      <p>File I/O, Bash execution, Git ops, web scraping, notebook editing — each permission-gated and sandboxed.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">🧠</span>
+      <h3>Query Engine</h3>
+      <p>Central intelligence managing LLM API calls, response streaming, caching, and multi-step orchestration.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">🔌</span>
+      <h3>MCP Integration</h3>
+      <p>Full Model Context Protocol — 6 transport types: Stdio, SSE, HTTP, WebSocket, SDK, and proxy.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">👥</span>
+      <h3>Multi-Agent Swarms</h3>
+      <p>Spawn sub-agents to parallelize complex tasks in isolated contexts with shared memory access.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">💾</span>
+      <h3>Session Memory</h3>
+      <p>Multi-layer memory with session persistence, transcript compaction, and context discovery.</p>
+    </div>
+    <div class="feat">
+      <span class="feat-icon">🔮</span>
+      <h3>Provider Agnostic</h3>
+      <p>Claude, OpenAI, local models — works with any LLM provider. Not locked to a single vendor.</p>
+    </div>
+  </div>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ ARCHITECTURE ═══════════════ -->
+<div class="section">
+  <p class="section-label">Under the hood</p>
+  <h2>Four layers, <em>one device</em></h2>
+
+  <div class="arch-wrap">
+    <div class="arch-header">
+      <span class="arch-dot"></span>
+      <span class="arch-dot"></span>
+      <span class="arch-dot"></span>
+    </div>
+    <div class="arch-body">
+<pre>
+<span class="dim">┌────────────────────────────────────────────────────────┐</span>
+<span class="dim">│</span>                    <span class="hl">Android APK</span>                         <span class="dim">│</span>
+<span class="dim">│</span>                                                        <span class="dim">│</span>
+<span class="dim">│</span>  <span class="grn">WebView (Vue.js)</span>  ←→  <span class="hl">CodexServerManager</span>              <span class="dim">│</span>
+<span class="dim">│</span>                                                        <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">┌──────────────────────────────────────────────────┐</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">│</span>  <span class="grn">claw-code agent</span>   → :18923  (HTTP + Vue UI)    <span class="dim">│</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">│</span>    └─ Rust core    (aarch64-musl, JSON-RPC)      <span class="dim">│</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">│</span>                                                  <span class="dim">│</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">│</span>  <span class="hl">agent gateway</span>     → :18789  (WebSocket)         <span class="dim">│</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">│</span>  <span class="hl">control UI</span>        → :19001  (Static files)      <span class="dim">│</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">│</span>                                                  <span class="dim">│</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">│</span>  proxy.js          → :18924  (CONNECT, DNS/TLS)  <span class="dim">│</span>  <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">└──────────────────────────────────────────────────┘</span>  <span class="dim">│</span>
+<span class="dim">└────────────────────────────────────────────────────────┘</span>
+</pre>
+    </div>
+  </div>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ STARTUP ═══════════════ -->
+<div class="section">
+  <p class="section-label">Boot sequence</p>
+  <h2>From cold start to <em>coding</em></h2>
+
+  <div class="steps">
+    <div class="step">
+      <h3>Battery &amp; Service</h3>
+      <p>Request Doze exemption. Start foreground service with persistent notification.</p>
+    </div>
+    <div class="step">
+      <h3>Bootstrap Extraction</h3>
+      <p>Extract Termux bootstrap zip into app's private storage. Full Linux userland, unpacked.</p>
+    </div>
+    <div class="step">
+      <h3>Runtime Installation</h3>
+      <p>Install Node.js 24, Python, clang/cmake/make/lld for native module builds.</p>
+    </div>
+    <div class="step">
+      <h3>Agent Framework</h3>
+      <p>Install Claw Code agent + Rust core. Build native FFI modules from source.</p>
+    </div>
+    <div class="step">
+      <h3>Proxy &amp; Auth</h3>
+      <p>Start CONNECT proxy for DNS/TLS. OAuth login via browser. One-time setup.</p>
+    </div>
+    <div class="step">
+      <h3>Launch</h3>
+      <p>Gateway, Control UI server, web server — then WebView loads and you're coding.</p>
+    </div>
+  </div>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ VS DESKTOP ═══════════════ -->
+<div class="section">
+  <p class="section-label">Comparison</p>
+  <h2>Mobile vs. <em>Desktop</em></h2>
+
+  <table class="vs-table">
+    <thead>
+      <tr><th>Aspect</th><th>Desktop (Mac/Linux/Cloud)</th><th>Mobile (This App)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Platform</td><td>macOS, Linux, WSL</td><td class="win">Android 7.0+ (ARM64)</td></tr>
+      <tr><td>Installation</td><td>pip install + terminal setup</td><td class="win">Download APK → Open → Done</td></tr>
+      <tr><td>Dependencies</td><td>Python, Rust, Node.js</td><td class="win">Nothing. Zero. Nada.</td></tr>
+      <tr><td>Linux</td><td>Native OS</td><td>Embedded in APK</td></tr>
+      <tr><td>Server Cost</td><td>$0–∞ (cloud VMs)</td><td class="win">$0. It's your phone.</td></tr>
+      <tr><td>Portability</td><td>Carry your laptop</td><td class="win">Carry your pocket</td></tr>
+      <tr><td>Background</td><td>Terminal stays open</td><td>Foreground service</td></tr>
+      <tr><td>Agent Features</td><td>19 tools, 15 commands, MCP</td><td>19 tools, 15 commands, MCP</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ QUICK START ═══════════════ -->
+<div class="section">
+  <p class="section-label">Get started</p>
+  <h2>Build from <em>source</em></h2>
+
+  <div class="code-card">
+    <div class="code-tab">terminal</div>
+    <div class="code-body">
+<code><span class="cmt"># clone</span>
+git clone https://github.com/friuns2/claw-code-android.git
+cd claw-code-android
+
+<span class="cmt"># build frontend</span>
+npm install && npm run build
+
+<span class="cmt"># prepare android</span>
+cd android && bash scripts/download-bootstrap.sh
+
+<span class="cmt"># build + install + launch 🦀</span>
+bash scripts/build-server-bundle.sh && ./gradlew assembleDebug \
+  && adb install -r app/build/outputs/apk/debug/app-debug.apk \
+  && adb shell am start -n com.codex.mobile/.MainActivity</code>
+    </div>
+  </div>
+  <p style="margin-top:1.5rem;color:var(--text-dim);font-size:.9rem">
+    Or just <a href="https://github.com/friuns2/claw-code-android/releases/latest/download/app-prod-release.apk">download the latest APK</a> and skip all of this.
+  </p>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ TECH STACK ═══════════════ -->
+<div class="section">
+  <p class="section-label">Stack</p>
+  <h2>What's <em>inside</em></h2>
+
+  <table class="stack-table">
+    <thead><tr><th>Layer</th><th>Technology</th><th>Details</th></tr></thead>
+    <tbody>
+      <tr><td>🦀 Agent Framework</td><td>Claw Code</td><td>Python + Rust clean-room rewrite</td></tr>
+      <tr><td>⚡ Rust Core</td><td>6-crate workspace</td><td>16 runtime modules, zero-dep JSON parser</td></tr>
+      <tr><td>🔧 Tool System</td><td>19 built-in tools</td><td>Permission-gated, sandboxed</td></tr>
+      <tr><td>⌘ Commands</td><td>15 slash commands</td><td>/compact, /model, /session, /cost, etc.</td></tr>
+      <tr><td>🔮 LLM Support</td><td>Provider-agnostic</td><td>Claude, OpenAI, local models</td></tr>
+      <tr><td>🌐 Runtime</td><td>Node.js 24</td><td>Via Termux package manager</td></tr>
+      <tr><td>🖥️ Frontend</td><td>Vue.js 3 + Vite + Tailwind</td><td>Served via embedded HTTP</td></tr>
+      <tr><td>📱 Android</td><td>Kotlin + WebView</td><td>Foreground service, OAuth</td></tr>
+      <tr><td>🐧 Linux</td><td>Termux bootstrap</td><td>aarch64, extracted from APK</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ RELEASE NOTES ═══════════════ -->
+<div class="section" id="release">
+  <p class="section-label">Latest upstream release</p>
+  <!-- RELEASE_START -->
+  <h2><em>Checking for latest release...</em></h2>
+  <p class="release-date" style="font-family:var(--mono);font-size:.8rem;color:var(--text-dim);margin-bottom:2rem">Synced automatically from upstream</p>
+  <div class="release-body" style="color:var(--text-dim);font-size:.92rem;line-height:1.75;max-width:800px">
+  </div>
+  <!-- RELEASE_END -->
+  <p style="margin-top:2rem">
+    <a href="https://github.com/instructkr/claw-code/releases" class="btn btn-ghost" style="display:inline-flex">All Releases</a>
+  </p>
+</div>
+
+<div class="divider"></div>
+
+<!-- ═══════════════ FOOTER ═══════════════ -->
+<footer>
+  <div class="tagline">Your pocket called. It wants to write some code.</div>
+  <div class="sub">Built by shoving an entire Linux distro + AI agent framework into an APK and refusing to give up.</div>
+  <div class="links">
+    <a href="https://github.com/friuns2/claw-code-android">GitHub</a>
+    <a href="https://github.com/friuns2/claw-code-android/releases/latest/download/app-prod-release.apk">Download</a>
+    <a href="https://play.google.com/store/apps/details?id=gptos.intelligence.assistant&hl=en">Google Play</a>
+    <a href="https://claw-code.codes">Claw Code</a>
+    <a href="https://github.com/instructkr/claw-code">Upstream</a>
+  </div>
+</footer>
+
+</body>
+</html>
