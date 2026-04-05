@@ -8,6 +8,13 @@ pub enum ApiError {
         provider: &'static str,
         env_vars: &'static [&'static str],
     },
+    ContextWindowExceeded {
+        model: String,
+        estimated_input_tokens: u32,
+        requested_output_tokens: u32,
+        estimated_total_tokens: u32,
+        context_window_tokens: u32,
+    },
     ExpiredOAuthToken,
     Auth(String),
     InvalidApiKeyEnv(VarError),
@@ -48,6 +55,7 @@ impl ApiError {
             Self::Api { retryable, .. } => *retryable,
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
             | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
@@ -66,6 +74,16 @@ impl Display for ApiError {
                 f,
                 "missing {provider} credentials; export {} before calling the {provider} API",
                 env_vars.join(" or ")
+            ),
+            Self::ContextWindowExceeded {
+                model,
+                estimated_input_tokens,
+                requested_output_tokens,
+                estimated_total_tokens,
+                context_window_tokens,
+            } => write!(
+                f,
+                "context_window_blocked for {model}: estimated input {estimated_input_tokens} + requested output {requested_output_tokens} = {estimated_total_tokens} tokens exceeds the {context_window_tokens}-token context window; compact the session or reduce request size before retrying"
             ),
             Self::ExpiredOAuthToken => {
                 write!(

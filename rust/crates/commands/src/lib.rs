@@ -2142,13 +2142,22 @@ pub fn handle_plugins_slash_command(
 }
 
 pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
+    if let Some(args) = normalize_optional_args(args) {
+        if let Some(help_path) = help_path_from_args(args) {
+            return Ok(match help_path.as_slice() {
+                [] => render_agents_usage(None),
+                _ => render_agents_usage(Some(&help_path.join(" "))),
+            });
+        }
+    }
+
     match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_definition_roots(cwd, "agents");
             let agents = load_agents_from_roots(&roots)?;
             Ok(render_agents_report(&agents))
         }
-        Some("-h" | "--help" | "help") => Ok(render_agents_usage(None)),
+        Some(args) if is_help_arg(args) => Ok(render_agents_usage(None)),
         Some(args) => Ok(render_agents_usage(Some(args))),
     }
 }
@@ -2162,6 +2171,16 @@ pub fn handle_mcp_slash_command(
 }
 
 pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
+    if let Some(args) = normalize_optional_args(args) {
+        if let Some(help_path) = help_path_from_args(args) {
+            return Ok(match help_path.as_slice() {
+                [] => render_skills_usage(None),
+                ["install", ..] => render_skills_usage(Some("install")),
+                _ => render_skills_usage(Some(&help_path.join(" "))),
+            });
+        }
+    }
+
     match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_skill_roots(cwd);
@@ -2177,7 +2196,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             let install = install_skill(target, cwd)?;
             Ok(render_skill_install_report(&install))
         }
-        Some("-h" | "--help" | "help") => Ok(render_skills_usage(None)),
+        Some(args) if is_help_arg(args) => Ok(render_skills_usage(None)),
         Some(args) => Ok(render_skills_usage(Some(args))),
     }
 }
@@ -2187,6 +2206,16 @@ fn render_mcp_report_for(
     cwd: &Path,
     args: Option<&str>,
 ) -> Result<String, runtime::ConfigError> {
+    if let Some(args) = normalize_optional_args(args) {
+        if let Some(help_path) = help_path_from_args(args) {
+            return Ok(match help_path.as_slice() {
+                [] => render_mcp_usage(None),
+                ["show", ..] => render_mcp_usage(Some("show")),
+                _ => render_mcp_usage(Some(&help_path.join(" "))),
+            });
+        }
+    }
+
     match normalize_optional_args(args) {
         None | Some("list") => {
             let runtime_config = loader.load()?;
@@ -2195,7 +2224,7 @@ fn render_mcp_report_for(
                 runtime_config.mcp().servers(),
             ))
         }
-        Some("-h" | "--help" | "help") => Ok(render_mcp_usage(None)),
+        Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
         Some("show") => Ok(render_mcp_usage(Some("show"))),
         Some(args) if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
@@ -3034,6 +3063,16 @@ fn render_mcp_server_report(
 }
 fn normalize_optional_args(args: Option<&str>) -> Option<&str> {
     args.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn is_help_arg(arg: &str) -> bool {
+    matches!(arg, "help" | "-h" | "--help")
+}
+
+fn help_path_from_args(args: &str) -> Option<Vec<&str>> {
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    let help_index = parts.iter().position(|part| is_help_arg(part))?;
+    Some(parts[..help_index].to_vec())
 }
 
 fn render_agents_usage(unexpected: Option<&str>) -> String {
@@ -4005,7 +4044,17 @@ mod tests {
 
         let skills_unexpected =
             super::handle_skills_slash_command(Some("show help"), &cwd).expect("skills usage");
-        assert!(skills_unexpected.contains("Unexpected       show help"));
+        assert!(skills_unexpected.contains("Unexpected       show"));
+
+        let skills_install_help = super::handle_skills_slash_command(Some("install --help"), &cwd)
+            .expect("nested skills help");
+        assert!(skills_install_help.contains("Usage            /skills [list|install <path>|help]"));
+        assert!(skills_install_help.contains("Unexpected       install"));
+
+        let skills_unknown_help =
+            super::handle_skills_slash_command(Some("show --help"), &cwd).expect("skills help");
+        assert!(skills_unknown_help.contains("Usage            /skills [list|install <path>|help]"));
+        assert!(skills_unknown_help.contains("Unexpected       show"));
 
         let _ = fs::remove_dir_all(cwd);
     }
@@ -4021,6 +4070,16 @@ mod tests {
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
         assert!(unexpected.contains("Unexpected       show alpha beta"));
+
+        let nested_help =
+            super::handle_mcp_slash_command(Some("show --help"), &cwd).expect("mcp help");
+        assert!(nested_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(nested_help.contains("Unexpected       show"));
+
+        let unknown_help =
+            super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
+        assert!(unknown_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(unknown_help.contains("Unexpected       inspect"));
 
         let _ = fs::remove_dir_all(cwd);
     }

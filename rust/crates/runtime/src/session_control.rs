@@ -4,7 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-
 use crate::session::{Session, SessionError};
 
 pub const PRIMARY_SESSION_EXTENSION: &str = "jsonl";

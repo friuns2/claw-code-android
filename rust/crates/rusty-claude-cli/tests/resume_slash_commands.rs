@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::ContentBlock;
 use runtime::Session;
+use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -219,6 +220,52 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     assert!(stdout.contains("Status"));
     assert!(stdout.contains("Messages         2"));
     assert!(stdout.contains(newer_path.to_str().expect("utf8 path")));
+}
+
+#[test]
+fn resumed_status_command_emits_structured_json_when_requested() {
+    // given
+    let temp_dir = unique_temp_dir("resume-status-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+
+    let mut session = Session::new();
+    session
+        .push_user_text("resume status json fixture")
+        .expect("session write should succeed");
+    session
+        .save_to_path(&session_path)
+        .expect("session should persist");
+
+    // when
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/status",
+        ],
+    );
+
+    // then
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("resume status output should be json");
+    assert_eq!(parsed["kind"], "status");
+    assert_eq!(parsed["messages"], 1);
+    assert_eq!(
+        parsed["workspace"]["session"],
+        session_path.to_str().expect("utf8 path")
+    );
 }
 
 fn run_claw(current_dir: &Path, args: &[&str]) -> Output {

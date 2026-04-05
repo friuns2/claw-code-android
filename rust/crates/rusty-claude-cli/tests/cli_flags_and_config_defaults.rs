@@ -160,6 +160,42 @@ fn config_command_loads_defaults_from_standard_config_locations() {
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
 
+#[test]
+fn nested_help_flags_render_usage_instead_of_falling_through() {
+    let temp_dir = unique_temp_dir("nested-help");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+
+    let mcp_output = command_in(&temp_dir)
+        .args(["mcp", "show", "--help"])
+        .output()
+        .expect("claw should launch");
+    assert_success(&mcp_output);
+    let mcp_stdout = String::from_utf8(mcp_output.stdout).expect("stdout should be utf8");
+    assert!(mcp_stdout.contains("Usage            /mcp [list|show <server>|help]"));
+    assert!(mcp_stdout.contains("Unexpected       show"));
+    assert!(!mcp_stdout.contains("server `--help` is not configured"));
+
+    let skills_output = command_in(&temp_dir)
+        .args(["skills", "install", "--help"])
+        .output()
+        .expect("claw should launch");
+    assert_success(&skills_output);
+    let skills_stdout = String::from_utf8(skills_output.stdout).expect("stdout should be utf8");
+    assert!(skills_stdout.contains("Usage            /skills [list|install <path>|help]"));
+    assert!(skills_stdout.contains("Unexpected       install"));
+
+    let unknown_output = command_in(&temp_dir)
+        .args(["mcp", "inspect", "--help"])
+        .output()
+        .expect("claw should launch");
+    assert_success(&unknown_output);
+    let unknown_stdout = String::from_utf8(unknown_output.stdout).expect("stdout should be utf8");
+    assert!(unknown_stdout.contains("Usage            /mcp [list|show <server>|help]"));
+    assert!(unknown_stdout.contains("Unexpected       inspect"));
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
 fn command_in(cwd: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command.current_dir(cwd);
