@@ -28,6 +28,7 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
 /// Validate that a resolved path stays within the given workspace root.
 /// Returns the canonical path on success, or an error if the path escapes
 /// the workspace boundary (e.g. via `../` traversal or symlink).
+#[allow(dead_code)]
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
     if !resolved.starts_with(workspace_root) {
         return Err(io::Error::new(
@@ -557,6 +558,7 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
 }
 
 /// Read a file with workspace boundary enforcement.
+#[allow(dead_code)]
 pub fn read_file_in_workspace(
     path: &str,
     offset: Option<usize>,
@@ -572,6 +574,7 @@ pub fn read_file_in_workspace(
 }
 
 /// Write a file with workspace boundary enforcement.
+#[allow(dead_code)]
 pub fn write_file_in_workspace(
     path: &str,
     content: &str,
@@ -586,6 +589,7 @@ pub fn write_file_in_workspace(
 }
 
 /// Edit a file with workspace boundary enforcement.
+#[allow(dead_code)]
 pub fn edit_file_in_workspace(
     path: &str,
     old_string: &str,
@@ -602,6 +606,7 @@ pub fn edit_file_in_workspace(
 }
 
 /// Check whether a path is a symlink that resolves outside the workspace.
+#[allow(dead_code)]
 pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_symlink() {
