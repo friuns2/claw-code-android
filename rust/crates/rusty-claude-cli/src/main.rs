@@ -1570,24 +1570,19 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                         && matches!(command, SlashCommand::Status)
                     {
                         let tracker = UsageTracker::from_session(&session);
-                        let usage = tracker.cumulative_usage();
                         let context = status_context(Some(&resolved_path)).expect("status context");
-                        let value = json!({
-                            "kind": "status",
-                            "messages": session.messages.len(),
-                            "turns": tracker.turns(),
-                            "latest_total": tracker.current_turn_usage().total_tokens(),
-                            "cumulative_input": usage.input_tokens,
-                            "cumulative_output": usage.output_tokens,
-                            "cumulative_total": usage.total_tokens(),
-                            "workspace": {
-                                "cwd": context.cwd,
-                                "project_root": context.project_root,
-                                "git_branch": context.git_branch,
-                                "git_state": context.git_summary.headline(),
-                                "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
-                            }
-                        });
+                        let value = status_json_value(
+                            "restored-session",
+                            StatusUsage {
+                                message_count: session.messages.len(),
+                                turns: tracker.turns(),
+                                latest: tracker.current_turn_usage(),
+                                cumulative: tracker.cumulative_usage(),
+                                estimated_tokens: 0,
+                            },
+                            default_permission_mode().as_str(),
+                            &context,
+                        );
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&value).expect("status json")
@@ -3845,52 +3840,66 @@ fn print_status_snapshot(
         ),
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "status",
-                "model": model,
-                "permission_mode": permission_mode.as_str(),
-                "usage": {
-                    "messages": usage.message_count,
-                    "turns": usage.turns,
-                    "latest_total": usage.latest.total_tokens(),
-                    "cumulative_input": usage.cumulative.input_tokens,
-                    "cumulative_output": usage.cumulative.output_tokens,
-                    "cumulative_total": usage.cumulative.total_tokens(),
-                    "estimated_tokens": usage.estimated_tokens,
-                },
-                "workspace": {
-                    "cwd": context.cwd,
-                    "project_root": context.project_root,
-                    "git_branch": context.git_branch,
-                    "git_state": context.git_summary.headline(),
-                    "changed_files": context.git_summary.changed_files,
-                    "staged_files": context.git_summary.staged_files,
-                    "unstaged_files": context.git_summary.unstaged_files,
-                    "untracked_files": context.git_summary.untracked_files,
-                    "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
-                    "loaded_config_files": context.loaded_config_files,
-                    "discovered_config_files": context.discovered_config_files,
-                    "memory_file_count": context.memory_file_count,
-                },
-                "sandbox": {
-                    "enabled": context.sandbox_status.enabled,
-                    "active": context.sandbox_status.active,
-                    "supported": context.sandbox_status.supported,
-                    "in_container": context.sandbox_status.in_container,
-                    "requested_namespace": context.sandbox_status.requested.namespace_restrictions,
-                    "active_namespace": context.sandbox_status.namespace_active,
-                    "requested_network": context.sandbox_status.requested.network_isolation,
-                    "active_network": context.sandbox_status.network_active,
-                    "filesystem_mode": context.sandbox_status.filesystem_mode.as_str(),
-                    "filesystem_active": context.sandbox_status.filesystem_active,
-                    "allowed_mounts": context.sandbox_status.allowed_mounts,
-                    "markers": context.sandbox_status.container_markers,
-                    "fallback_reason": context.sandbox_status.fallback_reason,
-                }
-            }))?
+            serde_json::to_string_pretty(&status_json_value(
+                model,
+                usage,
+                permission_mode.as_str(),
+                &context,
+            ))?
         ),
     }
     Ok(())
+}
+
+fn status_json_value(
+    model: &str,
+    usage: StatusUsage,
+    permission_mode: &str,
+    context: &StatusContext,
+) -> serde_json::Value {
+    json!({
+        "kind": "status",
+        "model": model,
+        "permission_mode": permission_mode,
+        "usage": {
+            "messages": usage.message_count,
+            "turns": usage.turns,
+            "latest_total": usage.latest.total_tokens(),
+            "cumulative_input": usage.cumulative.input_tokens,
+            "cumulative_output": usage.cumulative.output_tokens,
+            "cumulative_total": usage.cumulative.total_tokens(),
+            "estimated_tokens": usage.estimated_tokens,
+        },
+        "workspace": {
+            "cwd": context.cwd,
+            "project_root": context.project_root,
+            "git_branch": context.git_branch,
+            "git_state": context.git_summary.headline(),
+            "changed_files": context.git_summary.changed_files,
+            "staged_files": context.git_summary.staged_files,
+            "unstaged_files": context.git_summary.unstaged_files,
+            "untracked_files": context.git_summary.untracked_files,
+            "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+            "loaded_config_files": context.loaded_config_files,
+            "discovered_config_files": context.discovered_config_files,
+            "memory_file_count": context.memory_file_count,
+        },
+        "sandbox": {
+            "enabled": context.sandbox_status.enabled,
+            "active": context.sandbox_status.active,
+            "supported": context.sandbox_status.supported,
+            "in_container": context.sandbox_status.in_container,
+            "requested_namespace": context.sandbox_status.requested.namespace_restrictions,
+            "active_namespace": context.sandbox_status.namespace_active,
+            "requested_network": context.sandbox_status.requested.network_isolation,
+            "active_network": context.sandbox_status.network_active,
+            "filesystem_mode": context.sandbox_status.filesystem_mode.as_str(),
+            "filesystem_active": context.sandbox_status.filesystem_active,
+            "allowed_mounts": context.sandbox_status.allowed_mounts,
+            "markers": context.sandbox_status.container_markers,
+            "fallback_reason": context.sandbox_status.fallback_reason,
+        }
+    })
 }
 
 fn status_context(

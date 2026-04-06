@@ -130,7 +130,10 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         ],
     );
     assert_eq!(resumed["kind"], "status");
-    assert_eq!(resumed["messages"], 1);
+    assert_eq!(resumed["model"], "restored-session");
+    assert_eq!(resumed["usage"]["messages"], 1);
+    assert!(resumed["workspace"]["cwd"].as_str().is_some());
+    assert!(resumed["sandbox"]["filesystem_mode"].as_str().is_some());
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {

@@ -261,11 +261,18 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     let parsed: Value =
         serde_json::from_str(stdout.trim()).expect("resume status output should be json");
     assert_eq!(parsed["kind"], "status");
-    assert_eq!(parsed["messages"], 1);
+    assert_eq!(parsed["model"], "restored-session");
+    assert_eq!(parsed["permission_mode"], "danger-full-access");
+    assert_eq!(parsed["usage"]["messages"], 1);
+    assert!(parsed["usage"]["turns"].is_number());
+    assert!(parsed["workspace"]["cwd"].as_str().is_some());
     assert_eq!(
         parsed["workspace"]["session"],
         session_path.to_str().expect("utf8 path")
     );
+    assert!(parsed["workspace"]["changed_files"].is_number());
+    assert_eq!(parsed["workspace"]["loaded_config_files"].as_u64(), Some(0));
+    assert!(parsed["sandbox"]["filesystem_mode"].as_str().is_some());
 }
 
 fn run_claw(current_dir: &Path, args: &[&str]) -> Output {
