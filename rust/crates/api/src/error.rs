@@ -103,7 +103,11 @@ impl ApiError {
     #[must_use]
     pub fn safe_failure_class(&self) -> &'static str {
         match self {
-            Self::RetriesExhausted { .. } => "provider_retry_exhausted",
+            Self::RetriesExhausted { .. } if self.is_context_window_failure() => "context_window",
+            Self::RetriesExhausted { .. } if self.is_generic_fatal_wrapper() => {
+                "provider_retry_exhausted"
+            }
+            Self::RetriesExhausted { last_error, .. } => last_error.safe_failure_class(),
             Self::MissingCredentials { .. } | Self::ExpiredOAuthToken | Self::Auth(_) => {
                 "provider_auth"
             }

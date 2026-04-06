@@ -1599,8 +1599,13 @@ fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::E
         println!("Listening for callback on {redirect_uri}");
     }
     if let Err(error) = open_browser(&authorize_url) {
-        eprintln!("warning: failed to open browser automatically: {error}");
-        println!("Open this URL manually:\n{authorize_url}");
+        emit_login_browser_open_failure(
+            output_format,
+            &authorize_url,
+            &error,
+            &mut io::stdout(),
+            &mut io::stderr(),
+        )?;
     }
 
     let callback = wait_for_oauth_callback(callback_port)?;
@@ -1649,6 +1654,23 @@ fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::E
         ),
     }
     Ok(())
+}
+
+fn emit_login_browser_open_failure(
+    output_format: CliOutputFormat,
+    authorize_url: &str,
+    error: &io::Error,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> io::Result<()> {
+    writeln!(
+        stderr,
+        "warning: failed to open browser automatically: {error}"
+    )?;
+    match output_format {
+        CliOutputFormat::Text => writeln!(stdout, "Open this URL manually:\n{authorize_url}"),
+        CliOutputFormat::Json => writeln!(stderr, "Open this URL manually:\n{authorize_url}"),
+    }
 }
 
 fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -5586,13 +5608,29 @@ impl AnthropicRuntimeClient {
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_startup_auth_source(|| {
-        let cwd = env::current_dir().map_err(api::ApiError::from)?;
-        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
-            api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
-        })?;
-        Ok(config.oauth().cloned())
-    })?)
+    let cwd = env::current_dir()?;
+    Ok(resolve_cli_auth_source_for_cwd(&cwd, default_oauth_config)?)
+}
+
+fn resolve_cli_auth_source_for_cwd<F>(
+    cwd: &Path,
+    default_oauth: F,
+) -> Result<AuthSource, api::ApiError>
+where
+    F: FnOnce() -> OAuthConfig,
+{
+    resolve_startup_auth_source(|| {
+        Ok(Some(
+            load_runtime_oauth_config_for(cwd)?.unwrap_or_else(default_oauth),
+        ))
+    })
+}
+
+fn load_runtime_oauth_config_for(cwd: &Path) -> Result<Option<OAuthConfig>, api::ApiError> {
+    let config = ConfigLoader::default_for(cwd).load().map_err(|error| {
+        api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
+    })?;
+    Ok(config.oauth().cloned())
 }
 
 impl ApiClient for AnthropicRuntimeClient {
@@ -5632,6 +5670,7 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut markdown_stream = MarkdownStreamState::default();
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
+            let mut block_has_thinking_summary = false;
             let mut saw_stop = false;
 
             while let Some(event) = stream.next_event().await.map_err(|error| {
@@ -5640,7 +5679,14 @@ impl ApiClient for AnthropicRuntimeClient {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(block, out, &mut events, &mut pending_tool, true)?;
+                            push_output_block(
+                                block,
+                                out,
+                                &mut events,
+                                &mut pending_tool,
+                                true,
+                                &mut block_has_thinking_summary,
+                            )?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
@@ -5650,6 +5696,7 @@ impl ApiClient for AnthropicRuntimeClient {
                             &mut events,
                             &mut pending_tool,
                             true,
+                            &mut block_has_thinking_summary,
                         )?;
                     }
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -5671,10 +5718,16 @@ impl ApiClient for AnthropicRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
+                        ContentBlockDelta::ThinkingDelta { .. } => {
+                            if !block_has_thinking_summary {
+                                render_thinking_block_summary(out, None, false)?;
+                                block_has_thinking_summary = true;
+                            }
+                        }
+                        ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
+                        block_has_thinking_summary = false;
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
                             write!(out, "{rendered}")
                                 .and_then(|()| out.flush())
@@ -5742,7 +5795,7 @@ impl ApiClient for AnthropicRuntimeClient {
 }
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
-    if error.safe_failure_class() == "context_window" {
+    if error.is_context_window_failure() {
         format_context_window_blocked_error(session_id, error)
     } else if error.is_generic_fatal_wrapper() {
         let mut qualifiers = vec![format!("session {session_id}")];
@@ -6409,12 +6462,30 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
     preview
 }
 
+fn render_thinking_block_summary(
+    out: &mut (impl Write + ?Sized),
+    char_count: Option<usize>,
+    redacted: bool,
+) -> Result<(), RuntimeError> {
+    let summary = if redacted {
+        "\n▶ Thinking block hidden by provider\n".to_string()
+    } else if let Some(char_count) = char_count {
+        format!("\n▶ Thinking ({char_count} chars hidden)\n")
+    } else {
+        "\n▶ Thinking hidden\n".to_string()
+    };
+    write!(out, "{summary}")
+        .and_then(|()| out.flush())
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
 fn push_output_block(
     block: OutputContentBlock,
     out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
+    block_has_thinking_summary: &mut bool,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
@@ -6440,7 +6511,14 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        OutputContentBlock::Thinking { thinking, .. } => {
+            render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
+            *block_has_thinking_summary = true;
+        }
+        OutputContentBlock::RedactedThinking { .. } => {
+            render_thinking_block_summary(out, None, true)?;
+            *block_has_thinking_summary = true;
+        }
     }
     Ok(())
 }
@@ -6453,7 +6531,15 @@ fn response_to_events(
     let mut pending_tool = None;
 
     for block in response.content {
-        push_output_block(block, out, &mut events, &mut pending_tool, false)?;
+        let mut block_has_thinking_summary = false;
+        push_output_block(
+            block,
+            out,
+            &mut events,
+            &mut pending_tool,
+            false,
+            &mut block_has_thinking_summary,
+        )?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -6841,14 +6927,17 @@ mod tests {
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
-        PermissionMode, Session, ToolExecutor,
+        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
+        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
 
@@ -6986,6 +7075,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retry_wrapped_context_window_errors_keep_recovery_guidance() {
+        let error = ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(ApiError::Api {
+                status: "413".parse().expect("status"),
+                error_type: Some("invalid_request_error".to_string()),
+                message: Some("Request is too large for this model's context window.".to_string()),
+                request_id: Some("req_ctx_retry_789".to_string()),
+                body: String::new(),
+                retryable: false,
+            }),
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("Context window blocked"), "{rendered}");
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Trace            req_ctx_retry_789"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Detail           Request is too large for this model's context window."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            "{rendered}"
+        );
+    }
+
     fn temp_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -7016,6 +7138,36 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn sample_oauth_config(token_url: String) -> OAuthConfig {
+        OAuthConfig {
+            client_id: "runtime-client".to_string(),
+            authorize_url: "https://console.test/oauth/authorize".to_string(),
+            token_url,
+            callback_port: Some(4545),
+            manual_redirect_url: Some("https://console.test/oauth/callback".to_string()),
+            scopes: vec!["org:create_api_key".to_string(), "user:profile".to_string()],
+        }
+    }
+
+    fn spawn_token_server(response_body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        format!("http://{address}/oauth/token")
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
@@ -7154,6 +7306,78 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
+    }
+
+    #[test]
+    fn load_runtime_oauth_config_for_returns_none_without_project_config() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        std::fs::create_dir_all(&root).expect("workspace should exist");
+
+        let oauth = super::load_runtime_oauth_config_for(&root)
+            .expect("loading config should succeed when files are absent");
+
+        std::fs::remove_dir_all(root).expect("temp workspace should clean up");
+
+        assert_eq!(oauth, None);
+    }
+
+    #[test]
+    fn resolve_cli_auth_source_uses_default_oauth_when_runtime_config_is_missing() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        let config_home = temp_dir();
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let original_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+
+        save_oauth_credentials(&runtime::OAuthTokenSet {
+            access_token: "expired-access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            expires_at: Some(0),
+            scopes: vec!["org:create_api_key".to_string(), "user:profile".to_string()],
+        })
+        .expect("save expired oauth credentials");
+
+        let token_url = spawn_token_server(
+            r#"{"access_token":"refreshed-access-token","refresh_token":"refreshed-refresh-token","expires_at":4102444800,"scopes":["org:create_api_key","user:profile"]}"#,
+        );
+
+        let auth =
+            super::resolve_cli_auth_source_for_cwd(&workspace, || sample_oauth_config(token_url))
+                .expect("expired saved oauth should refresh via default config");
+
+        let stored = load_oauth_credentials()
+            .expect("load stored credentials")
+            .expect("stored credentials should exist");
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_auth_token {
+            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
+            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+        }
+        std::fs::remove_dir_all(workspace).expect("temp workspace should clean up");
+        std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
+
+        assert_eq!(auth.bearer_token(), Some("refreshed-access-token"));
+        assert_eq!(stored.access_token, "refreshed-access-token");
+        assert_eq!(
+            stored.refresh_token.as_deref(),
+            Some("refreshed-refresh-token")
+        );
     }
 
     #[test]
@@ -7552,6 +7776,17 @@ mod tests {
             CliAction::Skills {
                 args: Some("install ./fixtures/help-skill".to_string()),
                 output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["/skills".to_string(), "/test".to_string()])
+                .expect("/skills /test should normalize to a single skill prompt prefix"),
+            CliAction::Prompt {
+                prompt: "$test".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -8636,6 +8871,7 @@ UU conflicted.rs",
         let mut out = Vec::new();
         let mut events = Vec::new();
         let mut pending_tool = None;
+        let mut block_has_thinking_summary = false;
 
         push_output_block(
             OutputContentBlock::Text {
@@ -8645,6 +8881,7 @@ UU conflicted.rs",
             &mut events,
             &mut pending_tool,
             false,
+            &mut block_has_thinking_summary,
         )
         .expect("text block should render");
 
@@ -8658,6 +8895,7 @@ UU conflicted.rs",
         let mut out = Vec::new();
         let mut events = Vec::new();
         let mut pending_tool = None;
+        let mut block_has_thinking_summary = false;
 
         push_output_block(
             OutputContentBlock::ToolUse {
@@ -8669,6 +8907,7 @@ UU conflicted.rs",
             &mut events,
             &mut pending_tool,
             true,
+            &mut block_has_thinking_summary,
         )
         .expect("tool block should accumulate");
 
@@ -8750,7 +8989,7 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn response_to_events_ignores_thinking_blocks() {
+    fn response_to_events_renders_collapsed_thinking_summary() {
         let mut out = Vec::new();
         let events = response_to_events(
             MessageResponse {
@@ -8785,7 +9024,34 @@ UU conflicted.rs",
             &events[0],
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
-        assert!(!String::from_utf8(out).expect("utf8").contains("step 1"));
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("▶ Thinking (6 chars hidden)"));
+        assert!(!rendered.contains("step 1"));
+    }
+
+    #[test]
+    fn login_browser_failure_keeps_json_stdout_clean() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no supported browser opener command found",
+        );
+
+        super::emit_login_browser_open_failure(
+            CliOutputFormat::Json,
+            "https://example.test/oauth/authorize",
+            &error,
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("browser warning should render");
+
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).expect("utf8");
+        assert!(stderr.contains("failed to open browser automatically"));
+        assert!(stderr.contains("Open this URL manually:"));
+        assert!(stderr.contains("https://example.test/oauth/authorize"));
     }
 
     #[test]

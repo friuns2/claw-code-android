@@ -2293,8 +2293,51 @@ pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
         Some(args) if args == "install" || args.starts_with("install ") => {
             SkillSlashDispatch::Local
         }
-        Some(args) => SkillSlashDispatch::Invoke(format!("${args}")),
+        Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
     }
+}
+
+/// Resolve a skill invocation by validating the skill exists on disk before
+/// returning the dispatch.  When the skill is not found, returns `Err` with a
+/// human-readable message that lists nearby skill names.
+pub fn resolve_skill_invocation(
+    cwd: &Path,
+    args: Option<&str>,
+) -> Result<SkillSlashDispatch, String> {
+    let dispatch = classify_skills_slash_command(args);
+    if let SkillSlashDispatch::Invoke(ref prompt) = dispatch {
+        // Extract the skill name from the "$skill [args]" prompt.
+        let skill_token = prompt
+            .trim_start_matches('$')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        if !skill_token.is_empty() {
+            if let Err(error) = resolve_skill_path(cwd, skill_token) {
+                let mut message =
+                    format!("Unknown skill: {skill_token} ({error})");
+                let roots = discover_skill_roots(cwd);
+                if let Ok(available) = load_skills_from_roots(&roots) {
+                    let names: Vec<String> = available
+                        .iter()
+                        .filter(|s| s.shadowed_by.is_none())
+                        .map(|s| s.name.clone())
+                        .collect();
+                    if !names.is_empty() {
+                        message.push_str(&format!(
+                            "\n  Available skills: {}",
+                            names.join(", ")
+                        ));
+                    }
+                }
+                message.push_str(
+                    "\n  Usage: /skills [list|install <path>|help|<skill> [args]]",
+                );
+                return Err(message);
+            }
+        }
+    }
+    Ok(dispatch)
 }
 
 pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
@@ -4300,6 +4343,10 @@ mod tests {
         assert_eq!(
             classify_skills_slash_command(Some("help overview")),
             SkillSlashDispatch::Invoke("$help overview".to_string())
+        );
+        assert_eq!(
+            classify_skills_slash_command(Some("/test")),
+            SkillSlashDispatch::Invoke("$test".to_string())
         );
         assert_eq!(
             classify_skills_slash_command(Some("install ./skill-pack")),
