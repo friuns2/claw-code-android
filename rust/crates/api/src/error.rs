@@ -7,6 +7,16 @@ const GENERIC_FATAL_WRAPPER_MARKERS: &[&str] = &[
     "please try again, or use /new to start a fresh session",
 ];
 
+const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
+    "maximum context length",
+    "context window",
+    "context length",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+    "request is too large",
+];
+
 #[derive(Debug)]
 pub enum ApiError {
     MissingCredentials {
@@ -99,6 +109,7 @@ impl ApiError {
             }
             Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => "provider_auth",
             Self::ContextWindowExceeded { .. } => "context_window",
+            Self::Api { .. } if self.is_context_window_failure() => "context_window",
             Self::Api { status, .. } if status.as_u16() == 429 => "provider_rate_limit",
             Self::Api { .. } if self.is_generic_fatal_wrapper() => "provider_internal",
             Self::Api { .. } => "provider_error",
@@ -121,6 +132,35 @@ impl ApiError {
             Self::RetriesExhausted { last_error, .. } => last_error.is_generic_fatal_wrapper(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. } => false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_context_window_failure(&self) -> bool {
+        match self {
+            Self::ContextWindowExceeded { .. } => true,
+            Self::Api {
+                status,
+                message,
+                body,
+                ..
+            } => {
+                matches!(status.as_u16(), 400 | 413 | 422)
+                    && (message
+                        .as_deref()
+                        .is_some_and(looks_like_context_window_error)
+                        || looks_like_context_window_error(body))
+            }
+            Self::RetriesExhausted { last_error, .. } => last_error.is_context_window_failure(),
+            Self::MissingCredentials { .. }
             | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
@@ -235,6 +275,13 @@ fn looks_like_generic_fatal_wrapper(text: &str) -> bool {
         .any(|marker| lowered.contains(marker))
 }
 
+fn looks_like_context_window_error(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    CONTEXT_WINDOW_ERROR_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::ApiError;
@@ -279,5 +326,24 @@ mod tests {
         assert!(error.is_generic_fatal_wrapper());
         assert_eq!(error.safe_failure_class(), "provider_retry_exhausted");
         assert_eq!(error.request_id(), Some("req_nested_456"));
+    }
+
+    #[test]
+    fn classifies_provider_context_window_errors() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some(
+                "This model's maximum context length is 200000 tokens, but your request used 230000 tokens."
+                    .to_string(),
+            ),
+            request_id: Some("req_ctx_123".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        assert!(error.is_context_window_failure());
+        assert_eq!(error.safe_failure_class(), "context_window");
+        assert_eq!(error.request_id(), Some("req_ctx_123"));
     }
 }

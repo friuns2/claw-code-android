@@ -31,10 +31,11 @@ use api::{
 };
 
 use commands::{
-    handle_agents_slash_command, handle_agents_slash_command_json, handle_mcp_slash_command,
-    handle_mcp_slash_command_json, handle_plugins_slash_command, handle_skills_slash_command,
-    handle_skills_slash_command_json, render_slash_command_help, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SlashCommand,
+    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
+    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
+    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
+    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input,
+    SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -127,6 +128,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             args,
             output_format,
         } => LiveCli::print_skills(args.as_deref(), output_format)?,
+        CliAction::Plugins {
+            action,
+            target,
+            output_format,
+        } => LiveCli::print_plugins(action.as_deref(), target.as_deref(), output_format)?,
         CliAction::PrintSystemPrompt {
             cwd,
             date,
@@ -185,6 +191,11 @@ enum CliAction {
     },
     Skills {
         args: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    Plugins {
+        action: Option<String>,
+        target: Option<String>,
         output_format: CliOutputFormat,
     },
     PrintSystemPrompt {
@@ -419,10 +430,22 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
-        "skills" => Ok(CliAction::Skills {
-            args: join_optional_args(&rest[1..]),
-            output_format,
-        }),
+        "skills" => {
+            let args = join_optional_args(&rest[1..]);
+            match classify_skills_slash_command(args.as_deref()) {
+                SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
+                    prompt,
+                    model,
+                    output_format,
+                    allowed_tools,
+                    permission_mode,
+                }),
+                SkillSlashDispatch::Local => Ok(CliAction::Skills {
+                    args,
+                    output_format,
+                }),
+            }
+        }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "login" => Ok(CliAction::Login { output_format }),
         "logout" => Ok(CliAction::Logout { output_format }),
@@ -440,7 +463,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
             })
         }
-        other if other.starts_with('/') => parse_direct_slash_cli_action(&rest, output_format),
+        other if other.starts_with('/') => parse_direct_slash_cli_action(
+            &rest,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+        ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
             model,
@@ -532,7 +561,10 @@ fn join_optional_args(args: &[String]) -> Option<String> {
 
 fn parse_direct_slash_cli_action(
     rest: &[String],
+    model: String,
     output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -550,10 +582,21 @@ fn parse_direct_slash_cli_action(
             },
             output_format,
         }),
-        Ok(Some(SlashCommand::Skills { args })) => Ok(CliAction::Skills {
-            args,
-            output_format,
-        }),
+        Ok(Some(SlashCommand::Skills { args })) => {
+            match classify_skills_slash_command(args.as_deref()) {
+                SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
+                    prompt,
+                    model,
+                    output_format,
+                    allowed_tools,
+                    permission_mode,
+                }),
+                SkillSlashDispatch::Local => Ok(CliAction::Skills {
+                    args,
+                    output_format,
+                }),
+            }
+        }
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
             let _ = command;
@@ -586,6 +629,10 @@ fn format_unknown_direct_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(&suggestions);
     }
+    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+        message.push('\n');
+        message.push_str(note);
+    }
     message.push_str("\nRun `claw --help` for CLI usage, or start `claw` and use /help.");
     message
 }
@@ -597,8 +644,19 @@ fn format_unknown_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(&suggestions);
     }
+    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+        message.push('\n');
+        message.push_str(note);
+    }
     message.push_str("\n  Help             /help lists available slash commands");
     message
+}
+
+fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
+    name.starts_with("oh-my-claudecode:")
+        .then_some(
+            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+        )
 }
 
 fn render_suggestion_line(label: &str, suggestions: &[String]) -> Option<String> {
@@ -1852,14 +1910,18 @@ impl GitWorkspaceSummary {
 #[cfg(test)]
 fn format_unknown_slash_command_message(name: &str) -> String {
     let suggestions = suggest_slash_commands(name);
-    if suggestions.is_empty() {
-        format!("unknown slash command: /{name}. Use /help to list available commands.")
-    } else {
-        format!(
-            "unknown slash command: /{name}. Did you mean {}? Use /help to list available commands.",
-            suggestions.join(", ")
-        )
+    let mut message = format!("unknown slash command: /{name}.");
+    if !suggestions.is_empty() {
+        message.push_str(" Did you mean ");
+        message.push_str(&suggestions.join(", "));
+        message.push('?');
     }
+    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+        message.push(' ');
+        message.push_str(note);
+    }
+    message.push_str(" Use /help to list available commands.");
+    message
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
@@ -2281,6 +2343,11 @@ fn run_resume_command(
             })
         }
         SlashCommand::Skills { args } => {
+            if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
+                return Err(
+                    "resumed /skills invocations are interactive-only; start `claw` and run `/skills <skill>` in the REPL".into(),
+                );
+            }
             let cwd = env::current_dir()?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -3203,7 +3270,12 @@ impl LiveCli {
                 false
             }
             SlashCommand::Skills { args } => {
-                Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
+                match classify_skills_slash_command(args.as_deref()) {
+                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Local => {
+                        Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
+                    }
+                }
                 false
             }
             SlashCommand::Doctor => {
@@ -3521,6 +3593,32 @@ impl LiveCli {
             CliOutputFormat::Json => println!(
                 "{}",
                 serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
+            ),
+        }
+        Ok(())
+    }
+
+    fn print_plugins(
+        action: Option<&str>,
+        target: Option<&str>,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let loader = ConfigLoader::default_for(&cwd);
+        let runtime_config = loader.load()?;
+        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+        let result = handle_plugins_slash_command(action, target, &mut manager)?;
+        match output_format {
+            CliOutputFormat::Text => println!("{}", result.message),
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "plugin",
+                    "action": action.unwrap_or("list"),
+                    "target": target,
+                    "message": result.message,
+                    "reload_runtime": result.reload_runtime,
+                }))?
             ),
         }
         Ok(())
@@ -5644,7 +5742,9 @@ impl ApiClient for AnthropicRuntimeClient {
 }
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
-    if error.is_generic_fatal_wrapper() {
+    if error.safe_failure_class() == "context_window" {
+        format_context_window_blocked_error(session_id, error)
+    } else if error.is_generic_fatal_wrapper() {
         let mut qualifiers = vec![format!("session {session_id}")];
         if let Some(request_id) = error.request_id() {
             qualifiers.push(format!("trace {request_id}"));
@@ -5658,6 +5758,72 @@ fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> Str
     } else {
         error.to_string()
     }
+}
+
+fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
+    let mut lines = vec![
+        "Context window blocked".to_string(),
+        "  Failure class    context_window_blocked".to_string(),
+        format!("  Session          {session_id}"),
+    ];
+
+    if let Some(request_id) = error.request_id() {
+        lines.push(format!("  Trace            {request_id}"));
+    }
+
+    match error {
+        api::ApiError::ContextWindowExceeded {
+            model,
+            estimated_input_tokens,
+            requested_output_tokens,
+            estimated_total_tokens,
+            context_window_tokens,
+        } => {
+            lines.push(format!("  Model            {model}"));
+            lines.push(format!("  Estimated input  {estimated_input_tokens}"));
+            lines.push(format!("  Requested output {requested_output_tokens}"));
+            lines.push(format!("  Estimated total  {estimated_total_tokens}"));
+            lines.push(format!("  Context window   {context_window_tokens}"));
+        }
+        api::ApiError::Api { message, body, .. } => {
+            let detail = message.as_deref().unwrap_or(body).trim();
+            if !detail.is_empty() {
+                lines.push(format!(
+                    "  Detail           {}",
+                    truncate_for_summary(detail, 120)
+                ));
+            }
+        }
+        api::ApiError::RetriesExhausted { last_error, .. } => {
+            let detail = match last_error.as_ref() {
+                api::ApiError::Api { message, body, .. } => message.as_deref().unwrap_or(body),
+                other => return format_context_window_blocked_error(session_id, other),
+            }
+            .trim();
+            if !detail.is_empty() {
+                lines.push(format!(
+                    "  Detail           {}",
+                    truncate_for_summary(detail, 120)
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    lines.push(String::new());
+    lines.push("Recovery".to_string());
+    lines.push("  Compact          /compact".to_string());
+    lines.push(format!(
+        "  Resume compact   claw --resume {session_id} /compact"
+    ));
+    lines.push("  Fresh session    /clear --confirm".to_string());
+    lines.push(
+        "  Reduce scope     remove large pasted context/files or ask for a smaller slice"
+            .to_string(),
+    );
+    lines.push("  Retry            rerun after compacting or reducing the request".to_string());
+
+    lines.join("\n")
 }
 
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
@@ -6753,6 +6919,73 @@ mod tests {
         assert!(rendered.contains("trace req_jobdori_790"));
     }
 
+    #[test]
+    fn context_window_preflight_errors_render_recovery_steps() {
+        let error = ApiError::ContextWindowExceeded {
+            model: "claude-sonnet-4-6".to_string(),
+            estimated_input_tokens: 182_000,
+            requested_output_tokens: 64_000,
+            estimated_total_tokens: 246_000,
+            context_window_tokens: 200_000,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("Context window blocked"), "{rendered}");
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Session          session-issue-32"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Model            claude-sonnet-4-6"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Estimated total  246000"), "{rendered}");
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Fresh session    /clear --confirm"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Reduce scope"), "{rendered}");
+        assert!(rendered.contains("Retry            rerun"), "{rendered}");
+    }
+
+    #[test]
+    fn provider_context_window_errors_are_reframed_with_same_guidance() {
+        let error = ApiError::Api {
+            status: "400".parse().expect("status"),
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some(
+                "This model's maximum context length is 200000 tokens, but your request used 230000 tokens."
+                    .to_string(),
+            ),
+            request_id: Some("req_ctx_456".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Trace            req_ctx_456"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Detail           This model's maximum context length is 200000 tokens"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Fresh session    /clear --confirm"),
+            "{rendered}"
+        );
+    }
+
     fn temp_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -7124,6 +7357,21 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&[
+                "skills".to_string(),
+                "help".to_string(),
+                "overview".to_string()
+            ])
+            .expect("skills help overview should invoke"),
+            CliAction::Prompt {
+                prompt: "$help overview".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
+            }
+        );
+        assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
             CliAction::Agents {
@@ -7257,11 +7505,41 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["/skill".to_string()]).expect("/skill should parse"),
+            CliAction::Skills {
+                args: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
             parse_args(&["/skills".to_string(), "help".to_string()])
                 .expect("/skills help should parse"),
             CliAction::Skills {
                 args: Some("help".to_string()),
                 output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["/skill".to_string(), "list".to_string()])
+                .expect("/skill list should parse"),
+            CliAction::Skills {
+                args: Some("list".to_string()),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "/skills".to_string(),
+                "help".to_string(),
+                "overview".to_string()
+            ])
+            .expect("/skills help overview should invoke"),
+            CliAction::Prompt {
+                prompt: "$help overview".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
             }
         );
         assert_eq!(
@@ -7305,6 +7583,16 @@ mod tests {
         assert!(report.contains("unknown slash command: /statsu"));
         assert!(report.contains("Did you mean"));
         assert!(report.contains("Use /help"));
+    }
+
+    #[test]
+    fn formats_namespaced_omc_slash_command_with_contract_guidance() {
+        let report = format_unknown_slash_command_message("oh-my-claudecode:hud");
+        assert!(report.contains("unknown slash command: /oh-my-claudecode:hud"));
+        assert!(report.contains("Claude Code/OMC plugin command"));
+        assert!(report.contains("plugin slash commands"));
+        assert!(report.contains("statusline"));
+        assert!(report.contains("session hooks"));
     }
 
     #[test]
@@ -8102,6 +8390,14 @@ UU conflicted.rs",
         assert!(message.contains("Unknown slash command: /stats"));
         assert!(message.contains("/status"));
         assert!(message.contains("/help"));
+    }
+
+    #[test]
+    fn unknown_omc_slash_command_guidance_explains_runtime_gap() {
+        let message = format_unknown_slash_command("oh-my-claudecode:hud");
+        assert!(message.contains("Unknown slash command: /oh-my-claudecode:hud"));
+        assert!(message.contains("Claude Code/OMC plugin command"));
+        assert!(message.contains("does not yet load plugin slash commands"));
     }
 
     #[test]
