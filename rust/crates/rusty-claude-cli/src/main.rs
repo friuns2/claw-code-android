@@ -5833,10 +5833,10 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             context_window_tokens,
         } => {
             lines.push(format!("  Model            {model}"));
-            lines.push(format!("  Estimated input  {estimated_input_tokens}"));
-            lines.push(format!("  Requested output {requested_output_tokens}"));
-            lines.push(format!("  Estimated total  {estimated_total_tokens}"));
-            lines.push(format!("  Context window   {context_window_tokens}"));
+            lines.push(format!("  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"));
+            lines.push(format!("  Requested output {requested_output_tokens} tokens"));
+            lines.push(format!("  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"));
+            lines.push(format!("  Context window   {context_window_tokens} tokens"));
         }
         api::ApiError::Api { message, body, .. } => {
             let detail = message.as_deref().unwrap_or(body).trim();
@@ -7029,7 +7029,14 @@ mod tests {
             rendered.contains("Model            claude-sonnet-4-6"),
             "{rendered}"
         );
-        assert!(rendered.contains("Estimated total  246000"), "{rendered}");
+        assert!(
+            rendered.contains("Input estimate   ~182000 tokens (heuristic)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Total estimate   ~246000 tokens (heuristic)"),
+            "{rendered}"
+        );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
             rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
