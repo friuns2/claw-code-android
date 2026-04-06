@@ -5239,6 +5239,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: AnthropicClient,
+    session_id: String,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -5262,6 +5263,7 @@ impl AnthropicRuntimeClient {
             client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
                 .with_base_url(api::read_base_url())
                 .with_prompt_cache(PromptCache::new(session_id)),
+            session_id: session_id.to_string(),
             model,
             enable_tools,
             emit_output,
@@ -5301,11 +5303,13 @@ impl ApiClient for AnthropicRuntimeClient {
         };
 
         self.runtime.block_on(async {
-            let mut stream = self
-                .client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut stream =
+                self.client
+                    .stream_message(&message_request)
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    })?;
             let mut stdout = io::stdout();
             let mut sink = io::sink();
             let out: &mut dyn Write = if self.emit_output {
@@ -5319,11 +5323,9 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
 
-            while let Some(event) = stream
-                .next_event()
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?
-            {
+            while let Some(event) = stream.next_event().await.map_err(|error| {
+                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+            })? {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
@@ -5418,11 +5420,30 @@ impl ApiClient for AnthropicRuntimeClient {
                     ..message_request.clone()
                 })
                 .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                .map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                })?;
             let mut events = response_to_events(response, out)?;
             push_prompt_cache_record(&self.client, &mut events);
             Ok(events)
         })
+    }
+}
+
+fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
+    if error.is_generic_fatal_wrapper() {
+        let mut qualifiers = vec![format!("session {session_id}")];
+        if let Some(request_id) = error.request_id() {
+            qualifiers.push(format!("trace {request_id}"));
+        }
+        format!(
+            "{} ({}): {}",
+            error.safe_failure_class(),
+            qualifiers.join(", "),
+            error
+        )
+    } else {
+        error.to_string()
     }
 }
 
@@ -6424,18 +6445,19 @@ mod tests {
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, normalize_permission_mode, parse_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_memory_report, render_repl_help,
-        render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
+        format_unknown_slash_command_message, format_user_visible_api_error,
+        normalize_permission_mode, parse_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
+        print_help_to, push_output_block, render_config_report, render_diff_report,
+        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
+        resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
-    use api::{MessageResponse, OutputContentBlock, Usage};
+    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -6475,12 +6497,59 @@ mod tests {
         .expect("plugin tool registry should build")
     }
 
+    #[test]
+    fn opaque_provider_wrapper_surfaces_failure_class_session_and_trace() {
+        let error = ApiError::Api {
+            status: "500".parse().expect("status"),
+            error_type: Some("api_error".to_string()),
+            message: Some(
+                "Something went wrong while processing your request. Please try again, or use /new to start a fresh session."
+                    .to_string(),
+            ),
+            request_id: Some("req_jobdori_789".to_string()),
+            body: String::new(),
+            retryable: true,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-22", &error);
+        assert!(rendered.contains("provider_internal"));
+        assert!(rendered.contains("session session-issue-22"));
+        assert!(rendered.contains("trace req_jobdori_789"));
+    }
+
+    #[test]
+    fn retry_exhaustion_uses_retry_failure_class_for_generic_provider_wrapper() {
+        let error = ApiError::RetriesExhausted {
+            attempts: 3,
+            last_error: Box::new(ApiError::Api {
+                status: "502".parse().expect("status"),
+                error_type: Some("api_error".to_string()),
+                message: Some(
+                    "Something went wrong while processing your request. Please try again, or use /new to start a fresh session."
+                        .to_string(),
+                ),
+                request_id: Some("req_jobdori_790".to_string()),
+                body: String::new(),
+                retryable: true,
+            }),
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-22", &error);
+        assert!(rendered.contains("provider_retry_exhausted"), "{rendered}");
+        assert!(rendered.contains("session session-issue-22"));
+        assert!(rendered.contains("trace req_jobdori_790"));
+    }
+
     fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}"))
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}-{unique}"))
     }
 
     fn git(args: &[&str], cwd: &Path) {

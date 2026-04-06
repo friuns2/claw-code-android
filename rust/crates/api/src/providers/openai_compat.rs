@@ -906,6 +906,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
+    let request_id = request_id_from_headers(response.headers());
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
@@ -918,6 +919,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         message: parsed_error
             .as_ref()
             .and_then(|error| error.error.message.clone()),
+        request_id,
         body,
         retryable,
     })
