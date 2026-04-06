@@ -275,6 +275,49 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     assert!(parsed["sandbox"]["filesystem_mode"].as_str().is_some());
 }
 
+#[test]
+fn resumed_sandbox_command_emits_structured_json_when_requested() {
+    // given
+    let temp_dir = unique_temp_dir("resume-sandbox-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+
+    Session::new()
+        .save_to_path(&session_path)
+        .expect("session should persist");
+
+    // when
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/sandbox",
+        ],
+    );
+
+    // then
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("resume sandbox output should be json");
+    assert_eq!(parsed["kind"], "sandbox");
+    assert!(parsed["enabled"].is_boolean());
+    assert!(parsed["active"].is_boolean());
+    assert!(parsed["supported"].is_boolean());
+    assert!(parsed["filesystem_mode"].as_str().is_some());
+    assert!(parsed["allowed_mounts"].is_array());
+    assert!(parsed["markers"].is_array());
+}
+
 fn run_claw(current_dir: &Path, args: &[&str]) -> Output {
     run_claw_with_env(current_dir, args, &[])
 }
