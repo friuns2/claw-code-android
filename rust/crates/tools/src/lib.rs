@@ -5555,6 +5555,191 @@ mod tests {
     }
 
     #[test]
+    fn worker_terminate_sets_finished_status() {
+        // Create a worker in running state
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/terminate-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
+
+        // Terminate
+        let terminated = execute_tool(
+            "WorkerTerminate",
+            &json!({"worker_id": worker_id}),
+        )
+        .expect("WorkerTerminate should succeed");
+        let term_output: serde_json::Value = serde_json::from_str(&terminated).expect("json");
+        assert_eq!(term_output["status"], "finished", "terminated worker should be finished");
+        assert_eq!(
+            term_output["prompt_in_flight"], false,
+            "prompt_in_flight should be cleared on termination"
+        );
+    }
+
+    #[test]
+    fn worker_restart_resets_to_spawning() {
+        // Create and advance worker to ready_for_prompt
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/restart-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
+
+        // Advance to ready_for_prompt via observe
+        execute_tool(
+            "WorkerObserve",
+            &json!({"worker_id": worker_id, "screen_text": "Ready for input\n>"}),
+        )
+        .expect("WorkerObserve should succeed");
+
+        // Restart
+        let restarted = execute_tool(
+            "WorkerRestart",
+            &json!({"worker_id": worker_id}),
+        )
+        .expect("WorkerRestart should succeed");
+        let restart_output: serde_json::Value = serde_json::from_str(&restarted).expect("json");
+        assert_eq!(
+            restart_output["status"], "spawning",
+            "restarted worker should return to spawning"
+        );
+        assert_eq!(
+            restart_output["prompt_in_flight"], false,
+            "prompt_in_flight should be cleared on restart"
+        );
+        assert_eq!(
+            restart_output["trust_gate_cleared"], false,
+            "trust_gate_cleared should be reset on restart (re-trust required)"
+        );
+    }
+
+    #[test]
+    fn stall_detect_and_resolve_trust_end_to_end() {
+        // 1. Create worker WITHOUT trusted_roots so trust won't auto-resolve
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/no/trusted/root/here"}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id").to_string();
+        assert_eq!(created_output["trust_auto_resolve"], false);
+
+        // 2. Observe trust prompt screen text -> worker stalls at trust_required
+        let stalled = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": worker_id,
+                "screen_text": "Do you trust the files in this folder?\n[Allow] [Deny]"
+            }),
+        )
+        .expect("WorkerObserve should succeed");
+        let stalled_output: serde_json::Value = serde_json::from_str(&stalled).expect("json");
+        assert_eq!(
+            stalled_output["status"], "trust_required",
+            "worker should stall at trust_required when trust prompt seen without allowlist"
+        );
+        assert_eq!(stalled_output["trust_gate_cleared"], false);
+        // 3. Clawhip calls WorkerResolveTrust to unblock
+        let resolved = execute_tool(
+            "WorkerResolveTrust",
+            &json!({"worker_id": worker_id}),
+        )
+        .expect("WorkerResolveTrust should succeed");
+        let resolved_output: serde_json::Value = serde_json::from_str(&resolved).expect("json");
+        assert_eq!(
+            resolved_output["status"], "spawning",
+            "worker should return to spawning after trust resolved"
+        );
+        assert_eq!(resolved_output["trust_gate_cleared"], true);
+
+        // 4. Ready screen text now advances worker normally
+        let ready = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": worker_id,
+                "screen_text": "Ready for input\n>"
+            }),
+        )
+        .expect("WorkerObserve should succeed after trust resolved");
+        let ready_output: serde_json::Value = serde_json::from_str(&ready).expect("json");
+        assert_eq!(
+            ready_output["status"], "ready_for_prompt",
+            "worker should reach ready_for_prompt after trust resolved and ready screen seen"
+        );
+    }
+
+    #[test]
+    fn stall_detect_and_restart_recovery_end_to_end() {
+        // Worker stalls at trust_required, clawhip restarts instead of resolving
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/no/trusted/root/restart-test"}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id").to_string();
+
+        // Force trust_required
+        let stalled = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": worker_id,
+                "screen_text": "trust this folder? [Yes] [No]"
+            }),
+        )
+        .expect("WorkerObserve should succeed");
+        let stalled_output: serde_json::Value = serde_json::from_str(&stalled).expect("json");
+        assert_eq!(stalled_output["status"], "trust_required");
+
+        // WorkerRestart resets the worker
+        let restarted = execute_tool(
+            "WorkerRestart",
+            &json!({"worker_id": worker_id}),
+        )
+        .expect("WorkerRestart should succeed");
+        let restarted_output: serde_json::Value = serde_json::from_str(&restarted).expect("json");
+        assert_eq!(
+            restarted_output["status"], "spawning",
+            "restarted worker should be back at spawning"
+        );
+        assert_eq!(restarted_output["trust_gate_cleared"], false,
+            "restart clears trust — next observe loop must re-acquire trust"
+        );
+    }
+
+    #[test]
+    fn worker_terminate_on_unknown_id_returns_error() {
+        let result = execute_tool(
+            "WorkerTerminate",
+            &json!({"worker_id": "worker_nonexistent_00000000"}),
+        );
+        assert!(result.is_err(), "terminating unknown worker should fail");
+        assert!(
+            result.unwrap_err().contains("worker not found"),
+            "error should mention worker not found"
+        );
+    }
+
+    #[test]
+    fn worker_restart_on_unknown_id_returns_error() {
+        let result = execute_tool(
+            "WorkerRestart",
+            &json!({"worker_id": "worker_nonexistent_00000001"}),
+        );
+        assert!(result.is_err(), "restarting unknown worker should fail");
+        assert!(
+            result.unwrap_err().contains("worker not found"),
+            "error should mention worker not found"
+        );
+    }
+
+    #[test]
     fn worker_tools_detect_misdelivery_and_arm_prompt_replay() {
         let created = execute_tool(
             "WorkerCreate",

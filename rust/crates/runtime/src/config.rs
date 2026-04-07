@@ -9,27 +9,6 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 /// Schema name advertised by generated settings files.
 pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
-/// Top-level settings keys recognized by the runtime configuration loader.
-const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
-    "$schema",
-    "enabledPlugins",
-    "env",
-    "hooks",
-    "mcpServers",
-    "model",
-    "oauth",
-    "permissionMode",
-    "permissions",
-    "plugins",
-    "sandbox",
-];
-
-/// Deprecated top-level keys mapped to their replacement guidance.
-const DEPRECATED_TOP_LEVEL_KEYS: &[(&str, &str)] = &[
-    ("allowedTools", "permissions.allow"),
-    ("ignorePatterns", "permissions.deny"),
-];
-
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {

@@ -1438,8 +1438,52 @@ mod tests {
 /// Per-worktree session isolation: returns a session directory namespaced
 /// by the workspace fingerprint of the given working directory.
 /// This prevents parallel `opencode serve` instances from colliding.
+/// Called by external consumers (e.g. clawhip) to enumerate sessions for a CWD.
+#[allow(dead_code)]
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
     let store = crate::session_control::SessionStore::from_cwd(cwd)
         .map_err(|e| SessionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
     Ok(store.sessions_dir().to_path_buf())
+}
+
+#[cfg(test)]
+mod workspace_sessions_dir_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn workspace_sessions_dir_returns_fingerprinted_path_for_valid_cwd() {
+        let tmp = std::env::temp_dir().join("claw-session-dir-test");
+        fs::create_dir_all(&tmp).expect("create temp dir");
+
+        let result = workspace_sessions_dir(&tmp);
+        assert!(
+            result.is_ok(),
+            "workspace_sessions_dir should succeed for a valid CWD, got: {:?}",
+            result
+        );
+        let dir = result.unwrap();
+        // The returned path should be non-empty and end with a hash component
+        assert!(!dir.as_os_str().is_empty());
+        // Two calls with the same CWD should produce identical paths (deterministic)
+        let result2 = workspace_sessions_dir(&tmp).unwrap();
+        assert_eq!(dir, result2, "workspace_sessions_dir must be deterministic");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn workspace_sessions_dir_differs_for_different_cwds() {
+        let tmp_a = std::env::temp_dir().join("claw-session-dir-a");
+        let tmp_b = std::env::temp_dir().join("claw-session-dir-b");
+        fs::create_dir_all(&tmp_a).expect("create dir a");
+        fs::create_dir_all(&tmp_b).expect("create dir b");
+
+        let dir_a = workspace_sessions_dir(&tmp_a).expect("dir a");
+        let dir_b = workspace_sessions_dir(&tmp_b).expect("dir b");
+        assert_ne!(dir_a, dir_b, "different CWDs must produce different session dirs");
+
+        fs::remove_dir_all(&tmp_a).ok();
+        fs::remove_dir_all(&tmp_b).ok();
+    }
 }
