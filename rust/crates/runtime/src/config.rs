@@ -69,6 +69,7 @@ pub struct RuntimePluginConfig {
     install_root: Option<String>,
     registry_path: Option<String>,
     bundled_root: Option<String>,
+    max_output_tokens: Option<u32>,
 }
 
 /// Structured feature configuration consumed by runtime subsystems.
@@ -541,6 +542,15 @@ impl RuntimePluginConfig {
         self.bundled_root.as_deref()
     }
 
+    #[must_use]
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+
+    pub fn set_max_output_tokens(&mut self, max_output_tokens: Option<u32>) {
+        self.max_output_tokens = max_output_tokens;
+    }
+
     pub fn set_plugin_state(&mut self, plugin_id: String, enabled: bool) {
         self.enabled_plugins.insert(plugin_id, enabled);
     }
@@ -823,6 +833,7 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
         optional_string(plugins, "registryPath", "merged settings.plugins")?.map(str::to_string);
     config.bundled_root =
         optional_string(plugins, "bundledRoot", "merged settings.plugins")?.map(str::to_string);
+    config.max_output_tokens = optional_u32(plugins, "maxOutputTokens", "merged settings.plugins")?;
     Ok(config)
 }
 
@@ -1075,6 +1086,27 @@ fn optional_u16(
                 )));
             };
             let number = u16::try_from(number).map_err(|_| {
+                ConfigError::Parse(format!("{context}: field {key} is out of range"))
+            })?;
+            Ok(Some(number))
+        }
+        None => Ok(None),
+    }
+}
+
+fn optional_u32(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u32>, ConfigError> {
+    match object.get(key) {
+        Some(value) => {
+            let Some(number) = value.as_i64() else {
+                return Err(ConfigError::Parse(format!(
+                    "{context}: field {key} must be a non-negative integer"
+                )));
+            };
+            let number = u32::try_from(number).map_err(|_| {
                 ConfigError::Parse(format!("{context}: field {key} is out of range"))
             })?;
             Ok(Some(number))

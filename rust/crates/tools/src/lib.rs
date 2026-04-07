@@ -5306,6 +5306,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 pub mod lane_completion;
+pub mod pdf_extract;
 
 #[cfg(test)]
 mod tests {

@@ -1434,3 +1434,12 @@ mod tests {
             .collect()
     }
 }
+
+/// Per-worktree session isolation: returns a session directory namespaced
+/// by the workspace fingerprint of the given working directory.
+/// This prevents parallel `opencode serve` instances from colliding.
+pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
+    let store = crate::session_control::SessionStore::from_cwd(cwd)
+        .map_err(|e| SessionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+    Ok(store.sessions_dir().to_path_buf())
+}

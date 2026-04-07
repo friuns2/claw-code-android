@@ -35,9 +35,10 @@ pub mod recovery_recipes;
 mod remote;
 pub mod sandbox;
 mod session;
-#[cfg(test)]
-mod session_control;
+pub mod session_control;
+pub use session_control::SessionStore;
 mod sse;
+pub mod stale_base;
 pub mod stale_branch;
 pub mod summary_compression;
 pub mod task_packet;
@@ -150,6 +151,10 @@ pub use session::{
     SessionFork, SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
+pub use stale_base::{
+    check_base_commit, format_stale_base_warning, read_claw_base_file, resolve_expected_base,
+    BaseCommitSource, BaseCommitState,
+};
 pub use stale_branch::{
     apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,

@@ -204,6 +204,14 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
     )
 }
 
+/// Returns the effective max output tokens for a model, preferring a plugin
+/// override when present. Falls back to [`max_tokens_for_model`] when the
+/// override is `None`.
+#[must_use]
+pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u32>) -> u32 {
+    plugin_override.unwrap_or_else(|| max_tokens_for_model(model))
+}
+
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
@@ -323,8 +331,9 @@ mod tests {
     };
 
     use super::{
-        detect_provider_kind, load_dotenv_file, max_tokens_for_model, model_token_limit,
-        parse_dotenv, preflight_message_request, resolve_model_alias, ProviderKind,
+        detect_provider_kind, load_dotenv_file, max_tokens_for_model,
+        max_tokens_for_model_with_override, model_token_limit, parse_dotenv,
+        preflight_message_request, resolve_model_alias, ProviderKind,
     };
 
     #[test]
@@ -347,6 +356,56 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+    }
+
+    #[test]
+    fn plugin_config_max_output_tokens_overrides_model_default() {
+        // given
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("api-plugin-max-tokens-{nanos}"));
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        std::fs::create_dir_all(&home).expect("home config dir");
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{
+              "plugins": {
+                "maxOutputTokens": 12345
+              }
+            }"#,
+        )
+        .expect("write plugin settings");
+
+        // when
+        let loaded = runtime::ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let plugin_override = loaded.plugins().max_output_tokens();
+        let effective = max_tokens_for_model_with_override("claude-opus-4-6", plugin_override);
+
+        // then
+        assert_eq!(plugin_override, Some(12345));
+        assert_eq!(effective, 12345);
+        assert_ne!(effective, max_tokens_for_model("claude-opus-4-6"));
+
+        std::fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn max_tokens_for_model_with_override_falls_back_when_plugin_unset() {
+        // given
+        let plugin_override: Option<u32> = None;
+
+        // when
+        let effective = max_tokens_for_model_with_override("claude-opus-4-6", plugin_override);
+
+        // then
+        assert_eq!(effective, max_tokens_for_model("claude-opus-4-6"));
+        assert_eq!(effective, 32_000);
     }
 
     #[test]

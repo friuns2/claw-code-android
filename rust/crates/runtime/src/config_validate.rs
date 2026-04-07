@@ -242,6 +242,10 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
         name: "bundledRoot",
         expected: FieldType::String,
     },
+    FieldSpec {
+        name: "maxOutputTokens",
+        expected: FieldType::Number,
+    },
 ];
 
 const SANDBOX_FIELDS: &[FieldSpec] = &[
