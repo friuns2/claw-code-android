@@ -3841,6 +3841,7 @@ impl ApiClient for ProviderRuntimeClient {
                 tools: (!tools.is_empty()).then(|| tools.clone()),
                 tool_choice: tool_choice.clone(),
                 stream: true,
+                ..Default::default()
             };
 
             let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));

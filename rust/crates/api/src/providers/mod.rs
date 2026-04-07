@@ -480,6 +480,7 @@ mod tests {
             }]),
             tool_choice: Some(ToolChoice::Auto),
             stream: true,
+            ..Default::default()
         };
 
         let error = preflight_message_request(&request)
@@ -518,6 +519,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: false,
+            ..Default::default()
         };
 
         preflight_message_request(&request)
