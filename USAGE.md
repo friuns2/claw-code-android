@@ -109,6 +109,50 @@ cd rust
 ./target/debug/claw logout
 ```
 
+## Local Models
+
+`claw` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services. OAuth is Anthropic-only, so when `OPENAI_BASE_URL` is set you should use API-key style auth instead of `claw login`.
+
+### Anthropic-compatible endpoint
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
+export ANTHROPIC_AUTH_TOKEN="local-dev-token"
+
+cd rust
+./target/debug/claw --model "claude-sonnet-4-6" prompt "reply with the word ready"
+```
+
+### OpenAI-compatible endpoint
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
+export OPENAI_API_KEY="local-dev-token"
+
+cd rust
+./target/debug/claw --model "qwen2.5-coder" prompt "reply with the word ready"
+```
+
+### Ollama
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
+unset OPENAI_API_KEY
+
+cd rust
+./target/debug/claw --model "llama3.2" prompt "summarize this repository in one sentence"
+```
+
+### OpenRouter
+
+```bash
+export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+export OPENAI_API_KEY="sk-or-v1-..."
+
+cd rust
+./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
+```
+
 ## Common operational commands
 
 ```bash

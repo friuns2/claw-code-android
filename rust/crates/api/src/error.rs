@@ -35,7 +35,12 @@ pub enum ApiError {
     InvalidApiKeyEnv(VarError),
     Http(reqwest::Error),
     Io(std::io::Error),
-    Json(serde_json::Error),
+    Json {
+        provider: String,
+        model: String,
+        body_snippet: String,
+        source: serde_json::Error,
+    },
     Api {
         status: reqwest::StatusCode,
         error_type: Option<String>,
@@ -64,6 +69,25 @@ impl ApiError {
         Self::MissingCredentials { provider, env_vars }
     }
 
+    /// Build a `Self::Json` enriched with the provider name, the model that
+    /// was requested, and the first 200 characters of the raw response body so
+    /// that callers can diagnose deserialization failures without re-running
+    /// the request.
+    #[must_use]
+    pub fn json_deserialize(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        body: &str,
+        source: serde_json::Error,
+    ) -> Self {
+        Self::Json {
+            provider: provider.into(),
+            model: model.into(),
+            body_snippet: truncate_body_snippet(body, 200),
+            source,
+        }
+    }
+
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -76,7 +100,7 @@ impl ApiError {
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Io(_)
-            | Self::Json(_)
+            | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
         }
@@ -94,7 +118,7 @@ impl ApiError {
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
             | Self::Io(_)
-            | Self::Json(_)
+            | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => None,
         }
@@ -120,7 +144,7 @@ impl ApiError {
             Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
                 "provider_transport"
             }
-            Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json(_) => "runtime_io",
+            Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
         }
     }
 
@@ -141,7 +165,7 @@ impl ApiError {
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
             | Self::Io(_)
-            | Self::Json(_)
+            | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
         }
@@ -170,7 +194,7 @@ impl ApiError {
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
             | Self::Io(_)
-            | Self::Json(_)
+            | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
         }
@@ -180,11 +204,27 @@ impl ApiError {
 impl Display for ApiError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingCredentials { provider, env_vars } => write!(
-                f,
-                "missing {provider} credentials; export {} before calling the {provider} API",
-                env_vars.join(" or ")
-            ),
+            Self::MissingCredentials { provider, env_vars } => {
+                write!(
+                    f,
+                    "missing {provider} credentials; export {} before calling the {provider} API",
+                    env_vars.join(" or ")
+                )?;
+                if cfg!(target_os = "windows") {
+                    if let Some(primary) = env_vars.first() {
+                        write!(
+                            f,
+                            " (on Windows, environment variables set in PowerShell only persist for the current session; use `setx {primary} <value>` to make it permanent, then open a new terminal, or place a `.env` file containing `{primary}=<value>` in the current working directory)"
+                        )?;
+                    } else {
+                        write!(
+                            f,
+                            " (on Windows, environment variables set in PowerShell only persist for the current session; use `setx` to make them permanent, then open a new terminal, or place a `.env` file in the current working directory)"
+                        )?;
+                    }
+                }
+                Ok(())
+            }
             Self::ContextWindowExceeded {
                 model,
                 estimated_input_tokens,
@@ -207,7 +247,15 @@ impl Display for ApiError {
             }
             Self::Http(error) => write!(f, "http error: {error}"),
             Self::Io(error) => write!(f, "io error: {error}"),
-            Self::Json(error) => write!(f, "json error: {error}"),
+            Self::Json {
+                provider,
+                model,
+                body_snippet,
+                source,
+            } => write!(
+                f,
+                "failed to parse {provider} response for model {model}: {source}; first 200 chars of body: {body_snippet}"
+            ),
             Self::Api {
                 status,
                 error_type,
@@ -262,7 +310,12 @@ impl From<std::io::Error> for ApiError {
 
 impl From<serde_json::Error> for ApiError {
     fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
+        Self::Json {
+            provider: "unknown".to_string(),
+            model: "unknown".to_string(),
+            body_snippet: String::new(),
+            source: value,
+        }
     }
 }
 
@@ -286,9 +339,89 @@ fn looks_like_context_window_error(text: &str) -> bool {
         .any(|marker| lowered.contains(marker))
 }
 
+/// Truncate `body` so the resulting snippet contains at most `max_chars`
+/// characters (counted by Unicode scalar values, not bytes), preserving the
+/// leading slice of the body that the caller most often needs to inspect.
+fn truncate_body_snippet(body: &str, max_chars: usize) -> String {
+    let mut taken_chars = 0;
+    let mut byte_end = 0;
+    for (offset, character) in body.char_indices() {
+        if taken_chars >= max_chars {
+            break;
+        }
+        taken_chars += 1;
+        byte_end = offset + character.len_utf8();
+    }
+    if taken_chars >= max_chars && byte_end < body.len() {
+        format!("{}…", &body[..byte_end])
+    } else {
+        body[..byte_end].to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ApiError;
+    use super::{truncate_body_snippet, ApiError};
+
+    #[test]
+    fn json_deserialize_error_includes_provider_model_and_truncated_body_snippet() {
+        let raw_body = format!("{}{}", "x".repeat(190), "_TAIL_PAST_200_CHARS_MARKER_");
+        let source = serde_json::from_str::<serde_json::Value>("{not json")
+            .expect_err("invalid json should fail to parse");
+
+        let error = ApiError::json_deserialize("Anthropic", "claude-opus-4-6", &raw_body, source);
+        let rendered = error.to_string();
+
+        assert!(
+            rendered.starts_with("failed to parse Anthropic response for model claude-opus-4-6: "),
+            "rendered error should lead with provider and model: {rendered}"
+        );
+        assert!(
+            rendered.contains("first 200 chars of body: "),
+            "rendered error should label the body snippet: {rendered}"
+        );
+        let snippet = rendered
+            .split("first 200 chars of body: ")
+            .nth(1)
+            .expect("snippet section should be present");
+        assert!(
+            snippet.starts_with(&"x".repeat(190)),
+            "snippet should preserve the leading characters of the body: {snippet}"
+        );
+        assert!(
+            snippet.ends_with('…'),
+            "snippet should signal truncation with an ellipsis: {snippet}"
+        );
+        assert!(
+            !snippet.contains("_TAIL_PAST_200_CHARS_MARKER_"),
+            "snippet should drop characters past the 200-char cap: {snippet}"
+        );
+        assert_eq!(error.safe_failure_class(), "runtime_io");
+        assert_eq!(error.request_id(), None);
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn truncate_body_snippet_keeps_short_bodies_intact() {
+        assert_eq!(truncate_body_snippet("hello", 200), "hello");
+        assert_eq!(truncate_body_snippet("", 200), "");
+    }
+
+    #[test]
+    fn truncate_body_snippet_caps_long_bodies_at_max_chars() {
+        let body = "a".repeat(250);
+        let snippet = truncate_body_snippet(&body, 200);
+        assert_eq!(snippet.chars().count(), 201, "200 chars + ellipsis");
+        assert!(snippet.ends_with('…'));
+        assert!(snippet.starts_with(&"a".repeat(200)));
+    }
+
+    #[test]
+    fn truncate_body_snippet_does_not_split_multibyte_characters() {
+        let body = "한글한글한글한글한글한글";
+        let snippet = truncate_body_snippet(body, 4);
+        assert_eq!(snippet, "한글한글…");
+    }
 
     #[test]
     fn detects_generic_fatal_wrapper_and_classifies_it_as_provider_internal() {

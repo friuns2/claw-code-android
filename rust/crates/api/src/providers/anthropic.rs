@@ -296,12 +296,12 @@ impl AnthropicClient {
 
         self.preflight_message_request(&request).await?;
 
-        let response = self.send_with_retry(&request).await?;
-        let request_id = request_id_from_headers(response.headers());
-        let mut response = response
-            .json::<MessageResponse>()
-            .await
-            .map_err(ApiError::from)?;
+        let http_response = self.send_with_retry(&request).await?;
+        let request_id = request_id_from_headers(http_response.headers());
+        let body = http_response.text().await.map_err(ApiError::from)?;
+        let mut response = serde_json::from_str::<MessageResponse>(&body).map_err(|error| {
+            ApiError::json_deserialize("Anthropic", &request.model, &body, error)
+        })?;
         if response.request_id.is_none() {
             response.request_id = request_id;
         }
@@ -346,7 +346,7 @@ impl AnthropicClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: SseParser::new(),
+            parser: SseParser::new().with_context("Anthropic", request.model.clone()),
             pending: VecDeque::new(),
             done: false,
             request: request.clone(),
@@ -371,10 +371,10 @@ impl AnthropicClient {
             .await
             .map_err(ApiError::from)?;
         let response = expect_success(response).await?;
-        response
-            .json::<OAuthTokenSet>()
-            .await
-            .map_err(ApiError::from)
+        let body = response.text().await.map_err(ApiError::from)?;
+        serde_json::from_str::<OAuthTokenSet>(&body).map_err(|error| {
+            ApiError::json_deserialize("Anthropic OAuth (exchange)", "n/a", &body, error)
+        })
     }
 
     pub async fn refresh_oauth_token(
@@ -391,10 +391,10 @@ impl AnthropicClient {
             .await
             .map_err(ApiError::from)?;
         let response = expect_success(response).await?;
-        response
-            .json::<OAuthTokenSet>()
-            .await
-            .map_err(ApiError::from)
+        let body = response.text().await.map_err(ApiError::from)?;
+        serde_json::from_str::<OAuthTokenSet>(&body).map_err(|error| {
+            ApiError::json_deserialize("Anthropic OAuth (refresh)", "n/a", &body, error)
+        })
     }
 
     async fn send_with_retry(
@@ -466,7 +466,8 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let request_body = self.request_profile.render_json_body(request)?;
+        let mut request_body = self.request_profile.render_json_body(request)?;
+        strip_unsupported_beta_body_fields(&mut request_body);
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -513,7 +514,8 @@ impl AnthropicClient {
         }
 
         let request_url = format!("{}/v1/messages/count_tokens", self.base_url.trim_end_matches('/'));
-        let request_body = self.request_profile.render_json_body(request)?;
+        let mut request_body = self.request_profile.render_json_body(request)?;
+        strip_unsupported_beta_body_fields(&mut request_body);
         let response = self
             .build_request(&request_url)
             .json(&request_body)
@@ -521,11 +523,16 @@ impl AnthropicClient {
             .await
             .map_err(ApiError::from)?;
 
-        let parsed = expect_success(response)
-            .await?
-            .json::<CountTokensResponse>()
-            .await
-            .map_err(ApiError::from)?;
+        let response = expect_success(response).await?;
+        let body = response.text().await.map_err(ApiError::from)?;
+        let parsed = serde_json::from_str::<CountTokensResponse>(&body).map_err(|error| {
+            ApiError::json_deserialize(
+                "Anthropic count_tokens",
+                &request.model,
+                &body,
+                error,
+            )
+        })?;
         Ok(parsed.input_tokens)
     }
 
@@ -725,7 +732,7 @@ fn now_unix_timestamp() -> u64 {
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
         Err(error) => Err(ApiError::from(error)),
     }
 }
@@ -878,6 +885,16 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Remove beta-only body fields that the standard `/v1/messages` and
+/// `/v1/messages/count_tokens` endpoints reject as `Extra inputs are not
+/// permitted`. The `betas` opt-in is communicated via the `anthropic-beta`
+/// HTTP header on these endpoints, never as a JSON body field.
+fn strip_unsupported_beta_body_fields(body: &mut Value) {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("betas");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1294,6 +1311,75 @@ mod tests {
         assert_eq!(
             headers.get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer proxy-token")
+        );
+    }
+
+    #[test]
+    fn strip_unsupported_beta_body_fields_removes_betas_array() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "betas": ["claude-code-20250219", "prompt-caching-scope-2026-01-05"],
+            "metadata": {"source": "test"},
+        });
+
+        super::strip_unsupported_beta_body_fields(&mut body);
+
+        assert!(
+            body.get("betas").is_none(),
+            "betas body field must be stripped before sending to /v1/messages"
+        );
+        assert_eq!(
+            body.get("model").and_then(serde_json::Value::as_str),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(body["max_tokens"], serde_json::json!(1024));
+        assert_eq!(body["metadata"]["source"], serde_json::json!("test"));
+    }
+
+    #[test]
+    fn strip_unsupported_beta_body_fields_is_a_noop_when_betas_absent() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+        });
+        let original = body.clone();
+
+        super::strip_unsupported_beta_body_fields(&mut body);
+
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn rendered_request_body_strips_betas_for_standard_messages_endpoint() {
+        let client = AnthropicClient::new("test-key").with_beta("tools-2026-04-01");
+        let request = MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 64,
+            messages: vec![],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: false,
+        };
+
+        let mut rendered = client
+            .request_profile()
+            .render_json_body(&request)
+            .expect("body should render");
+        assert!(
+            rendered.get("betas").is_some(),
+            "render_json_body still emits betas; the strip helper guards the wire format",
+        );
+        super::strip_unsupported_beta_body_fields(&mut rendered);
+
+        assert!(
+            rendered.get("betas").is_none(),
+            "betas must not appear in /v1/messages request bodies"
+        );
+        assert_eq!(
+            rendered.get("model").and_then(serde_json::Value::as_str),
+            Some("claude-sonnet-4-6")
         );
     }
 }

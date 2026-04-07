@@ -97,9 +97,9 @@ async fn send_message_posts_json_and_parses_response() {
     assert!(body.get("stream").is_none());
     assert_eq!(body["tools"][0]["name"], json!("get_weather"));
     assert_eq!(body["tool_choice"]["type"], json!("auto"));
-    assert_eq!(
-        body["betas"],
-        json!(["claude-code-20250219", "prompt-caching-scope-2026-01-05"])
+    assert!(
+        body.get("betas").is_none(),
+        "betas must travel via the anthropic-beta header, not the request body"
     );
 }
 
@@ -191,13 +191,9 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
     assert_eq!(body["metadata"]["source"], json!("clawd-code"));
-    assert_eq!(
-        body["betas"],
-        json!([
-            "claude-code-20250219",
-            "prompt-caching-scope-2026-01-05",
-            "tools-2026-04-01"
-        ])
+    assert!(
+        body.get("betas").is_none(),
+        "betas must travel via the anthropic-beta header, not the request body"
     );
 
     let events = sink.events();
@@ -274,6 +270,44 @@ async fn send_message_parses_prompt_cache_token_usage_from_response() {
     assert_eq!(response.usage.cache_creation_input_tokens, 321);
     assert_eq!(response.usage.cache_read_input_tokens, 654);
     assert_eq!(response.usage.output_tokens, 4);
+}
+
+#[tokio::test]
+async fn given_empty_usage_object_when_send_message_parses_response_then_usage_defaults_to_zero() {
+    // given
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"msg_empty_usage\",",
+        "\"type\":\"message\",",
+        "\"role\":\"assistant\",",
+        "\"content\":[{\"type\":\"text\",\"text\":\"Hello from Claude\"}],",
+        "\"model\":\"claude-3-7-sonnet-latest\",",
+        "\"stop_reason\":\"end_turn\",",
+        "\"stop_sequence\":null,",
+        "\"usage\":{}",
+        "}"
+    );
+    let server = spawn_server(
+        state,
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+
+    // when
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("response with empty usage object should still parse");
+
+    // then
+    assert_eq!(response.id, "msg_empty_usage");
+    assert_eq!(response.total_tokens(), 0);
+    assert_eq!(response.usage.input_tokens, 0);
+    assert_eq!(response.usage.cache_creation_input_tokens, 0);
+    assert_eq!(response.usage.cache_read_input_tokens, 0);
+    assert_eq!(response.usage.output_tokens, 0);
 }
 
 #[tokio::test]

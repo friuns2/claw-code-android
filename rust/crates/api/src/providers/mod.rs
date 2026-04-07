@@ -258,6 +258,61 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
         .map_or(0, |bytes| (bytes.len() / 4 + 1) as u32)
 }
 
+/// Parse a `.env` file body into key/value pairs using a minimal `KEY=VALUE`
+/// grammar. Lines that are blank, start with `#`, or do not contain `=` are
+/// ignored. Surrounding double or single quotes are stripped from the value.
+/// An optional leading `export ` prefix on the key is also stripped so files
+/// shared with shell `source` workflows still parse cleanly.
+pub(crate) fn parse_dotenv(content: &str) -> std::collections::HashMap<String, String> {
+    let mut values = std::collections::HashMap::new();
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let trimmed_key = raw_key.trim();
+        let key = trimmed_key
+            .strip_prefix("export ")
+            .map_or(trimmed_key, str::trim)
+            .to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let trimmed_value = raw_value.trim();
+        let unquoted = if (trimmed_value.starts_with('"') && trimmed_value.ends_with('"')
+            || trimmed_value.starts_with('\'') && trimmed_value.ends_with('\''))
+            && trimmed_value.len() >= 2
+        {
+            &trimmed_value[1..trimmed_value.len() - 1]
+        } else {
+            trimmed_value
+        };
+        values.insert(key, unquoted.to_string());
+    }
+    values
+}
+
+/// Load and parse a `.env` file from the given path. Missing files yield
+/// `None` instead of an error so callers can use this as a soft fallback.
+pub(crate) fn load_dotenv_file(
+    path: &std::path::Path,
+) -> Option<std::collections::HashMap<String, String>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(parse_dotenv(&content))
+}
+
+/// Look up `key` in a `.env` file located in the current working directory.
+/// Returns `None` when the file is missing, the key is absent, or the value
+/// is empty.
+pub(crate) fn dotenv_value(key: &str) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let values = load_dotenv_file(&cwd.join(".env"))?;
+    values.get(key).filter(|value| !value.is_empty()).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -268,8 +323,8 @@ mod tests {
     };
 
     use super::{
-        detect_provider_kind, max_tokens_for_model, model_token_limit, preflight_message_request,
-        resolve_model_alias, ProviderKind,
+        detect_provider_kind, load_dotenv_file, max_tokens_for_model, model_token_limit,
+        parse_dotenv, preflight_message_request, resolve_model_alias, ProviderKind,
     };
 
     #[test]
@@ -374,5 +429,86 @@ mod tests {
 
         preflight_message_request(&request)
             .expect("models without context metadata should skip the guarded preflight");
+    }
+
+    #[test]
+    fn parse_dotenv_extracts_keys_handles_comments_quotes_and_export_prefix() {
+        // given
+        let body = "\
+# this is a comment
+
+ANTHROPIC_API_KEY=plain-value
+XAI_API_KEY=\"quoted-value\"
+OPENAI_API_KEY='single-quoted'
+export GROK_API_KEY=exported-value
+   PADDED_KEY  =  padded-value  
+EMPTY_VALUE=
+NO_EQUALS_LINE
+";
+
+        // when
+        let values = parse_dotenv(body);
+
+        // then
+        assert_eq!(
+            values.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("plain-value")
+        );
+        assert_eq!(
+            values.get("XAI_API_KEY").map(String::as_str),
+            Some("quoted-value")
+        );
+        assert_eq!(
+            values.get("OPENAI_API_KEY").map(String::as_str),
+            Some("single-quoted")
+        );
+        assert_eq!(
+            values.get("GROK_API_KEY").map(String::as_str),
+            Some("exported-value")
+        );
+        assert_eq!(
+            values.get("PADDED_KEY").map(String::as_str),
+            Some("padded-value")
+        );
+        assert_eq!(values.get("EMPTY_VALUE").map(String::as_str), Some(""));
+        assert!(!values.contains_key("NO_EQUALS_LINE"));
+        assert!(!values.contains_key("# this is a comment"));
+    }
+
+    #[test]
+    fn load_dotenv_file_reads_keys_from_disk_and_returns_none_when_missing() {
+        // given
+        let temp_root = std::env::temp_dir().join(format!(
+            "api-dotenv-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp dir");
+        let env_path = temp_root.join(".env");
+        std::fs::write(
+            &env_path,
+            "ANTHROPIC_API_KEY=secret-from-file\n# comment\nXAI_API_KEY=\"xai-secret\"\n",
+        )
+        .expect("write .env");
+        let missing_path = temp_root.join("does-not-exist.env");
+
+        // when
+        let loaded = load_dotenv_file(&env_path).expect("file should load");
+        let missing = load_dotenv_file(&missing_path);
+
+        // then
+        assert_eq!(
+            loaded.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("secret-from-file")
+        );
+        assert_eq!(
+            loaded.get("XAI_API_KEY").map(String::as_str),
+            Some("xai-secret")
+        );
+        assert!(missing.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }
