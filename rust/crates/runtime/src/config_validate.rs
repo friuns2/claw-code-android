@@ -193,6 +193,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "providerFallbacks",
         expected: FieldType::Object,
     },
+    FieldSpec {
+        name: "trustedRoots",
+        expected: FieldType::StringArray,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[

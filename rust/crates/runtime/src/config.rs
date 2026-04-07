@@ -85,6 +85,7 @@ pub struct RuntimeFeatureConfig {
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
+    trusted_roots: Vec<String>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -334,6 +335,7 @@ impl ConfigLoader {
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -428,6 +430,11 @@ impl RuntimeConfig {
     pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
         &self.feature_config.provider_fallbacks
     }
+
+    #[must_use]
+    pub fn trusted_roots(&self) -> &[String] {
+        &self.feature_config.trusted_roots
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -491,6 +498,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
         &self.provider_fallbacks
+    }
+
+    #[must_use]
+    pub fn trusted_roots(&self) -> &[String] {
+        &self.trusted_roots
     }
 }
 
@@ -911,6 +923,14 @@ fn parse_optional_provider_fallbacks(
     let fallbacks = optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
         .unwrap_or_default();
     Ok(ProviderFallbackConfig { primary, fallbacks })
+}
+
+fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(Vec::new());
+    };
+    Ok(optional_string_array(object, "trustedRoots", "merged settings.trustedRoots")?
+        .unwrap_or_default())
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
@@ -1461,6 +1481,53 @@ mod tests {
         assert_eq!(chain.primary(), None);
         assert!(chain.fallbacks().is_empty());
         assert!(chain.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_trusted_roots_from_settings() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"trustedRoots": ["/tmp/worktrees", "/home/user/projects"]}"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let roots = loaded.trusted_roots();
+        assert_eq!(roots, ["/tmp/worktrees", "/home/user/projects"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn trusted_roots_default_is_empty_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        assert!(loaded.trusted_roots().is_empty());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
