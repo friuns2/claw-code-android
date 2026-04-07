@@ -211,6 +211,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
+        CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Export {
             session_reference,
@@ -291,6 +292,9 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Doctor {
+        output_format: CliOutputFormat,
+    },
+    State {
         output_format: CliOutputFormat,
     },
     Init {
@@ -611,6 +615,7 @@ fn parse_single_word_command_alias(
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
+        "state" => Some(Ok(CliAction::State { output_format })),
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -1322,6 +1327,32 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 ///
 /// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
 /// dispatched through [`tools::execute_tool`], so this server exposes exactly
+/// Read `.claw/worker-state.json` from the current working directory and print it.
+/// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
+/// atomically writes state transitions here so external observers (clawhip, orchestrators)
+/// can poll current `WorkerStatus` without needing an HTTP route on the opencode binary.
+fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let state_path = cwd.join(".claw").join("worker-state.json");
+    if !state_path.exists() {
+        match output_format {
+            CliOutputFormat::Text => println!("No worker state file found at {}", state_path.display()),
+            CliOutputFormat::Json => println!("{}", serde_json::json!({"error": "no_state_file", "path": state_path.display().to_string()})),
+        }
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&state_path)?;
+    match output_format {
+        CliOutputFormat::Text => println!("{raw}"),
+        CliOutputFormat::Json => {
+            // Validate it parses as JSON before re-emitting
+            let _: serde_json::Value = serde_json::from_str(&raw)?;
+            println!("{raw}");
+        }
+    }
+    Ok(())
+}
+
 /// the same surface the in-process agent loop uses.
 fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
     let tools = mvp_tool_specs()
@@ -8545,6 +8576,19 @@ mod tests {
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
                 output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["state".to_string()]).expect("state should parse"),
+            CliAction::State {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["state".to_string(), "--output-format".to_string(), "json".to_string()])
+                .expect("state --output-format json should parse"),
+            CliAction::State {
+                output_format: CliOutputFormat::Json,
             }
         );
         assert_eq!(
