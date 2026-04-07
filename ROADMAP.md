@@ -385,3 +385,22 @@ to:
 - a **claw-native execution runtime**
 - an **event-native orchestration substrate**
 - a **plugin/hook-first autonomous coding harness**
+
+## Deployment Architecture Gap (filed from dogfood 2026-04-08)
+
+### WorkerState is in the runtime; /state is NOT in opencode serve
+
+**Root cause discovered during batch 8 dogfood.**
+
+`worker_boot.rs` has a solid `WorkerStatus` state machine (`Spawning → TrustRequired → ReadyForPrompt → Running → Finished/Failed`). It is exported from `runtime/src/lib.rs` as a public API. But claw-code is a **plugin** loaded inside the `opencode` binary — it cannot add HTTP routes to `opencode serve`. The HTTP server is 100% owned by the upstream opencode process (v1.3.15).
+
+**Impact:** There is no way to `curl localhost:4710/state` and get back a JSON `WorkerStatus`. Any such endpoint would require either:
+1. Upstreaming a `/state` route into opencode's HTTP server (requires a PR to sst/opencode), or
+2. Writing a sidecar HTTP process that queries the `WorkerRegistry` in-process (possible but fragile), or
+3. Writing `WorkerStatus` to a well-known file path (`.claw/worker-state.json`) that an external observer can poll.
+
+**Recommended path:** Option 3 — emit `WorkerStatus` transitions to `.claw/worker-state.json` on every state change. This is purely within claw-code's plugin scope, requires no upstream changes, and gives clawhip a file it can poll to distinguish a truly stalled worker from a quiet-but-progressing one.
+
+**Action item:** Wire `WorkerRegistry::transition()` to atomically write `.claw/worker-state.json` on every state transition. Add a `claw state` CLI subcommand that reads and prints this file. Add regression test.
+
+**Prior session note:** A previous session summary claimed commit `0984cca` landed a `/state` HTTP endpoint via axum. This was incorrect — no such commit exists on main, axum is not a dependency, and the HTTP server is not ours. The actual work that exists: `worker_boot.rs` with `WorkerStatus` enum + `WorkerRegistry`, fully wired into `runtime/src/lib.rs` as public exports.
