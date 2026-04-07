@@ -13,7 +13,7 @@ mod render;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -46,14 +46,14 @@ use runtime::{
     load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
     pricing_for_model, resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest,
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
-    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
+    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
+    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -69,6 +69,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const LATEST_SESSION_REFERENCE: &str = "latest";
@@ -86,6 +87,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--allowed-tools",
     "--resume",
     "--print",
+    "--compact",
     "-p",
 ];
 
@@ -109,6 +111,45 @@ Run `claw --help` for usage."
         }
         std::process::exit(1);
     }
+}
+
+/// Read piped stdin content when stdin is not a terminal.
+///
+/// Returns `None` when stdin is attached to a terminal (interactive REPL use),
+/// when reading fails, or when the piped content is empty after trimming.
+/// Returns `Some(raw_content)` when a pipe delivered non-empty content.
+fn read_piped_stdin() -> Option<String> {
+    if io::stdin().is_terminal() {
+        return None;
+    }
+    let mut buffer = String::new();
+    if io::stdin().read_to_string(&mut buffer).is_err() {
+        return None;
+    }
+    if buffer.trim().is_empty() {
+        return None;
+    }
+    Some(buffer)
+}
+
+/// Merge a piped stdin payload into a prompt argument.
+///
+/// When `stdin_content` is `None` or empty after trimming, the prompt is
+/// returned unchanged. Otherwise the trimmed stdin content is appended to the
+/// prompt separated by a blank line so the model sees the prompt first and the
+/// piped context immediately after it.
+fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String {
+    let Some(raw) = stdin_content else {
+        return prompt.to_string();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return prompt.to_string();
+    }
+    if prompt.is_empty() {
+        return trimmed.to_string();
+    }
+    format!("{prompt}\n\n{trimmed}")
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -156,12 +197,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
-            .run_turn_with_output(&prompt, output_format)?,
+            compact: _,
+        } => {
+            let stdin_context = read_piped_stdin();
+            let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            LiveCli::new(model, true, allowed_tools, permission_mode)?
+                .run_turn_with_output(&effective_prompt, output_format, false)?;
+        }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Export {
+            session_reference,
+            output_path,
+            output_format,
+        } => run_export(&session_reference, output_path.as_deref(), output_format)?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -225,6 +276,7 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        compact: bool,
     },
     Login {
         output_format: CliOutputFormat,
@@ -236,6 +288,11 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Init {
+        output_format: CliOutputFormat,
+    },
+    Export {
+        session_reference: String,
+        output_path: Option<PathBuf>,
         output_format: CliOutputFormat,
     },
     Repl {
@@ -283,6 +340,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
+    let mut compact = false;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -300,11 +358,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model = resolve_model_alias(value).to_string();
+                model = resolve_model_alias_with_config(value);
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = resolve_model_alias(&flag[8..]).to_string();
+                model = resolve_model_alias_with_config(&flag[8..]);
                 index += 1;
             }
             "--output-format" => {
@@ -333,6 +391,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
                 index += 1;
             }
+            "--compact" => {
+                compact = true;
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -341,11 +403,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }
                 return Ok(CliAction::Prompt {
                     prompt,
-                    model: resolve_model_alias(&model).to_string(),
+                    model: resolve_model_alias_with_config(&model),
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
                         .unwrap_or_else(default_permission_mode),
+                    compact,
                 });
             }
             "--print" => {
@@ -439,6 +502,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     output_format,
                     allowed_tools,
                     permission_mode,
+                    compact,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -450,6 +514,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "login" => Ok(CliAction::Login { output_format }),
         "logout" => Ok(CliAction::Logout { output_format }),
         "init" => Ok(CliAction::Init { output_format }),
+        "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -461,6 +526,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
+                compact,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -469,6 +535,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            compact,
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
@@ -476,6 +543,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            compact,
         }),
     }
 }
@@ -535,6 +603,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "logout"
             | "init"
             | "prompt"
+            | "export"
     ) {
         return None;
     }
@@ -565,6 +634,7 @@ fn parse_direct_slash_cli_action(
     output_format: CliOutputFormat,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    compact: bool,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -590,6 +660,7 @@ fn parse_direct_slash_cli_action(
                     output_format,
                     allowed_tools,
                     permission_mode,
+                    compact,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -744,6 +815,27 @@ fn resolve_model_alias(model: &str) -> &str {
     }
 }
 
+/// Resolve a model name through user-defined config aliases first, then fall
+/// back to the built-in alias table. This is the entry point used wherever a
+/// user-supplied model string is about to be dispatched to a provider.
+fn resolve_model_alias_with_config(model: &str) -> String {
+    let trimmed = model.trim();
+    if let Some(resolved) = config_alias_for_current_dir(trimmed) {
+        return resolve_model_alias(&resolved).to_string();
+    }
+    resolve_model_alias(trimmed).to_string()
+}
+
+fn config_alias_for_current_dir(alias: &str) -> Option<String> {
+    if alias.is_empty() {
+        return None;
+    }
+    let cwd = env::current_dir().ok()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader.load().ok()?;
+    config.aliases().get(alias).cloned()
+}
+
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
     if values.is_empty() {
         return Ok(None);
@@ -834,10 +926,10 @@ fn resolve_repl_model(cli_model: String) -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        return resolve_model_alias(&env_model).to_string();
+        return resolve_model_alias_with_config(&env_model);
     }
     if let Some(config_model) = config_model_for_current_dir() {
-        return resolve_model_alias(&config_model).to_string();
+        return resolve_model_alias_with_config(&config_model);
     }
     cli_model
 }
@@ -893,6 +985,58 @@ fn parse_system_prompt_args(
     Ok(CliAction::PrintSystemPrompt {
         cwd,
         date,
+        output_format,
+    })
+}
+
+fn parse_export_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
+    let mut output_path: Option<PathBuf> = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--session" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --session".to_string())?;
+                session_reference = value.clone();
+                index += 2;
+            }
+            flag if flag.starts_with("--session=") => {
+                session_reference = flag[10..].to_string();
+                index += 1;
+            }
+            "--output" | "-o" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("missing value for {}", args[index]))?;
+                output_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            flag if flag.starts_with("--output=") => {
+                output_path = Some(PathBuf::from(&flag[9..]));
+                index += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown export option: {other}"));
+            }
+            other if output_path.is_none() => {
+                output_path = Some(PathBuf::from(other));
+                index += 1;
+            }
+            other => {
+                return Err(format!("unexpected export argument: {other}"));
+            }
+        }
+    }
+
+    Ok(CliAction::Export {
+        session_reference,
+        output_path,
         output_format,
     })
 }
@@ -1143,6 +1287,41 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     if report.has_failures() {
         return Err("doctor found failing checks".into());
     }
+    Ok(())
+}
+
+/// Starts a minimal Model Context Protocol server that exposes claw's
+/// built-in tools over stdio.
+///
+/// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
+/// dispatched through [`tools::execute_tool`], so this server exposes exactly
+/// the same surface the in-process agent loop uses.
+fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
+    let tools = mvp_tool_specs()
+        .into_iter()
+        .map(|spec| McpTool {
+            name: spec.name.to_string(),
+            description: Some(spec.description.to_string()),
+            input_schema: Some(spec.input_schema),
+            annotations: None,
+            meta: None,
+        })
+        .collect();
+
+    let spec = McpServerSpec {
+        server_name: "claw".to_string(),
+        server_version: VERSION.to_string(),
+        tools,
+        tool_handler: Box::new(execute_tool),
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let mut server = McpServer::new(spec);
+        server.run().await
+    })?;
     Ok(())
 }
 
@@ -2422,6 +2601,15 @@ fn run_resume_command(
             message: Some(render_doctor_report()?.render()),
             json: None,
         }),
+        SlashCommand::History { count } => {
+            let limit = parse_history_count(count.as_deref()).map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let entries = collect_session_prompt_history(session);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(render_prompt_history_report(&entries, limit)),
+                json: None,
+            })
+        }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -2515,6 +2703,7 @@ fn run_repl(
                     }
                 }
                 editor.push_history(input);
+                cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
@@ -2551,6 +2740,13 @@ struct LiveCli {
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
+    prompt_history: Vec<PromptHistoryEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptHistoryEntry {
+    timestamp_ms: u64,
+    text: String,
 }
 
 struct RuntimePluginState {
@@ -3052,6 +3248,7 @@ impl LiveCli {
             system_prompt,
             runtime,
             session,
+            prompt_history: Vec::new(),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -3186,11 +3383,26 @@ impl LiveCli {
         &mut self,
         input: &str,
         output_format: CliOutputFormat,
+        compact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match output_format {
+            CliOutputFormat::Text if compact => self.run_prompt_compact(input),
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
         }
+    }
+
+    fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        let summary = result?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+        let final_text = final_assistant_text(&summary);
+        println!("{final_text}");
+        Ok(())
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -3346,6 +3558,10 @@ impl LiveCli {
                 println!("{}", render_doctor_report()?.render());
                 false
             }
+            SlashCommand::History { count } => {
+                self.print_prompt_history(count.as_deref());
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
@@ -3420,6 +3636,56 @@ impl LiveCli {
         );
     }
 
+    fn record_prompt_history(&mut self, prompt: &str) {
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map_or(self.runtime.session().updated_at_ms, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            });
+        let entry = PromptHistoryEntry {
+            timestamp_ms,
+            text: prompt.to_string(),
+        };
+        self.prompt_history.push(entry);
+        if let Err(error) = self.runtime.session_mut().push_prompt_entry(prompt) {
+            eprintln!("warning: failed to persist prompt history: {error}");
+        }
+    }
+
+    fn print_prompt_history(&self, count: Option<&str>) {
+        let limit = match parse_history_count(count) {
+            Ok(limit) => limit,
+            Err(message) => {
+                eprintln!("{message}");
+                return;
+            }
+        };
+        let session_entries = &self.runtime.session().prompt_history;
+        let entries = if session_entries.is_empty() {
+            if self.prompt_history.is_empty() {
+                collect_session_prompt_history(self.runtime.session())
+            } else {
+                self.prompt_history
+                    .iter()
+                    .map(|entry| PromptHistoryEntry {
+                        timestamp_ms: entry.timestamp_ms,
+                        text: entry.text.clone(),
+                    })
+                    .collect()
+            }
+        } else {
+            session_entries
+                .iter()
+                .map(|entry| PromptHistoryEntry {
+                    timestamp_ms: entry.timestamp_ms,
+                    text: entry.text.clone(),
+                })
+                .collect()
+        };
+        println!("{}", render_prompt_history_report(&entries, limit));
+    }
+
     fn print_sandbox_status() {
         let cwd = env::current_dir().expect("current dir");
         let loader = ConfigLoader::default_for(&cwd);
@@ -3445,7 +3711,7 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let model = resolve_model_alias(&model).to_string();
+        let model = resolve_model_alias_with_config(&model);
 
         if model == self.model {
             println!(
@@ -3636,6 +3902,12 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
+        // tools. All other `mcp` subcommands fall through to the existing
+        // configured-server reporter (`list`, `status`, ...).
+        if matches!(args.map(str::trim), Some("serve")) {
+            return run_mcp_serve();
+        }
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
@@ -3788,9 +4060,55 @@ impl LiveCli {
                 );
                 Ok(true)
             }
+            Some("delete") => {
+                let Some(target) = target else {
+                    println!("Usage: /session delete <session-id> [--force]");
+                    return Ok(false);
+                };
+                let handle = resolve_session_reference(target)?;
+                if handle.id == self.session.id {
+                    println!(
+                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
+                        handle.id
+                    );
+                    return Ok(false);
+                }
+                if !confirm_session_deletion(&handle.id) {
+                    println!("delete: cancelled.");
+                    return Ok(false);
+                }
+                delete_managed_session(&handle.path)?;
+                println!(
+                    "Session deleted\n  Deleted session  {}\n  File             {}",
+                    handle.id,
+                    handle.path.display(),
+                );
+                Ok(false)
+            }
+            Some("delete-force") => {
+                let Some(target) = target else {
+                    println!("Usage: /session delete <session-id> [--force]");
+                    return Ok(false);
+                };
+                let handle = resolve_session_reference(target)?;
+                if handle.id == self.session.id {
+                    println!(
+                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
+                        handle.id
+                    );
+                    return Ok(false);
+                }
+                delete_managed_session(&handle.path)?;
+                println!(
+                    "Session deleted\n  Deleted session  {}\n  File             {}",
+                    handle.id,
+                    handle.path.display(),
+                );
+                Ok(false)
+            }
             Some(other) => {
                 println!(
-                    "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, or /session fork [branch-name]."
+                    "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
                 );
                 Ok(false)
             }
@@ -4076,6 +4394,24 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
         .ok_or_else(|| format_no_managed_sessions().into())
 }
 
+fn delete_managed_session(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Err(format!("session file does not exist: {}", path.display()).into());
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn confirm_session_deletion(session_id: &str) -> bool {
+    print!("Delete session '{session_id}'? This cannot be undone. [y/N]: ");
+    io::stdout().flush().unwrap_or(());
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+}
+
 fn format_missing_session_reference(reference: &str) -> String {
     format!(
         "session not found: {reference}\nHint: managed sessions live in .claw/sessions/. Try `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
@@ -4172,12 +4508,14 @@ fn render_repl_help() -> String {
         "  /exit                Quit the REPL".to_string(),
         "  /quit                Quit the REPL".to_string(),
         "  Up/Down              Navigate prompt history".to_string(),
+        "  Ctrl-R               Reverse-search prompt history".to_string(),
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .claw/sessions/<session-id>.jsonl".to_string(),
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
+        "  Show prompt history  /history [count]".to_string(),
         String::new(),
         render_slash_command_help(),
     ]
@@ -4893,6 +5231,110 @@ fn write_temp_text_file(
     Ok(path)
 }
 
+const DEFAULT_HISTORY_LIMIT: usize = 20;
+
+fn parse_history_count(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_HISTORY_LIMIT);
+    };
+    let parsed: usize = raw
+        .parse()
+        .map_err(|_| format!("history: invalid count '{raw}'. Expected a positive integer."))?;
+    if parsed == 0 {
+        return Err("history: count must be greater than 0.".to_string());
+    }
+    Ok(parsed)
+}
+
+fn format_history_timestamp(timestamp_ms: u64) -> String {
+    let secs = timestamp_ms / 1_000;
+    let subsec_ms = timestamp_ms % 1_000;
+    let days_since_epoch = secs / 86_400;
+    let seconds_of_day = secs % 86_400;
+    let hours = seconds_of_day / 3_600;
+    let minutes = (seconds_of_day % 3_600) / 60;
+    let seconds = seconds_of_day % 60;
+
+    let (year, month, day) = civil_from_days(i64::try_from(days_since_epoch).unwrap_or(0));
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec_ms:03}Z"
+    )
+}
+
+// Computes civil (Gregorian) year/month/day from days since the Unix epoch
+// (1970-01-01) using Howard Hinnant's `civil_from_days` algorithm.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = (z - era * 146_097) as u64; // [0, 146_096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = y + i64::from(m <= 2);
+    (y as i32, m as u32, d as u32)
+}
+
+fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) -> String {
+    if entries.is_empty() {
+        return "Prompt history\n  Result           no prompts recorded yet".to_string();
+    }
+
+    let total = entries.len();
+    let start = total.saturating_sub(limit);
+    let shown = &entries[start..];
+    let mut lines = vec![
+        "Prompt history".to_string(),
+        format!("  Total            {total}"),
+        format!("  Showing          {} most recent", shown.len()),
+        format!("  Reverse search   Ctrl-R in the REPL"),
+        String::new(),
+    ];
+    for (offset, entry) in shown.iter().enumerate() {
+        let absolute_index = start + offset + 1;
+        let timestamp = format_history_timestamp(entry.timestamp_ms);
+        let first_line = entry.text.lines().next().unwrap_or("").trim();
+        let display = if first_line.chars().count() > 80 {
+            let truncated: String = first_line.chars().take(77).collect();
+            format!("{truncated}...")
+        } else {
+            first_line.to_string()
+        };
+        lines.push(format!("  {absolute_index:>3}. [{timestamp}] {display}"));
+    }
+    lines.join("\n")
+}
+
+fn collect_session_prompt_history(session: &Session) -> Vec<PromptHistoryEntry> {
+    if !session.prompt_history.is_empty() {
+        return session
+            .prompt_history
+            .iter()
+            .map(|entry| PromptHistoryEntry {
+                timestamp_ms: entry.timestamp_ms,
+                text: entry.text.clone(),
+            })
+            .collect();
+    }
+    let timestamp_ms = session.updated_at_ms;
+    session
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .filter_map(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(PromptHistoryEntry {
+                    timestamp_ms,
+                    text: text.clone(),
+                }),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
 fn recent_user_context(session: &Session, limit: usize) -> String {
     let requests = session
         .messages
@@ -5037,6 +5479,172 @@ fn resolve_export_path(
         format!("{file_name}.txt")
     };
     Ok(cwd.join(final_name))
+}
+
+const SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT: usize = 280;
+
+fn summarize_tool_payload_for_markdown(payload: &str) -> String {
+    let compact = match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => value.to_string(),
+        Err(_) => payload.split_whitespace().collect::<Vec<_>>().join(" "),
+    };
+    if compact.is_empty() {
+        return String::new();
+    }
+    truncate_for_summary(&compact, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT)
+}
+
+fn run_export(
+    session_reference: &str,
+    output_path: Option<&Path>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = resolve_session_reference(session_reference)?;
+    let session = Session::load_from_path(&handle.path)?;
+    let markdown = render_session_markdown(&session, &handle.id, &handle.path);
+
+    if let Some(path) = output_path {
+        fs::write(path, &markdown)?;
+        let report = format!(
+            "Export\n  Result           wrote markdown transcript\n  File             {}\n  Session          {}\n  Messages         {}",
+            path.display(),
+            handle.id,
+            session.messages.len(),
+        );
+        match output_format {
+            CliOutputFormat::Text => println!("{report}"),
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "export",
+                    "message": report,
+                    "session_id": handle.id,
+                    "file": path.display().to_string(),
+                    "messages": session.messages.len(),
+                }))?
+            ),
+        }
+        return Ok(());
+    }
+
+    match output_format {
+        CliOutputFormat::Text => {
+            print!("{markdown}");
+            if !markdown.ends_with('\n') {
+                println!();
+            }
+        }
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "export",
+                "session_id": handle.id,
+                "file": handle.path.display().to_string(),
+                "messages": session.messages.len(),
+                "markdown": markdown,
+            }))?
+        ),
+    }
+    Ok(())
+}
+
+fn render_session_markdown(session: &Session, session_id: &str, session_path: &Path) -> String {
+    let mut lines = vec![
+        "# Conversation Export".to_string(),
+        String::new(),
+        format!("- **Session**: `{session_id}`"),
+        format!("- **File**: `{}`", session_path.display()),
+        format!("- **Messages**: {}", session.messages.len()),
+    ];
+    if let Some(workspace_root) = session.workspace_root() {
+        lines.push(format!("- **Workspace**: `{}`", workspace_root.display()));
+    }
+    if let Some(fork) = &session.fork {
+        let branch = fork.branch_name.as_deref().unwrap_or("(unnamed)");
+        lines.push(format!(
+            "- **Forked from**: `{}` (branch `{branch}`)",
+            fork.parent_session_id
+        ));
+    }
+    if let Some(compaction) = &session.compaction {
+        lines.push(format!(
+            "- **Compactions**: {} (last removed {} messages)",
+            compaction.count, compaction.removed_message_count
+        ));
+    }
+    lines.push(String::new());
+    lines.push("---".to_string());
+    lines.push(String::new());
+
+    for (index, message) in session.messages.iter().enumerate() {
+        let role = match message.role {
+            MessageRole::System => "System",
+            MessageRole::User => "User",
+            MessageRole::Assistant => "Assistant",
+            MessageRole::Tool => "Tool",
+        };
+        lines.push(format!("## {}. {role}", index + 1));
+        lines.push(String::new());
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Text { text } => {
+                    let trimmed = text.trim_end();
+                    if !trimmed.is_empty() {
+                        lines.push(trimmed.to_string());
+                        lines.push(String::new());
+                    }
+                }
+                ContentBlock::ToolUse { id, name, input } => {
+                    lines.push(format!(
+                        "**Tool call** `{name}` _(id `{}`)_",
+                        short_tool_id(id)
+                    ));
+                    let summary = summarize_tool_payload_for_markdown(input);
+                    if !summary.is_empty() {
+                        lines.push(format!("> {summary}"));
+                    }
+                    lines.push(String::new());
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    is_error,
+                } => {
+                    let status = if *is_error { "error" } else { "ok" };
+                    lines.push(format!(
+                        "**Tool result** `{tool_name}` _(id `{}`, {status})_",
+                        short_tool_id(tool_use_id)
+                    ));
+                    let summary = summarize_tool_payload_for_markdown(output);
+                    if !summary.is_empty() {
+                        lines.push(format!("> {summary}"));
+                    }
+                    lines.push(String::new());
+                }
+            }
+        }
+        if let Some(usage) = message.usage {
+            lines.push(format!(
+                "_tokens: in={} out={} cache_create={} cache_read={}_",
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens,
+            ));
+            lines.push(String::new());
+        }
+    }
+    lines.join("\n")
+}
+
+fn short_tool_id(id: &str) -> String {
+    let char_count = id.chars().count();
+    if char_count <= 12 {
+        return id.to_string();
+    }
+    let prefix: String = id.chars().take(12).collect();
+    format!("{prefix}…")
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -5681,6 +6289,7 @@ impl ApiClient for AnthropicRuntimeClient {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
+        let is_post_tool = request_ends_with_tool_result(&request);
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
@@ -5694,46 +6303,96 @@ impl ApiClient for AnthropicRuntimeClient {
         };
 
         self.runtime.block_on(async {
-            let mut stream =
-                self.client
-                    .stream_message(&message_request)
-                    .await
-                    .map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?;
-            let mut stdout = io::stdout();
-            let mut sink = io::sink();
-            let out: &mut dyn Write = if self.emit_output {
-                &mut stdout
-            } else {
-                &mut sink
-            };
-            let renderer = TerminalRenderer::new();
-            let mut markdown_stream = MarkdownStreamState::default();
-            let mut events = Vec::new();
-            let mut pending_tool: Option<(String, String, String)> = None;
-            let mut block_has_thinking_summary = false;
-            let mut saw_stop = false;
+            // When resuming after tool execution, apply a stall timeout on the
+            // first stream event.  If the model does not respond within the
+            // deadline we drop the stalled connection and re-send the request as
+            // a continuation nudge (one retry only).
+            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
 
-            while let Some(event) = stream.next_event().await.map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })? {
-                match event {
-                    ApiStreamEvent::MessageStart(start) => {
-                        for block in start.message.content {
-                            push_output_block(
-                                block,
-                                out,
-                                &mut events,
-                                &mut pending_tool,
-                                true,
-                                &mut block_has_thinking_summary,
-                            )?;
-                        }
+            for attempt in 1..=max_attempts {
+                let result = self
+                    .consume_stream(&message_request, is_post_tool && attempt == 1)
+                    .await;
+                match result {
+                    Ok(events) => return Ok(events),
+                    Err(error) if error.to_string().contains("post-tool stall") && attempt < max_attempts => {
+                        // Stalled after tool completion — nudge the model by
+                        // re-sending the same request.
+                        continue;
                     }
-                    ApiStreamEvent::ContentBlockStart(start) => {
+                    Err(error) => return Err(error),
+                }
+            }
+
+            Err(RuntimeError::new(
+                "post-tool continuation nudge exhausted",
+            ))
+        })
+    }
+}
+
+impl AnthropicRuntimeClient {
+    /// Consume a single streaming response, optionally applying a stall
+    /// timeout on the first event for post-tool continuations.
+    #[allow(clippy::too_many_lines)]
+    async fn consume_stream(
+        &self,
+        message_request: &MessageRequest,
+        apply_stall_timeout: bool,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let mut stream =
+            self.client
+                .stream_message(message_request)
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                })?;
+        let mut stdout = io::stdout();
+        let mut sink = io::sink();
+        let out: &mut dyn Write = if self.emit_output {
+            &mut stdout
+        } else {
+            &mut sink
+        };
+        let renderer = TerminalRenderer::new();
+        let mut markdown_stream = MarkdownStreamState::default();
+        let mut events = Vec::new();
+        let mut pending_tool: Option<(String, String, String)> = None;
+        let mut block_has_thinking_summary = false;
+        let mut saw_stop = false;
+        let mut received_any_event = false;
+
+        loop {
+            let next = if apply_stall_timeout && !received_any_event {
+                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
+                    Ok(inner) => inner.map_err(|error| {
+                        RuntimeError::new(format_user_visible_api_error(
+                            &self.session_id,
+                            &error,
+                        ))
+                    })?,
+                    Err(_elapsed) => {
+                        return Err(RuntimeError::new(
+                            "post-tool stall: model did not respond within timeout",
+                        ));
+                    }
+                }
+            } else {
+                stream.next_event().await.map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                })?
+            };
+
+            let Some(event) = next else {
+                break;
+            };
+            received_any_event = true;
+
+            match event {
+                ApiStreamEvent::MessageStart(start) => {
+                    for block in start.message.content {
                         push_output_block(
-                            start.content_block,
+                            block,
                             out,
                             &mut events,
                             &mut pending_tool,
@@ -5741,99 +6400,118 @@ impl ApiClient for AnthropicRuntimeClient {
                             &mut block_has_thinking_summary,
                         )?;
                     }
-                    ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                        ContentBlockDelta::TextDelta { text } => {
-                            if !text.is_empty() {
-                                if let Some(progress_reporter) = &self.progress_reporter {
-                                    progress_reporter.mark_text_phase(&text);
-                                }
-                                if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                    write!(out, "{rendered}")
-                                        .and_then(|()| out.flush())
-                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
-                                }
-                                events.push(AssistantEvent::TextDelta(text));
-                            }
-                        }
-                        ContentBlockDelta::InputJsonDelta { partial_json } => {
-                            if let Some((_, _, input)) = &mut pending_tool {
-                                input.push_str(&partial_json);
-                            }
-                        }
-                        ContentBlockDelta::ThinkingDelta { .. } => {
-                            if !block_has_thinking_summary {
-                                render_thinking_block_summary(out, None, false)?;
-                                block_has_thinking_summary = true;
-                            }
-                        }
-                        ContentBlockDelta::SignatureDelta { .. } => {}
-                    },
-                    ApiStreamEvent::ContentBlockStop(_) => {
-                        block_has_thinking_summary = false;
-                        if let Some(rendered) = markdown_stream.flush(&renderer) {
-                            write!(out, "{rendered}")
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        }
-                        if let Some((id, name, input)) = pending_tool.take() {
+                }
+                ApiStreamEvent::ContentBlockStart(start) => {
+                    push_output_block(
+                        start.content_block,
+                        out,
+                        &mut events,
+                        &mut pending_tool,
+                        true,
+                        &mut block_has_thinking_summary,
+                    )?;
+                }
+                ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                    ContentBlockDelta::TextDelta { text } => {
+                        if !text.is_empty() {
                             if let Some(progress_reporter) = &self.progress_reporter {
-                                progress_reporter.mark_tool_phase(&name, &input);
+                                progress_reporter.mark_text_phase(&text);
                             }
-                            // Display tool call now that input is fully accumulated
-                            writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            events.push(AssistantEvent::ToolUse { id, name, input });
+                            if let Some(rendered) = markdown_stream.push(&renderer, &text) {
+                                write!(out, "{rendered}")
+                                    .and_then(|()| out.flush())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
+                            events.push(AssistantEvent::TextDelta(text));
                         }
                     }
-                    ApiStreamEvent::MessageDelta(delta) => {
-                        events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-                    }
-                    ApiStreamEvent::MessageStop(_) => {
-                        saw_stop = true;
-                        if let Some(rendered) = markdown_stream.flush(&renderer) {
-                            write!(out, "{rendered}")
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    ContentBlockDelta::InputJsonDelta { partial_json } => {
+                        if let Some((_, _, input)) = &mut pending_tool {
+                            input.push_str(&partial_json);
                         }
-                        events.push(AssistantEvent::MessageStop);
+                    }
+                    ContentBlockDelta::ThinkingDelta { .. } => {
+                        if !block_has_thinking_summary {
+                            render_thinking_block_summary(out, None, false)?;
+                            block_has_thinking_summary = true;
+                        }
+                    }
+                    ContentBlockDelta::SignatureDelta { .. } => {}
+                },
+                ApiStreamEvent::ContentBlockStop(_) => {
+                    block_has_thinking_summary = false;
+                    if let Some(rendered) = markdown_stream.flush(&renderer) {
+                        write!(out, "{rendered}")
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    }
+                    if let Some((id, name, input)) = pending_tool.take() {
+                        if let Some(progress_reporter) = &self.progress_reporter {
+                            progress_reporter.mark_tool_phase(&name, &input);
+                        }
+                        // Display tool call now that input is fully accumulated
+                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                 }
+                ApiStreamEvent::MessageDelta(delta) => {
+                    events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                }
+                ApiStreamEvent::MessageStop(_) => {
+                    saw_stop = true;
+                    if let Some(rendered) = markdown_stream.flush(&renderer) {
+                        write!(out, "{rendered}")
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    }
+                    events.push(AssistantEvent::MessageStop);
+                }
             }
+        }
 
-            push_prompt_cache_record(&self.client, &mut events);
+        push_prompt_cache_record(&self.client, &mut events);
 
-            if !saw_stop
-                && events.iter().any(|event| {
-                    matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                        || matches!(event, AssistantEvent::ToolUse { .. })
-                })
-            {
-                events.push(AssistantEvent::MessageStop);
-            }
+        if !saw_stop
+            && events.iter().any(|event| {
+                matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                    || matches!(event, AssistantEvent::ToolUse { .. })
+            })
+        {
+            events.push(AssistantEvent::MessageStop);
+        }
 
-            if events
-                .iter()
-                .any(|event| matches!(event, AssistantEvent::MessageStop))
-            {
-                return Ok(events);
-            }
+        if events
+            .iter()
+            .any(|event| matches!(event, AssistantEvent::MessageStop))
+        {
+            return Ok(events);
+        }
 
-            let response = self
-                .client
-                .send_message(&MessageRequest {
-                    stream: false,
-                    ..message_request.clone()
-                })
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?;
-            let mut events = response_to_events(response, out)?;
-            push_prompt_cache_record(&self.client, &mut events);
-            Ok(events)
-        })
+        let response = self
+            .client
+            .send_message(&MessageRequest {
+                stream: false,
+                ..message_request.clone()
+            })
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+            })?;
+        let mut events = response_to_events(response, out)?;
+        push_prompt_cache_record(&self.client, &mut events);
+        Ok(events)
     }
+}
+
+/// Returns `true` when the conversation ends with a tool-result message,
+/// meaning the model is expected to continue after tool execution.
+fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
+    request
+        .messages
+        .last()
+        .is_some_and(|message| message.role == MessageRole::Tool)
 }
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
@@ -6850,6 +7528,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw export [PATH] [--session SESSION] [--output PATH]")?;
+    writeln!(
+        out,
+        "      Dump the latest (or named) session as markdown; writes to PATH or stdout"
+    )?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
     writeln!(
@@ -6859,6 +7542,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --output-format FORMAT     Non-interactive output format: text or json"
+    )?;
+    writeln!(
+        out,
+        "  --compact                  Strip tool call details; print only the final assistant text (text mode only; useful for piping)"
     )?;
     writeln!(
         out,
@@ -6908,6 +7595,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  claw --compact \"summarize Cargo.toml\" | wc -l"
+    )?;
+    writeln!(
+        out,
         "  claw --allowedTools read,glob \"summarize Cargo.toml\""
     )?;
     writeln!(out, "  claw --resume {LATEST_SESSION_REFERENCE}")?;
@@ -6921,6 +7612,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw doctor")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw export")?;
+    writeln!(out, "  claw export conversation.md")?;
     Ok(())
 }
 
@@ -6945,24 +7638,26 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_connected_line, format_cost_report,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
+        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_connected_line,
+        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
+        format_issue_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_pr_report,
+        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
+        format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        normalize_permission_mode, parse_args, parse_git_status_branch,
+        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
         print_help_to, push_output_block, render_config_report, render_diff_report,
         render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_repl_model, resolve_session_reference, response_to_events,
+        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
+        resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        SlashCommand, StatusUsage, DEFAULT_MODEL,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -7446,8 +8141,73 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
             }
         );
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_returns_prompt_unchanged_when_no_pipe() {
+        // given
+        let prompt = "Review this";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, None);
+
+        // then
+        assert_eq!(merged, "Review this");
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_ignores_whitespace_only_pipe() {
+        // given
+        let prompt = "Review this";
+        let piped = "   \n\t\n  ";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, Some(piped));
+
+        // then
+        assert_eq!(merged, "Review this");
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_appends_piped_content_as_context() {
+        // given
+        let prompt = "Review this";
+        let piped = "fn main() { println!(\"hi\"); }\n";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, Some(piped));
+
+        // then
+        assert_eq!(merged, "Review this\n\nfn main() { println!(\"hi\"); }");
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_trims_surrounding_whitespace_on_pipe() {
+        // given
+        let prompt = "Summarize";
+        let piped = "\n\n  some notes  \n\n";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, Some(piped));
+
+        // then
+        assert_eq!(merged, "Summarize\n\nsome notes");
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_returns_pipe_when_prompt_is_empty() {
+        // given
+        let prompt = "";
+        let piped = "standalone body";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, Some(piped));
+
+        // then
+        assert_eq!(merged, "standalone body");
     }
 
     #[test]
@@ -7469,8 +8229,54 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_compact_flag_for_prompt_mode() {
+        // given a bare prompt invocation that includes the --compact flag
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--compact".to_string(),
+            "summarize".to_string(),
+            "this".to_string(),
+        ];
+
+        // when parse_args interprets the flag
+        let parsed = parse_args(&args).expect("args should parse");
+
+        // then compact mode is propagated and other defaults stay unchanged
+        assert_eq!(
+            parsed,
+            CliAction::Prompt {
+                prompt: "summarize this".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                compact: true,
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_subcommand_defaults_compact_to_false() {
+        // given a `prompt` subcommand invocation without --compact
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["prompt".to_string(), "hello".to_string()];
+
+        // when parse_args runs
+        let parsed = parse_args(&args).expect("args should parse");
+
+        // then compact stays false (opt-in flag)
+        match parsed {
+            CliAction::Prompt { compact, .. } => assert!(!compact),
+            other => panic!("expected Prompt action, got {other:?}"),
+        }
     }
 
     #[test]
@@ -7491,6 +8297,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
             }
         );
     }
@@ -7501,6 +8308,45 @@ mod tests {
         assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
         assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
         assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
+    }
+
+    #[test]
+    fn user_defined_aliases_resolve_before_provider_dispatch() {
+        // given
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"aliases":{"fast":"claude-haiku-4-5-20251213","smart":"opus","cheap":"grok-3-mini"}}"#,
+        )
+        .expect("project config should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        // when
+        let direct = with_current_dir(&cwd, || resolve_model_alias_with_config("fast"));
+        let chained = with_current_dir(&cwd, || resolve_model_alias_with_config("smart"));
+        let cross_provider = with_current_dir(&cwd, || resolve_model_alias_with_config("cheap"));
+        let unknown = with_current_dir(&cwd, || resolve_model_alias_with_config("unknown-model"));
+        let builtin = with_current_dir(&cwd, || resolve_model_alias_with_config("haiku"));
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        // then
+        assert_eq!(direct, "claude-haiku-4-5-20251213");
+        assert_eq!(chained, "claude-opus-4-6");
+        assert_eq!(cross_provider, "grok-3-mini");
+        assert_eq!(unknown, "unknown-model");
+        assert_eq!(builtin, "claude-haiku-4-5-20251213");
     }
 
     #[test]
@@ -7528,6 +8374,50 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+            }
+        );
+    }
+
+    #[test]
+    fn dangerously_skip_permissions_flag_forces_danger_full_access_in_repl() {
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        let args = vec!["--dangerously-skip-permissions".to_string()];
+        let parsed = parse_args(&args).expect("args should parse");
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        assert_eq!(
+            parsed,
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+    }
+
+    #[test]
+    fn dangerously_skip_permissions_flag_applies_to_prompt_subcommand() {
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        let args = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "prompt".to_string(),
+            "do".to_string(),
+            "the".to_string(),
+            "thing".to_string(),
+        ];
+        let parsed = parse_args(&args).expect("args should parse");
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        assert_eq!(
+            parsed,
+            CliAction::Prompt {
+                prompt: "do the thing".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
             }
         );
     }
@@ -7642,6 +8532,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
+                compact: false,
             }
         );
         assert_eq!(
@@ -7706,6 +8597,277 @@ mod tests {
     }
 
     #[test]
+    fn parses_bare_export_subcommand_targeting_latest_session() {
+        // given
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["export".to_string()];
+
+        // when
+        let parsed = parse_args(&args).expect("bare export should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_export_subcommand_with_positional_output_path() {
+        // given
+        let args = vec!["export".to_string(), "conversation.md".to_string()];
+
+        // when
+        let parsed = parse_args(&args).expect("export with path should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: Some(PathBuf::from("conversation.md")),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_export_subcommand_with_session_and_output_flags() {
+        // given
+        let args = vec![
+            "export".to_string(),
+            "--session".to_string(),
+            "session-alpha".to_string(),
+            "--output".to_string(),
+            "/tmp/share.md".to_string(),
+        ];
+
+        // when
+        let parsed = parse_args(&args).expect("export flags should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: "session-alpha".to_string(),
+                output_path: Some(PathBuf::from("/tmp/share.md")),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_export_subcommand_with_inline_flag_values() {
+        // given
+        let args = vec![
+            "export".to_string(),
+            "--session=session-beta".to_string(),
+            "--output=/tmp/beta.md".to_string(),
+        ];
+
+        // when
+        let parsed = parse_args(&args).expect("export inline flags should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: "session-beta".to_string(),
+                output_path: Some(PathBuf::from("/tmp/beta.md")),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_export_subcommand_with_json_output_format() {
+        // given
+        let args = vec![
+            "--output-format=json".to_string(),
+            "export".to_string(),
+            "/tmp/notes.md".to_string(),
+        ];
+
+        // when
+        let parsed = parse_args(&args).expect("json export should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: Some(PathBuf::from("/tmp/notes.md")),
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_export_options_with_helpful_message() {
+        // given
+        let args = vec!["export".to_string(), "--bogus".to_string()];
+
+        // when
+        let error = parse_args(&args).expect_err("unknown export option should fail");
+
+        // then
+        assert!(error.contains("unknown export option: --bogus"));
+    }
+
+    #[test]
+    fn rejects_export_with_extra_positional_after_path() {
+        // given
+        let args = vec![
+            "export".to_string(),
+            "first.md".to_string(),
+            "second.md".to_string(),
+        ];
+
+        // when
+        let error = parse_args(&args).expect_err("multiple positionals should fail");
+
+        // then
+        assert!(error.contains("unexpected export argument: second.md"));
+    }
+
+    #[test]
+    fn parse_export_args_helper_defaults_to_latest_reference_and_no_output() {
+        // given
+        let args: Vec<String> = vec![];
+
+        // when
+        let parsed = parse_export_args(&args, CliOutputFormat::Text)
+            .expect("empty export args should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn render_session_markdown_includes_header_and_summarized_tool_calls() {
+        // given
+        let mut session = Session::new();
+        session.session_id = "session-export-test".to_string();
+        session.messages = vec![
+            ConversationMessage::user_text("How do I list files?"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::Text {
+                    text: "I'll run a tool.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_abcdefghijklmnop".to_string(),
+                    name: "bash".to_string(),
+                    input: r#"{"command":"ls -la"}"#.to_string(),
+                },
+            ]),
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_abcdefghijklmnop".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+        ];
+
+        // when
+        let markdown = render_session_markdown(
+            &session,
+            "session-export-test",
+            std::path::Path::new("/tmp/sessions/session-export-test.jsonl"),
+        );
+
+        // then
+        assert!(markdown.starts_with("# Conversation Export"));
+        assert!(markdown.contains("- **Session**: `session-export-test`"));
+        assert!(markdown.contains("- **Messages**: 3"));
+        assert!(markdown.contains("## 1. User"));
+        assert!(markdown.contains("How do I list files?"));
+        assert!(markdown.contains("## 2. Assistant"));
+        assert!(markdown.contains("**Tool call** `bash`"));
+        assert!(markdown.contains("toolu_abcdef…"));
+        assert!(markdown.contains("ls -la"));
+        assert!(markdown.contains("## 3. Tool"));
+        assert!(markdown.contains("**Tool result** `bash`"));
+        assert!(markdown.contains("ok"));
+        assert!(markdown.contains("total 8"));
+    }
+
+    #[test]
+    fn render_session_markdown_marks_tool_errors_and_skips_empty_summaries() {
+        // given
+        let mut session = Session::new();
+        session.session_id = "errs".to_string();
+        session.messages = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "short".to_string(),
+                tool_name: "read_file".to_string(),
+                output: "   ".to_string(),
+                is_error: true,
+            }],
+            usage: None,
+        }];
+
+        // when
+        let markdown =
+            render_session_markdown(&session, "errs", std::path::Path::new("errs.jsonl"));
+
+        // then
+        assert!(markdown.contains("**Tool result** `read_file` _(id `short`, error)_"));
+        // an empty summary should not produce a stray blockquote line
+        assert!(!markdown.contains("> \n"));
+    }
+
+    #[test]
+    fn summarize_tool_payload_for_markdown_compacts_json_and_truncates_overflow() {
+        // given
+        let json_payload = r#"{
+            "command":   "ls -la",
+            "cwd": "/tmp"
+        }"#;
+        let long_payload = "a".repeat(600);
+
+        // when
+        let compacted = summarize_tool_payload_for_markdown(json_payload);
+        let truncated = summarize_tool_payload_for_markdown(&long_payload);
+
+        // then
+        assert_eq!(compacted, r#"{"command":"ls -la","cwd":"/tmp"}"#);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.chars().count() <= 281);
+    }
+
+    #[test]
+    fn short_tool_id_truncates_long_identifiers_with_ellipsis() {
+        // given
+        let long = "toolu_01ABCDEFGHIJKLMN";
+        let short = "tool_1";
+
+        // when
+        let trimmed_long = short_tool_id(long);
+        let trimmed_short = short_tool_id(short);
+
+        // then
+        assert_eq!(trimmed_long, "toolu_01ABCD…");
+        assert_eq!(trimmed_short, "tool_1");
+    }
+
+    #[test]
     fn parses_json_output_for_mcp_and_skills_commands() {
         assert_eq!(
             parse_args(&["--output-format=json".to_string(), "mcp".to_string()])
@@ -7749,6 +8911,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
             }
         );
     }
@@ -7813,6 +8976,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
+                compact: false,
             }
         );
         assert_eq!(
@@ -7836,6 +9000,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
+                compact: false,
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -8815,6 +9980,168 @@ UU conflicted.rs",
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
         assert!(help.contains("Shift+Enter/Ctrl+J"));
+        assert!(help.contains("Ctrl-R"));
+        assert!(help.contains("Reverse-search prompt history"));
+        assert!(help.contains("/history [count]"));
+    }
+
+    #[test]
+    fn parse_history_count_defaults_to_ten_when_missing() {
+        // given
+        let raw: Option<&str> = None;
+
+        // when
+        let parsed = parse_history_count(raw);
+
+        // then
+        assert_eq!(parsed, Ok(10));
+    }
+
+    #[test]
+    fn parse_history_count_accepts_positive_integers() {
+        // given
+        let raw = Some("25");
+
+        // when
+        let parsed = parse_history_count(raw);
+
+        // then
+        assert_eq!(parsed, Ok(25));
+    }
+
+    #[test]
+    fn parse_history_count_rejects_zero() {
+        // given
+        let raw = Some("0");
+
+        // when
+        let parsed = parse_history_count(raw);
+
+        // then
+        assert!(parsed.is_err());
+        assert!(parsed.unwrap_err().contains("greater than 0"));
+    }
+
+    #[test]
+    fn parse_history_count_rejects_non_numeric() {
+        // given
+        let raw = Some("abc");
+
+        // when
+        let parsed = parse_history_count(raw);
+
+        // then
+        assert!(parsed.is_err());
+        assert!(parsed.unwrap_err().contains("invalid count 'abc'"));
+    }
+
+    #[test]
+    fn format_history_timestamp_renders_iso8601_utc() {
+        // given
+        // 2023-01-15T12:34:56.789Z -> 1673786096789 ms
+        let timestamp_ms: u64 = 1_673_786_096_789;
+
+        // when
+        let formatted = format_history_timestamp(timestamp_ms);
+
+        // then
+        assert_eq!(formatted, "2023-01-15T12:34:56.789Z");
+    }
+
+    #[test]
+    fn format_history_timestamp_renders_unix_epoch_origin() {
+        // given
+        let timestamp_ms: u64 = 0;
+
+        // when
+        let formatted = format_history_timestamp(timestamp_ms);
+
+        // then
+        assert_eq!(formatted, "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn render_prompt_history_report_lists_entries_with_timestamps() {
+        // given
+        let entries = vec![
+            PromptHistoryEntry {
+                timestamp_ms: 1_673_786_096_000,
+                text: "first prompt".to_string(),
+            },
+            PromptHistoryEntry {
+                timestamp_ms: 1_673_786_100_000,
+                text: "second prompt".to_string(),
+            },
+        ];
+
+        // when
+        let rendered = render_prompt_history_report(&entries, 10);
+
+        // then
+        assert!(rendered.contains("Prompt history"));
+        assert!(rendered.contains("Total            2"));
+        assert!(rendered.contains("Showing          2 most recent"));
+        assert!(rendered.contains("Reverse search   Ctrl-R in the REPL"));
+        assert!(rendered.contains("2023-01-15T12:34:56.000Z"));
+        assert!(rendered.contains("first prompt"));
+        assert!(rendered.contains("second prompt"));
+    }
+
+    #[test]
+    fn render_prompt_history_report_truncates_to_limit_from_the_tail() {
+        // given
+        let entries = vec![
+            PromptHistoryEntry {
+                timestamp_ms: 1_000,
+                text: "older".to_string(),
+            },
+            PromptHistoryEntry {
+                timestamp_ms: 2_000,
+                text: "middle".to_string(),
+            },
+            PromptHistoryEntry {
+                timestamp_ms: 3_000,
+                text: "latest".to_string(),
+            },
+        ];
+
+        // when
+        let rendered = render_prompt_history_report(&entries, 2);
+
+        // then
+        assert!(rendered.contains("Total            3"));
+        assert!(rendered.contains("Showing          2 most recent"));
+        assert!(!rendered.contains("older"));
+        assert!(rendered.contains("middle"));
+        assert!(rendered.contains("latest"));
+    }
+
+    #[test]
+    fn render_prompt_history_report_handles_empty_history() {
+        // given
+        let entries: Vec<PromptHistoryEntry> = Vec::new();
+
+        // when
+        let rendered = render_prompt_history_report(&entries, 10);
+
+        // then
+        assert!(rendered.contains("no prompts recorded yet"));
+    }
+
+    #[test]
+    fn collect_session_prompt_history_extracts_user_text_blocks() {
+        // given
+        let mut session = Session::new();
+        session.push_user_text("hello").unwrap();
+        session.push_user_text("world").unwrap();
+
+        // when
+        let entries = collect_session_prompt_history(&session);
+
+        // then
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].text, "hello");
+        assert_eq!(entries[1].text, "world");
     }
 
     #[test]

@@ -504,6 +504,10 @@ where
         &self.session
     }
 
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
     #[must_use]
     pub fn fork_session(&self, branch_name: Option<String>) -> Session {
         self.session.fork(branch_name)
@@ -890,6 +894,7 @@ mod tests {
                 current_date: "2026-03-31".to_string(),
                 git_status: None,
                 git_diff: None,
+                git_context: None,
                 instruction_files: Vec::new(),
             })
             .with_os("linux", "6.8")

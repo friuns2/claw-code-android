@@ -546,6 +546,71 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
 }
 
 #[tokio::test]
+async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response(
+                "429 Too Many Requests",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+            ),
+            http_response(
+                "500 Internal Server Error",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}",
+            ),
+            http_response(
+                "503 Service Unavailable",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}",
+            ),
+            http_response(
+                "429 Too Many Requests",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down again\"}}",
+            ),
+            http_response(
+                "503 Service Unavailable",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"still busy\"}}",
+            ),
+            http_response(
+                "200 OK",
+                "application/json",
+                "{\"id\":\"msg_exp_retry\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Recovered after 5\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
+            ),
+        ],
+    )
+    .await;
+
+    let client = ApiClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(8, Duration::from_millis(1), Duration::from_millis(4));
+    let started_at = std::time::Instant::now();
+
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("8-retry policy should absorb 5 retryable failures");
+
+    let elapsed = started_at.elapsed();
+    assert_eq!(response.total_tokens(), 5);
+    assert_eq!(
+        state.lock().await.len(),
+        6,
+        "client should issue 1 original + 5 retry requests before the 200"
+    );
+    // Jittered sleeps are bounded by 2 * max_backoff per retry (base + jitter),
+    // so 5 sleeps fit comfortably below this upper bound with generous slack.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "retries should complete promptly, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn send_message_reuses_recent_completion_cache_entries() {
     let _guard = env_lock();

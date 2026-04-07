@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
+use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -18,9 +20,9 @@ pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
-const DEFAULT_MAX_RETRIES: u32 = 2;
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
+const DEFAULT_MAX_RETRIES: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -81,7 +83,7 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client_or_default(),
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
@@ -190,7 +192,7 @@ impl OpenAiCompatClient {
                 break retryable_error;
             }
 
-            tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
         };
 
         Err(ApiError::RetriesExhausted {
@@ -226,6 +228,37 @@ impl OpenAiCompatClient {
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
     }
+
+    fn jittered_backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
+        let base = self.backoff_for_attempt(attempt)?;
+        Ok(base + jitter_for_base(base))
+    }
+}
+
+/// Process-wide counter that guarantees distinct jitter samples even when
+/// the system clock resolution is coarser than consecutive retry sleeps.
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a random additive jitter in `[0, base]` to decorrelate retries
+/// from multiple concurrent clients. Entropy is drawn from the nanosecond
+/// wall clock mixed with a monotonic counter and run through a splitmix64
+/// finalizer; adequate for retry jitter (no cryptographic requirement).
+fn jitter_for_base(base: Duration) -> Duration {
+    let base_nanos = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+    if base_nanos == 0 {
+        return Duration::ZERO;
+    }
+    let raw_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut mixed = raw_nanos.wrapping_add(tick).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    let jitter_nanos = mixed % base_nanos.saturating_add(1);
+    Duration::from_nanos(jitter_nanos)
 }
 
 impl Provider for OpenAiCompatClient {

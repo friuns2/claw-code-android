@@ -153,6 +153,26 @@ cd rust
 ./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
 ```
 
+## HTTP proxy support
+
+`claw` honours the standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables (both upper- and lower-case spellings are accepted) when issuing outbound requests to Anthropic, OpenAI-, and xAI-compatible endpoints. Set them before launching the CLI and the underlying `reqwest` client will be configured automatically.
+
+```bash
+export HTTPS_PROXY="http://proxy.corp.example:3128"
+export HTTP_PROXY="http://proxy.corp.example:3128"
+export NO_PROXY="localhost,127.0.0.1,.corp.example"
+
+cd rust
+./target/debug/claw prompt "hello via the corporate proxy"
+```
+
+Notes:
+
+- When both `HTTPS_PROXY` and `HTTP_PROXY` are set, the secure proxy applies to `https://` URLs and the plain proxy applies to `http://` URLs.
+- `NO_PROXY` accepts a comma-separated list of host suffixes (for example `.corp.example`) and IP literals.
+- Empty values are treated as unset, so leaving `HTTPS_PROXY=""` in your shell will not enable a proxy.
+- If a proxy URL cannot be parsed, `claw` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
+
 ## Common operational commands
 
 ```bash

@@ -9,6 +9,27 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 /// Schema name advertised by generated settings files.
 pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
+/// Top-level settings keys recognized by the runtime configuration loader.
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "$schema",
+    "enabledPlugins",
+    "env",
+    "hooks",
+    "mcpServers",
+    "model",
+    "oauth",
+    "permissionMode",
+    "permissions",
+    "plugins",
+    "sandbox",
+];
+
+/// Deprecated top-level keys mapped to their replacement guidance.
+const DEPRECATED_TOP_LEVEL_KEYS: &[(&str, &str)] = &[
+    ("allowedTools", "permissions.allow"),
+    ("ignorePatterns", "permissions.deny"),
+];
+
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
@@ -58,9 +79,20 @@ pub struct RuntimeFeatureConfig {
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
+    aliases: BTreeMap<String, String>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
+    provider_fallbacks: ProviderFallbackConfig,
+}
+
+/// Ordered chain of fallback model identifiers used when the primary
+/// provider returns a retryable failure (429/500/503/etc.). The chain is
+/// strict: each entry is tried in order until one succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderFallbackConfig {
+    primary: Option<String>,
+    fallbacks: Vec<String>,
 }
 
 /// Hook command lists grouped by lifecycle stage.
@@ -259,15 +291,31 @@ impl ConfigLoader {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
+        let mut all_warnings = Vec::new();
 
         for entry in self.discover() {
-            let Some(value) = read_optional_json_object(&entry.path)? else {
+            crate::config_validate::check_unsupported_format(&entry.path)?;
+            let Some(parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
-            validate_optional_hooks_config(&value, &entry.path)?;
-            merge_mcp_servers(&mut mcp_servers, entry.source, &value, &entry.path)?;
-            deep_merge_objects(&mut merged, &value);
+            let validation = crate::config_validate::validate_config_file(
+                &parsed.object,
+                &parsed.source,
+                &entry.path,
+            );
+            if !validation.is_ok() {
+                let first_error = &validation.errors[0];
+                return Err(ConfigError::Parse(first_error.to_string()));
+            }
+            all_warnings.extend(validation.warnings);
+            validate_optional_hooks_config(&parsed.object, &entry.path)?;
+            merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            deep_merge_objects(&mut merged, &parsed.object);
             loaded_entries.push(entry);
+        }
+
+        for warning in &all_warnings {
+            eprintln!("warning: {warning}");
         }
 
         let merged_value = JsonValue::Object(merged.clone());
@@ -280,9 +328,11 @@ impl ConfigLoader {
             },
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
+            aliases: parse_optional_aliases(&merged_value)?,
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
+            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -354,6 +404,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn aliases(&self) -> &BTreeMap<String, String> {
+        &self.feature_config.aliases
+    }
+
+    #[must_use]
     pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
         self.feature_config.permission_mode
     }
@@ -366,6 +421,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.feature_config.sandbox
+    }
+
+    #[must_use]
+    pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
+        &self.feature_config.provider_fallbacks
     }
 }
 
@@ -408,6 +468,11 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+    pub fn aliases(&self) -> &BTreeMap<String, String> {
+        &self.aliases
+    }
+
+    #[must_use]
     pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
         self.permission_mode
     }
@@ -420,6 +485,33 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.sandbox
+    }
+
+    #[must_use]
+    pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
+        &self.provider_fallbacks
+    }
+}
+
+impl ProviderFallbackConfig {
+    #[must_use]
+    pub fn new(primary: Option<String>, fallbacks: Vec<String>) -> Self {
+        Self { primary, fallbacks }
+    }
+
+    #[must_use]
+    pub fn primary(&self) -> Option<&str> {
+        self.primary.as_deref()
+    }
+
+    #[must_use]
+    pub fn fallbacks(&self) -> &[String] {
+        &self.fallbacks
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fallbacks.is_empty()
     }
 }
 
@@ -572,9 +664,13 @@ impl McpServerConfig {
     }
 }
 
-fn read_optional_json_object(
-    path: &Path,
-) -> Result<Option<BTreeMap<String, JsonValue>>, ConfigError> {
+/// Parsed JSON object paired with its raw source text for validation.
+struct ParsedConfigFile {
+    object: BTreeMap<String, JsonValue>,
+    source: String,
+}
+
+fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
     let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -583,7 +679,10 @@ fn read_optional_json_object(
     };
 
     if contents.trim().is_empty() {
-        return Ok(Some(BTreeMap::new()));
+        return Ok(Some(ParsedConfigFile {
+            object: BTreeMap::new(),
+            source: contents,
+        }));
     }
 
     let parsed = match JsonValue::parse(&contents) {
@@ -600,7 +699,10 @@ fn read_optional_json_object(
             path.display()
         )));
     };
-    Ok(Some(object.clone()))
+    Ok(Some(ParsedConfigFile {
+        object: object.clone(),
+        source: contents,
+    }))
 }
 
 fn merge_mcp_servers(
@@ -635,6 +737,13 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(optional_string_map(object, "aliases", "merged settings")?.unwrap_or_default())
 }
 
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {
@@ -774,6 +883,23 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
             .unwrap_or_default(),
     })
+}
+
+fn parse_optional_provider_fallbacks(
+    root: &JsonValue,
+) -> Result<ProviderFallbackConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(ProviderFallbackConfig::default());
+    };
+    let Some(value) = object.get("providerFallbacks") else {
+        return Ok(ProviderFallbackConfig::default());
+    };
+    let entry = expect_object(value, "merged settings.providerFallbacks")?;
+    let primary =
+        optional_string(entry, "primary", "merged settings.providerFallbacks")?.map(str::to_string);
+    let fallbacks = optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
+        .unwrap_or_default();
+    Ok(ProviderFallbackConfig { primary, fallbacks })
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
@@ -1248,6 +1374,66 @@ mod tests {
     }
 
     #[test]
+    fn parses_provider_fallbacks_chain_with_primary_and_ordered_fallbacks() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "providerFallbacks": {
+                "primary": "claude-opus-4-6",
+                "fallbacks": ["grok-3", "grok-3-mini"]
+              }
+            }"#,
+        )
+        .expect("write provider fallback settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let chain = loaded.provider_fallbacks();
+        assert_eq!(chain.primary(), Some("claude-opus-4-6"));
+        assert_eq!(
+            chain.fallbacks(),
+            &["grok-3".to_string(), "grok-3-mini".to_string()]
+        );
+        assert!(!chain.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn provider_fallbacks_default_is_empty_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let chain = loaded.provider_fallbacks();
+        assert_eq!(chain.primary(), None);
+        assert!(chain.fallbacks().is_empty());
+        assert!(chain.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn parses_typed_mcp_and_oauth_config() {
         let root = temp_dir();
         let cwd = root.join("project");
@@ -1494,6 +1680,49 @@ mod tests {
     }
 
     #[test]
+    fn parses_user_defined_model_aliases_from_settings() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{"aliases":{"fast":"claude-haiku-4-5-20251213","smart":"claude-opus-4-6"}}"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            cwd.join(".claw").join("settings.local.json"),
+            r#"{"aliases":{"smart":"claude-sonnet-4-6","cheap":"grok-3-mini"}}"#,
+        )
+        .expect("write local settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let aliases = loaded.aliases();
+        assert_eq!(
+            aliases.get("fast").map(String::as_str),
+            Some("claude-haiku-4-5-20251213")
+        );
+        assert_eq!(
+            aliases.get("smart").map(String::as_str),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            aliases.get("cheap").map(String::as_str),
+            Some("grok-3-mini")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn empty_settings_file_loads_defaults() {
         // given
         let root = temp_dir();
@@ -1574,12 +1803,13 @@ mod tests {
             .load()
             .expect_err("config should fail");
 
-        // then
+        // then — config validation now catches the mixed array before the hooks parser
         let rendered = error.to_string();
-        assert!(rendered.contains(&format!(
-            "{}: hooks: field PreToolUse must contain only strings",
-            project_settings.display()
-        )));
+        assert!(
+            rendered.contains("hooks.PreToolUse")
+                && rendered.contains("must be an array of strings"),
+            "expected validation error for hooks.PreToolUse, got: {rendered}"
+        );
         assert!(!rendered.contains("merged settings.hooks"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -1644,5 +1874,141 @@ mod tests {
         assert!(config.state_for("known", false));
         assert!(config.state_for("missing", true));
         assert!(!config.state_for("missing", false));
+    }
+
+    #[test]
+    fn validates_unknown_top_level_keys_with_line_and_field_name() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            "{\n  \"model\": \"opus\",\n  \"telemetry\": true\n}\n",
+        )
+        .expect("write user settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!("{}:3:", user_settings.display())),
+            "error should include file path and line number, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("unknown field telemetry"),
+            "error should name the offending field, got: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn validates_deprecated_top_level_keys_with_replacement_guidance() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            "{\n  \"model\": \"opus\",\n  \"allowedTools\": [\"Read\"]\n}\n",
+        )
+        .expect("write user settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!("{}:3:", user_settings.display())),
+            "error should include file path and line number, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("deprecated field allowedTools"),
+            "error should call out the deprecated field, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("permissions.allow"),
+            "error should mention the replacement field, got: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn validates_wrong_type_for_known_field_with_field_path() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            "{\n  \"hooks\": {\n    \"PreToolUse\": \"not-an-array\"\n  }\n}\n",
+        )
+        .expect("write user settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!("{}: hooks", user_settings.display())),
+            "error should include file path and field path, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("PreToolUse must be an array"),
+            "error should describe the type mismatch, got: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn unknown_top_level_key_suggests_closest_match() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(&user_settings, "{\n  \"modle\": \"opus\"\n}\n").expect("write user settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("unknown field modle"),
+            "error should name the offending field, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("did you mean model?"),
+            "error should suggest the closest known key, got: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

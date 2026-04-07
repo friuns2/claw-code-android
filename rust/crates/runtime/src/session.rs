@@ -65,6 +65,13 @@ pub struct SessionFork {
     pub branch_name: Option<String>,
 }
 
+/// A single user prompt recorded with a timestamp for history tracking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPromptEntry {
+    pub timestamp_ms: u64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPersistence {
     path: PathBuf,
@@ -88,6 +95,7 @@ pub struct Session {
     pub compaction: Option<SessionCompaction>,
     pub fork: Option<SessionFork>,
     pub workspace_root: Option<PathBuf>,
+    pub prompt_history: Vec<SessionPromptEntry>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -101,6 +109,7 @@ impl PartialEq for Session {
             && self.compaction == other.compaction
             && self.fork == other.fork
             && self.workspace_root == other.workspace_root
+            && self.prompt_history == other.prompt_history
     }
 }
 
@@ -151,6 +160,7 @@ impl Session {
             compaction: None,
             fork: None,
             workspace_root: None,
+            prompt_history: Vec::new(),
             persistence: None,
         }
     }
@@ -252,6 +262,7 @@ impl Session {
                 branch_name: normalize_optional_string(branch_name),
             }),
             workspace_root: self.workspace_root.clone(),
+            prompt_history: self.prompt_history.clone(),
             persistence: None,
         }
     }
@@ -293,6 +304,17 @@ impl Session {
             object.insert(
                 "workspace_root".to_string(),
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
+            );
+        }
+        if !self.prompt_history.is_empty() {
+            object.insert(
+                "prompt_history".to_string(),
+                JsonValue::Array(
+                    self.prompt_history
+                        .iter()
+                        .map(SessionPromptEntry::to_jsonl_record)
+                        .collect(),
+                ),
             );
         }
         Ok(JsonValue::Object(object))
@@ -339,6 +361,16 @@ impl Session {
             .get("workspace_root")
             .and_then(JsonValue::as_str)
             .map(PathBuf::from);
+        let prompt_history = object
+            .get("prompt_history")
+            .and_then(JsonValue::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(SessionPromptEntry::from_json_opt)
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             version,
             session_id,
@@ -348,6 +380,7 @@ impl Session {
             compaction,
             fork,
             workspace_root,
+            prompt_history,
             persistence: None,
         })
     }
@@ -361,6 +394,7 @@ impl Session {
         let mut compaction = None;
         let mut fork = None;
         let mut workspace_root = None;
+        let mut prompt_history = Vec::new();
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -414,6 +448,13 @@ impl Session {
                         object.clone(),
                     ))?);
                 }
+                "prompt_history" => {
+                    if let Some(entry) =
+                        SessionPromptEntry::from_json_opt(&JsonValue::Object(object.clone()))
+                    {
+                        prompt_history.push(entry);
+                    }
+                }
                 other => {
                     return Err(SessionError::Format(format!(
                         "unsupported JSONL record type at line {}: {other}",
@@ -433,8 +474,24 @@ impl Session {
             compaction,
             fork,
             workspace_root,
+            prompt_history,
             persistence: None,
         })
+    }
+
+    /// Record a user prompt with the current wall-clock timestamp.
+    ///
+    /// The entry is appended to the in-memory history and, when a persistence
+    /// path is configured, incrementally written to the JSONL session file.
+    pub fn push_prompt_entry(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
+        let timestamp_ms = current_time_millis();
+        let entry = SessionPromptEntry {
+            timestamp_ms,
+            text: text.into(),
+        };
+        self.prompt_history.push(entry);
+        let entry_ref = self.prompt_history.last().expect("entry was just pushed");
+        self.append_persisted_prompt_entry(entry_ref)
     }
 
     fn render_jsonl_snapshot(&self) -> Result<String, SessionError> {
@@ -442,6 +499,11 @@ impl Session {
         if let Some(compaction) = &self.compaction {
             lines.push(compaction.to_jsonl_record()?.render());
         }
+        lines.extend(
+            self.prompt_history
+                .iter()
+                .map(|entry| entry.to_jsonl_record().render()),
+        );
         lines.extend(
             self.messages
                 .iter()
@@ -465,6 +527,25 @@ impl Session {
 
         let mut file = OpenOptions::new().append(true).open(path)?;
         writeln!(file, "{}", message_record(message).render())?;
+        Ok(())
+    }
+
+    fn append_persisted_prompt_entry(
+        &self,
+        entry: &SessionPromptEntry,
+    ) -> Result<(), SessionError> {
+        let Some(path) = self.persistence_path() else {
+            return Ok(());
+        };
+
+        let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
+        if needs_bootstrap {
+            self.save_to_path(path)?;
+            return Ok(());
+        }
+
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        writeln!(file, "{}", entry.to_jsonl_record().render())?;
         Ok(())
     }
 
@@ -781,6 +862,33 @@ impl SessionFork {
                 .and_then(JsonValue::as_str)
                 .map(ToOwned::to_owned),
         })
+    }
+}
+
+impl SessionPromptEntry {
+    #[must_use]
+    pub fn to_jsonl_record(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "type".to_string(),
+            JsonValue::String("prompt_history".to_string()),
+        );
+        object.insert(
+            "timestamp_ms".to_string(),
+            JsonValue::Number(i64::try_from(self.timestamp_ms).unwrap_or(i64::MAX)),
+        );
+        object.insert("text".to_string(), JsonValue::String(self.text.clone()));
+        JsonValue::Object(object)
+    }
+
+    fn from_json_opt(value: &JsonValue) -> Option<Self> {
+        let object = value.as_object()?;
+        let timestamp_ms = object
+            .get("timestamp_ms")
+            .and_then(JsonValue::as_i64)
+            .and_then(|value| u64::try_from(value).ok())?;
+        let text = object.get("text").and_then(JsonValue::as_str)?.to_string();
+        Some(Self { timestamp_ms, text })
     }
 }
 
