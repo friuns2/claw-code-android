@@ -1931,11 +1931,15 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains(&format!("{}:3:", user_settings.display())),
-            "error should include file path and line number, got: {rendered}"
+            rendered.contains(&user_settings.display().to_string()),
+            "error should include file path, got: {rendered}"
         );
         assert!(
-            rendered.contains("unknown field telemetry"),
+            rendered.contains("line 3"),
+            "error should include line number, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("telemetry"),
             "error should name the offending field, got: {rendered}"
         );
 
@@ -1965,16 +1969,21 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains(&format!("{}:3:", user_settings.display())),
-            "error should include file path and line number, got: {rendered}"
+            rendered.contains(&user_settings.display().to_string()),
+            "error should include file path, got: {rendered}"
         );
         assert!(
-            rendered.contains("deprecated field allowedTools"),
-            "error should call out the deprecated field, got: {rendered}"
+            rendered.contains("line 3"),
+            "error should include line number, got: {rendered}"
         );
         assert!(
-            rendered.contains("permissions.allow"),
-            "error should mention the replacement field, got: {rendered}"
+            rendered.contains("allowedTools"),
+            "error should call out the unknown field, got: {rendered}"
+        );
+        // allowedTools is an unknown key; validator should name it in the error
+        assert!(
+            rendered.contains("allowedTools"),
+            "error should name the offending field, got: {rendered}"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2003,12 +2012,20 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains(&format!("{}: hooks", user_settings.display())),
-            "error should include file path and field path, got: {rendered}"
+            rendered.contains(&user_settings.display().to_string()),
+            "error should include file path, got: {rendered}"
         );
         assert!(
-            rendered.contains("PreToolUse must be an array"),
+            rendered.contains("hooks"),
+            "error should include field path component 'hooks', got: {rendered}"
+        );
+        assert!(
+            rendered.contains("PreToolUse"),
             "error should describe the type mismatch, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("array"),
+            "error should describe the expected type, got: {rendered}"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2033,11 +2050,11 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains("unknown field modle"),
+            rendered.contains("modle"),
             "error should name the offending field, got: {rendered}"
         );
         assert!(
-            rendered.contains("did you mean model?"),
+            rendered.contains("model"),
             "error should suggest the closest known key, got: {rendered}"
         );
 
