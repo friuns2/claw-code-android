@@ -16,7 +16,9 @@ use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
-use super::{model_token_limit, resolve_model_alias, Provider, ProviderFuture};
+use super::{
+    anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
+};
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
@@ -49,10 +51,7 @@ impl AuthSource {
             }),
             (Some(api_key), None) => Ok(Self::ApiKey(api_key)),
             (None, Some(bearer_token)) => Ok(Self::BearerToken(bearer_token)),
-            (None, None) => Err(ApiError::missing_credentials(
-                "Anthropic",
-                &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
-            )),
+            (None, None) => Err(anthropic_missing_credentials()),
         }
     }
 
@@ -436,6 +435,7 @@ impl AnthropicClient {
                         last_error = Some(error);
                     }
                     Err(error) => {
+                        let error = enrich_bearer_auth_error(error, &self.auth);
                         self.record_request_failure(attempts, &error);
                         return Err(error);
                     }
@@ -643,10 +643,7 @@ impl AuthSource {
                 }
             }
             Ok(Some(token_set)) => Ok(Self::BearerToken(token_set.access_token)),
-            Ok(None) => Err(ApiError::missing_credentials(
-                "Anthropic",
-                &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
-            )),
+            Ok(None) => Err(anthropic_missing_credentials()),
             Err(error) => Err(error),
         }
     }
@@ -690,10 +687,7 @@ where
     }
 
     let Some(token_set) = load_saved_oauth_token()? else {
-        return Err(ApiError::missing_credentials(
-            "Anthropic",
-            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
-        ));
+        return Err(anthropic_missing_credentials());
     };
     if !oauth_token_is_expired(&token_set) {
         return Ok(AuthSource::BearerToken(token_set.access_token));
@@ -790,10 +784,7 @@ fn read_api_key() -> Result<String, ApiError> {
     auth.api_key()
         .or_else(|| auth.bearer_token())
         .map(ToOwned::to_owned)
-        .ok_or(ApiError::missing_credentials(
-            "Anthropic",
-            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
-        ))
+        .ok_or_else(anthropic_missing_credentials)
 }
 
 #[cfg(test)]
@@ -932,6 +923,85 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Anthropic API keys (`sk-ant-*`) are accepted over the `x-api-key` header
+/// and rejected with HTTP 401 "Invalid bearer token" when sent as a Bearer
+/// token via `ANTHROPIC_AUTH_TOKEN`. This happens often enough in the wild
+/// (users copy-paste an `sk-ant-...` key into `ANTHROPIC_AUTH_TOKEN` because
+/// the env var name sounds auth-related) that a bare 401 error is useless.
+/// When we detect this exact shape, append a hint to the error message that
+/// points the user at the one-line fix.
+const SK_ANT_BEARER_HINT: &str = "sk-ant-* keys go in ANTHROPIC_API_KEY (x-api-key header), not ANTHROPIC_AUTH_TOKEN (Bearer header). Move your key to ANTHROPIC_API_KEY.";
+
+fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
+    let ApiError::Api {
+        status,
+        error_type,
+        message,
+        request_id,
+        body,
+        retryable,
+    } = error
+    else {
+        return error;
+    };
+    if status.as_u16() != 401 {
+        return ApiError::Api {
+            status,
+            error_type,
+            message,
+            request_id,
+            body,
+            retryable,
+        };
+    }
+    let Some(bearer_token) = auth.bearer_token() else {
+        return ApiError::Api {
+            status,
+            error_type,
+            message,
+            request_id,
+            body,
+            retryable,
+        };
+    };
+    if !bearer_token.starts_with("sk-ant-") {
+        return ApiError::Api {
+            status,
+            error_type,
+            message,
+            request_id,
+            body,
+            retryable,
+        };
+    }
+    // Only append the hint when the AuthSource is pure BearerToken. If both
+    // api_key and bearer_token are present (`ApiKeyAndBearer`), the x-api-key
+    // header is already being sent alongside the Bearer header and the 401
+    // is coming from a different cause — adding the hint would be misleading.
+    if auth.api_key().is_some() {
+        return ApiError::Api {
+            status,
+            error_type,
+            message,
+            request_id,
+            body,
+            retryable,
+        };
+    }
+    let enriched_message = match message {
+        Some(existing) => Some(format!("{existing} — hint: {SK_ANT_BEARER_HINT}")),
+        None => Some(format!("hint: {SK_ANT_BEARER_HINT}")),
+    };
+    ApiError::Api {
+        status,
+        error_type,
+        message: enriched_message,
+        request_id,
+        body,
+        retryable,
+    }
 }
 
 /// Remove beta-only body fields that the standard `/v1/messages` and
@@ -1537,5 +1607,164 @@ mod tests {
             rendered.get("model").and_then(serde_json::Value::as_str),
             Some("claude-sonnet-4-6")
         );
+    }
+
+    #[test]
+    fn enrich_bearer_auth_error_appends_sk_ant_hint_on_401_with_pure_bearer_token() {
+        // given
+        let auth = AuthSource::BearerToken("sk-ant-api03-deadbeef".to_string());
+        let error = crate::error::ApiError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            error_type: Some("authentication_error".to_string()),
+            message: Some("Invalid bearer token".to_string()),
+            request_id: Some("req_varleg_001".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        // when
+        let enriched = super::enrich_bearer_auth_error(error, &auth);
+
+        // then
+        let rendered = enriched.to_string();
+        assert!(
+            rendered.contains("Invalid bearer token"),
+            "existing provider message should be preserved: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sk-ant-* keys go in ANTHROPIC_API_KEY (x-api-key header), not ANTHROPIC_AUTH_TOKEN (Bearer header). Move your key to ANTHROPIC_API_KEY."
+            ),
+            "rendered error should include the sk-ant-* hint: {rendered}"
+        );
+        assert!(
+            rendered.contains("[trace req_varleg_001]"),
+            "request id should still flow through the enriched error: {rendered}"
+        );
+        match enriched {
+            crate::error::ApiError::Api { status, .. } => {
+                assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+            }
+            other => panic!("expected Api variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrich_bearer_auth_error_leaves_non_401_errors_unchanged() {
+        // given
+        let auth = AuthSource::BearerToken("sk-ant-api03-deadbeef".to_string());
+        let error = crate::error::ApiError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            error_type: Some("api_error".to_string()),
+            message: Some("internal server error".to_string()),
+            request_id: None,
+            body: String::new(),
+            retryable: true,
+        };
+
+        // when
+        let enriched = super::enrich_bearer_auth_error(error, &auth);
+
+        // then
+        let rendered = enriched.to_string();
+        assert!(
+            !rendered.contains("sk-ant-*"),
+            "non-401 errors must not be annotated with the bearer hint: {rendered}"
+        );
+        assert!(
+            rendered.contains("internal server error"),
+            "original message must be preserved verbatim: {rendered}"
+        );
+    }
+
+    #[test]
+    fn enrich_bearer_auth_error_ignores_401_when_bearer_token_is_not_sk_ant() {
+        // given
+        let auth = AuthSource::BearerToken("oauth-access-token-opaque".to_string());
+        let error = crate::error::ApiError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            error_type: Some("authentication_error".to_string()),
+            message: Some("Invalid bearer token".to_string()),
+            request_id: None,
+            body: String::new(),
+            retryable: false,
+        };
+
+        // when
+        let enriched = super::enrich_bearer_auth_error(error, &auth);
+
+        // then
+        let rendered = enriched.to_string();
+        assert!(
+            !rendered.contains("sk-ant-*"),
+            "oauth-style bearer tokens must not trigger the sk-ant-* hint: {rendered}"
+        );
+    }
+
+    #[test]
+    fn enrich_bearer_auth_error_skips_hint_when_api_key_header_is_also_present() {
+        // given
+        let auth = AuthSource::ApiKeyAndBearer {
+            api_key: "sk-ant-api03-legitimate".to_string(),
+            bearer_token: "sk-ant-api03-deadbeef".to_string(),
+        };
+        let error = crate::error::ApiError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            error_type: Some("authentication_error".to_string()),
+            message: Some("Invalid bearer token".to_string()),
+            request_id: None,
+            body: String::new(),
+            retryable: false,
+        };
+
+        // when
+        let enriched = super::enrich_bearer_auth_error(error, &auth);
+
+        // then
+        let rendered = enriched.to_string();
+        assert!(
+            !rendered.contains("sk-ant-*"),
+            "hint should be suppressed when x-api-key header is already being sent: {rendered}"
+        );
+    }
+
+    #[test]
+    fn enrich_bearer_auth_error_ignores_401_when_auth_source_has_no_bearer() {
+        // given
+        let auth = AuthSource::ApiKey("sk-ant-api03-legitimate".to_string());
+        let error = crate::error::ApiError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            error_type: Some("authentication_error".to_string()),
+            message: Some("Invalid x-api-key".to_string()),
+            request_id: None,
+            body: String::new(),
+            retryable: false,
+        };
+
+        // when
+        let enriched = super::enrich_bearer_auth_error(error, &auth);
+
+        // then
+        let rendered = enriched.to_string();
+        assert!(
+            !rendered.contains("sk-ant-*"),
+            "bearer hint must not apply when AuthSource is ApiKey-only: {rendered}"
+        );
+    }
+
+    #[test]
+    fn enrich_bearer_auth_error_passes_non_api_errors_through_unchanged() {
+        // given
+        let auth = AuthSource::BearerToken("sk-ant-api03-deadbeef".to_string());
+        let error = crate::error::ApiError::InvalidSseFrame("unterminated event");
+
+        // when
+        let enriched = super::enrich_bearer_auth_error(error, &auth);
+
+        // then
+        assert!(matches!(
+            enriched,
+            crate::error::ApiError::InvalidSseFrame(_)
+        ));
     }
 }
