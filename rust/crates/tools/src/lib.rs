@@ -6249,6 +6249,14 @@ mod tests {
 
     #[test]
     fn web_search_extracts_and_filters_results() {
+        // Serialize env-var mutation so this test cannot race with the sibling
+        // web_search_handles_generic_links_and_invalid_base_url test that also
+        // sets CLAWD_WEB_SEARCH_BASE_URL. Without the lock, parallel test
+        // runners can interleave the set/remove calls and cause assertion
+        // failures on the wrong port.
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.contains("GET /search?q=rust+web+search "));
             HttpResponse::html(
