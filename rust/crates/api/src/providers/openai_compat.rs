@@ -726,6 +726,24 @@ fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
+/// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
+/// The prefix is used only to select transport; the backend expects the
+/// bare model id.
+fn strip_routing_prefix(model: &str) -> &str {
+    if let Some(pos) = model.find('/') {
+        let prefix = &model[..pos];
+        // Only strip if the prefix before "/" is a known routing prefix,
+        // not if "/" appears in the middle of the model name for other reasons.
+        if matches!(prefix, "openai" | "xai" | "grok" | "qwen") {
+            &model[pos + 1..]
+        } else {
+            model
+        }
+    } else {
+        model
+    }
+}
+
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
@@ -738,8 +756,11 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
         messages.extend(translate_message(message));
     }
 
+    // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
+    let wire_model = strip_routing_prefix(&request.model);
+
     let mut payload = json!({
-        "model": request.model,
+        "model": wire_model,
         "max_tokens": request.max_tokens,
         "messages": messages,
         "stream": request.stream,
@@ -848,13 +869,45 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
         .join("\n")
 }
 
+/// Recursively ensure every object-type node in a JSON Schema has
+/// `"properties"` (at least `{}`) and `"additionalProperties": false`.
+/// The OpenAI `/responses` endpoint validates schemas strictly and rejects
+/// objects that omit these fields; `/chat/completions` is lenient but also
+/// accepts them, so we normalise unconditionally.
+fn normalize_object_schema(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        if obj.get("type").and_then(Value::as_str) == Some("object") {
+            obj.entry("properties").or_insert_with(|| json!({}));
+            obj.entry("additionalProperties")
+                .or_insert(Value::Bool(false));
+        }
+        // Recurse into properties values
+        if let Some(props) = obj.get_mut("properties") {
+            if let Some(props_obj) = props.as_object_mut() {
+                let keys: Vec<String> = props_obj.keys().cloned().collect();
+                for k in keys {
+                    if let Some(v) = props_obj.get_mut(&k) {
+                        normalize_object_schema(v);
+                    }
+                }
+            }
+        }
+        // Recurse into items (arrays)
+        if let Some(items) = obj.get_mut("items") {
+            normalize_object_schema(items);
+        }
+    }
+}
+
 fn openai_tool_definition(tool: &ToolDefinition) -> Value {
+    let mut parameters = tool.input_schema.clone();
+    normalize_object_schema(&mut parameters);
     json!({
         "type": "function",
         "function": {
             "name": tool.name,
             "description": tool.description,
-            "parameters": tool.input_schema,
+            "parameters": parameters,
         }
     })
 }
@@ -1120,6 +1173,40 @@ mod tests {
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn tool_schema_object_gets_strict_fields_for_responses_endpoint() {
+        // OpenAI /responses endpoint rejects object schemas missing
+        // "properties" and "additionalProperties". Verify normalize_object_schema
+        // fills them in so the request shape is strict-validator-safe.
+        use super::normalize_object_schema;
+
+        // Bare object — no properties at all
+        let mut schema = json!({"type": "object"});
+        normalize_object_schema(&mut schema);
+        assert_eq!(schema["properties"], json!({}));
+        assert_eq!(schema["additionalProperties"], json!(false));
+
+        // Nested object inside properties
+        let mut schema2 = json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": "object", "properties": {"lat": {"type": "number"}}}
+            }
+        });
+        normalize_object_schema(&mut schema2);
+        assert_eq!(schema2["additionalProperties"], json!(false));
+        assert_eq!(schema2["properties"]["location"]["additionalProperties"], json!(false));
+
+        // Existing properties/additionalProperties should not be overwritten
+        let mut schema3 = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "additionalProperties": true
+        });
+        normalize_object_schema(&mut schema3);
+        assert_eq!(schema3["additionalProperties"], json!(true), "must not overwrite existing");
     }
 
     #[test]
