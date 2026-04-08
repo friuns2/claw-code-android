@@ -88,6 +88,7 @@ async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
             tools: None,
             tool_choice: None,
             stream: false,
+            ..Default::default()
         })
         .await
         .expect_err("oversized request should fail local context-window preflight");
@@ -496,6 +497,7 @@ fn sample_request(stream: bool) -> MessageRequest {
         }]),
         tool_choice: Some(ToolChoice::Auto),
         stream,
+        ..Default::default()
     }
 }
 

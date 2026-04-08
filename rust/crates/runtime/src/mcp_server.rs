@@ -366,9 +366,7 @@ mod tests {
                 server_name: "test".to_string(),
                 server_version: "0.0.0".to_string(),
                 tools: Vec::new(),
-                tool_handler: Box::new(|name, args| {
-                    Ok(format!("called {name} with {args}"))
-                }),
+                tool_handler: Box::new(|name, args| Ok(format!("called {name} with {args}"))),
             },
             stdin: BufReader::new(stdin()),
             stdout: stdout(),

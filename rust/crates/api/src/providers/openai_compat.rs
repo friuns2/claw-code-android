@@ -135,12 +135,7 @@ impl OpenAiCompatClient {
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(
-                self.config.provider_name,
-                &request.model,
-                &body,
-                error,
-            )
+            ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
         })?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
@@ -160,10 +155,7 @@ impl OpenAiCompatClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::with_context(
-                self.config.provider_name,
-                request.model.clone(),
-            ),
+            parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),
@@ -253,7 +245,9 @@ fn jitter_for_base(base: Duration) -> Duration {
         .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0);
     let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut mixed = raw_nanos.wrapping_add(tick).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut mixed = raw_nanos
+        .wrapping_add(tick)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
     mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     mixed ^= mixed >> 31;
@@ -1110,7 +1104,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
-            ..Default::default()
+                ..Default::default()
             },
             OpenAiCompatConfig::openai(),
         );
@@ -1129,7 +1123,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
-            ..Default::default()
+                ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );
@@ -1240,8 +1234,14 @@ mod tests {
             ..Default::default()
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
-        assert!(payload.get("temperature").is_none(), "reasoning model should strip temperature");
-        assert!(payload.get("top_p").is_none(), "reasoning model should strip top_p");
+        assert!(
+            payload.get("temperature").is_none(),
+            "reasoning model should strip temperature"
+        );
+        assert!(
+            payload.get("top_p").is_none(),
+            "reasoning model should strip top_p"
+        );
         assert!(payload.get("frequency_penalty").is_none());
         assert!(payload.get("presence_penalty").is_none());
         // stop is safe for all providers
@@ -1269,7 +1269,10 @@ mod tests {
             ..Default::default()
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
-        assert!(payload.get("temperature").is_none(), "temperature should be absent");
+        assert!(
+            payload.get("temperature").is_none(),
+            "temperature should be absent"
+        );
         assert!(payload.get("top_p").is_none(), "top_p should be absent");
         assert!(payload.get("frequency_penalty").is_none());
         assert!(payload.get("presence_penalty").is_none());

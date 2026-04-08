@@ -1441,8 +1441,12 @@ mod tests {
 /// Called by external consumers (e.g. clawhip) to enumerate sessions for a CWD.
 #[allow(dead_code)]
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
-    let store = crate::session_control::SessionStore::from_cwd(cwd)
-        .map_err(|e| SessionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+    let store = crate::session_control::SessionStore::from_cwd(cwd).map_err(|e| {
+        SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+    })?;
     Ok(store.sessions_dir().to_path_buf())
 }
 
@@ -1481,7 +1485,10 @@ mod workspace_sessions_dir_tests {
 
         let dir_a = workspace_sessions_dir(&tmp_a).expect("dir a");
         let dir_b = workspace_sessions_dir(&tmp_b).expect("dir b");
-        assert_ne!(dir_a, dir_b, "different CWDs must produce different session dirs");
+        assert_ne!(
+            dir_a, dir_b,
+            "different CWDs must produce different session dirs"
+        );
 
         fs::remove_dir_all(&tmp_a).ok();
         fs::remove_dir_all(&tmp_b).ok();

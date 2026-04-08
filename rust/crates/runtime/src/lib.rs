@@ -56,10 +56,6 @@ pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
-pub use config_validate::{
-    check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
-    DiagnosticKind, ValidationResult,
-};
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
@@ -68,17 +64,21 @@ pub use config::{
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
     CLAW_SETTINGS_SCHEMA_NAME,
 };
+pub use config_validate::{
+    check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
+    DiagnosticKind, ValidationResult,
+};
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
     ToolExecutor, TurnSummary,
 };
-pub use git_context::{GitCommitEntry, GitContext};
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
     WriteFileOutput,
 };
+pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
