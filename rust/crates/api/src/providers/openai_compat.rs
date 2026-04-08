@@ -18,6 +18,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -34,6 +35,7 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -55,11 +57,27 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
         }
     }
+
+    /// Alibaba DashScope compatible-mode endpoint (Qwen family models).
+    /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
+    /// Requested via Discord #clawcode-get-help: native Alibaba API for
+    /// higher rate limits than going through OpenRouter.
+    #[must_use]
+    pub const fn dashscope() -> Self {
+        Self {
+            provider_name: "DashScope",
+            api_key_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "DashScope" => DASHSCOPE_ENV_VARS,
             _ => &[],
         }
     }
@@ -689,12 +707,18 @@ struct ErrorBody {
 /// reasoning/chain-of-thought models with fixed sampling.
 fn is_reasoning_model(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
+    // Strip any provider/ prefix for the check (e.g. qwen/qwen-qwq -> qwen-qwq)
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
     // OpenAI reasoning models
-    lowered.starts_with("o1")
-        || lowered.starts_with("o3")
-        || lowered.starts_with("o4")
+    canonical.starts_with("o1")
+        || canonical.starts_with("o3")
+        || canonical.starts_with("o4")
         // xAI reasoning: grok-3-mini always uses reasoning mode
-        || lowered == "grok-3-mini"
+        || canonical == "grok-3-mini"
+        // Alibaba DashScope reasoning variants (QwQ + Qwen3-Thinking family)
+        || canonical.starts_with("qwen-qwq")
+        || canonical.starts_with("qwq")
+        || canonical.contains("thinking")
 }
 
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
@@ -1257,6 +1281,22 @@ mod tests {
         assert!(!is_reasoning_model("gpt-4o"));
         assert!(!is_reasoning_model("grok-3"));
         assert!(!is_reasoning_model("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn qwen_reasoning_variants_are_detected() {
+        // QwQ reasoning model
+        assert!(is_reasoning_model("qwen-qwq-32b"));
+        assert!(is_reasoning_model("qwen/qwen-qwq-32b"));
+        // Qwen3 thinking family
+        assert!(is_reasoning_model("qwen3-30b-a3b-thinking"));
+        assert!(is_reasoning_model("qwen/qwen3-30b-a3b-thinking"));
+        // Bare qwq
+        assert!(is_reasoning_model("qwq-plus"));
+        // Regular Qwen models must NOT be classified as reasoning
+        assert!(!is_reasoning_model("qwen-max"));
+        assert!(!is_reasoning_model("qwen/qwen-plus"));
+        assert!(!is_reasoning_model("qwen-turbo"));
     }
 
     #[test]
