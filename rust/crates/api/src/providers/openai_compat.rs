@@ -98,6 +98,11 @@ impl OpenAiCompatClient {
     const fn config(&self) -> OpenAiCompatConfig {
         self.config
     }
+
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
