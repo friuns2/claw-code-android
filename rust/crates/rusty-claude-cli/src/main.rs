@@ -201,16 +201,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-            compact: _,
+            compact,
             base_commit,
         } => {
             run_stale_base_preflight(base_commit.as_deref());
-            let stdin_context = read_piped_stdin();
+            // Only consume piped stdin as prompt context when the permission
+            // mode is fully unattended. In modes where the permission
+            // prompter may invoke CliPermissionPrompter::decide(), stdin
+            // must remain available for interactive approval; otherwise the
+            // prompter's read_line() would hit EOF and deny every request.
+            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
+                read_piped_stdin()
+            } else {
+                None
+            };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
                 &effective_prompt,
                 output_format,
-                false,
+                compact,
             )?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
@@ -4394,6 +4403,22 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
             return Ok(path);
         }
     }
+    // Backward compatibility: pre-isolation sessions were stored at
+    // `.claw/sessions/<id>.{jsonl,json}` without the per-workspace hash
+    // subdirectory. Walk up from `directory` to the `.claw/sessions/` root
+    // and try the flat layout as a fallback so users do not lose access
+    // to their pre-upgrade managed sessions.
+    if let Some(legacy_root) = directory
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+    {
+        for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
+            let path = legacy_root.join(format!("{session_id}.{extension}"));
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
     Err(format_missing_session_reference(session_id).into())
 }
 
@@ -4405,9 +4430,14 @@ fn is_managed_session_file(path: &Path) -> bool {
         })
 }
 
-fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    let mut sessions = Vec::new();
-    for entry in fs::read_dir(sessions_dir()?)? {
+fn collect_sessions_from_dir(
+    directory: &Path,
+    sessions: &mut Vec<ManagedSessionSummary>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         if !is_managed_session_file(&path) {
@@ -4457,6 +4487,24 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             branch_name,
         });
     }
+    Ok(())
+}
+
+fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    let mut sessions = Vec::new();
+    let primary_dir = sessions_dir()?;
+    collect_sessions_from_dir(&primary_dir, &mut sessions)?;
+
+    // Backward compatibility: include sessions stored in the pre-isolation
+    // flat `.claw/sessions/` root so users do not lose access to existing
+    // managed sessions after the workspace-hashed subdirectory rollout.
+    if let Some(legacy_root) = primary_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+    {
+        collect_sessions_from_dir(legacy_root, &mut sessions)?;
+    }
+
     sessions.sort_by(|left, right| {
         right
             .modified_epoch_millis
@@ -9018,11 +9066,14 @@ mod tests {
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        // Input is ["help", "me", "debug"] so the joined prompt shorthand
+        // must be "help me debug". A previous batch accidentally rewrote
+        // the expected string to "$help overview" (copy-paste slip).
         assert_eq!(
             parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
-                prompt: "$help overview".to_string(),
+                prompt: "help me debug".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -9339,7 +9390,9 @@ mod tests {
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
-        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]]"));
+        // Batch 5 added `/session delete`; match on the stable core rather than
+        // the trailing bracket so future additions don't re-break this.
+        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]"));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));

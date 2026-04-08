@@ -487,10 +487,21 @@ impl AnthropicClient {
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
+        // Always run the local byte-estimate guard first. This catches
+        // oversized requests even if the remote count_tokens endpoint is
+        // unreachable, misconfigured, or unimplemented (e.g., third-party
+        // Anthropic-compatible gateways). If byte estimation already flags
+        // the request as oversized, reject immediately without a network
+        // round trip.
+        super::preflight_message_request(request)?;
+
         let Some(limit) = model_token_limit(&request.model) else {
             return Ok(());
         };
 
+        // Best-effort refinement using the Anthropic count_tokens endpoint.
+        // On any failure (network, parse, auth), fall back to the local
+        // byte-estimate result which already passed above.
         let counted_input_tokens = match self.count_tokens(request).await {
             Ok(count) => count,
             Err(_) => return Ok(()),

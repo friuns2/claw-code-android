@@ -194,6 +194,20 @@ Workers should distinguish:
 Acceptance:
 - no more ambiguous "tests passed" messaging
 - merge policy can require the correct green level for the lane type
+- a single hung test must not mask other failures: enforce per-test
+  timeouts in CI (`cargo test --workspace`) so a 6-minute hang in one
+  crate cannot prevent downstream crates from running their suites
+- when a CI job fails because of a hang, the worker must report it as
+  `test.hung` rather than a generic failure, so triage doesn't conflate
+  it with a normal `assertion failed`
+- recorded pinpoint (2026-04-08): `be561bf` swapped the local
+  byte-estimate preflight for a `count_tokens` round-trip and silently
+  returned `Ok(())` on any error, so `send_message_blocks_oversized_*`
+  hung for ~6 minutes per attempt; the resulting workspace job crash
+  hid 6 *separate* pre-existing CLI regressions (compact flag
+  discarded, piped stdin vs permission prompter, legacy session layout,
+  help/prompt assertions, mock harness count) that only became
+  diagnosable after `8c6dfe5` + `5851f2d` restored the fast-fail path
 
 ## Phase 4 — Claws-First Task Execution
 
@@ -311,6 +325,7 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 22. **Opaque failure surface for session/runtime crashes** — **done**: `safe_failure_class()` in `error.rs` classifies all API errors into 8 user-safe classes (`provider_auth`, `provider_internal`, `provider_retry_exhausted`, `provider_rate_limit`, `provider_transport`, `provider_error`, `context_window`, `runtime_io`). `format_user_visible_api_error` in `main.rs` attaches session ID + request trace ID to every user-visible error. Coverage in `opaque_provider_wrapper_surfaces_failure_class_session_and_trace` and 3 related tests.
 23. **`doctor --output-format json` check-level structure gap** — **done**: `claw doctor --output-format json` now keeps the human-readable `message`/`report` while also emitting structured per-check diagnostics (`name`, `status`, `summary`, `details`, plus typed fields like workspace paths and sandbox fallback data), with regression coverage in `output_format_contract.rs`.
 24. **Plugin lifecycle init/shutdown test flakes under workspace-parallel execution** — dogfooding surfaced that `build_runtime_runs_plugin_lifecycle_init_and_shutdown` can fail under `cargo test --workspace` while passing in isolation because sibling tests race on tempdir-backed shell init script paths. This is test brittleness rather than a code-path regression, but it still destabilizes CI confidence and wastes diagnosis cycles. **Action:** isolate temp resources per test robustly (unique dirs + no shared cwd assumptions), audit cleanup timing, and add a regression guard so the plugin lifecycle test remains stable under parallel workspace execution.
+25. **`plugins::hooks::collects_and_runs_hooks_from_enabled_plugins` flakes on Linux CI** — dogfooding on 2026-04-08 reproduced this twice (CI runs [24120271422](https://github.com/ultraworkers/claw-code/actions/runs/24120271422) and [24120538408](https://github.com/ultraworkers/claw-code/actions/runs/24120538408)), both times failing on first attempt and passing on rerun. Failure mode is `PostToolUse hook .../hooks/post.sh failed to start for "Read": Broken pipe (os error 32)` when spawning a child shell script. Passes consistently on macOS. **Suspected root cause:** `write_hook_plugin` in `rust/crates/plugins/src/hooks.rs` (~line 362) writes `pre.sh`, `post.sh`, and `failure.sh` via `fs::write` but never calls `fs::set_permissions` to add the execute bit. On Linux, directly `Command::new(path).spawn()`ing a shebang script without `+x` can succeed or fail depending on fork/exec ordering, which explains the flake pattern (pipe setup succeeds, exec fails after fork, yielding `Broken pipe` instead of a clean `Permission denied`). **Action:** in `write_hook_plugin`, after each `fs::write` of a `.sh` file, set mode `0o755` via `std::os::unix::fs::PermissionsExt` under `#[cfg(unix)]`, and add a regression guard that asserts the file is executable before the hook runner is invoked.
 26. **Resumed local-command JSON parity gap** — **done**: direct `claw --output-format json` already had structured renderers for `sandbox`, `mcp`, `skills`, `version`, and `init`, but resumed `claw --output-format json --resume <session> /…` paths still fell back to prose because resumed slash dispatch only emitted JSON for `/status`. Resumed `/sandbox`, `/mcp`, `/skills`, `/version`, and `/init` now reuse the same JSON envelopes as their direct CLI counterparts, with regression coverage in `rust/crates/rusty-claude-cli/tests/resume_slash_commands.rs` and `rust/crates/rusty-claude-cli/tests/output_format_contract.rs`.
 
 41. **Phantom completions root cause: global session store has no per-worktree isolation** —
