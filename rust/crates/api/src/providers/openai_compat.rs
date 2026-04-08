@@ -801,6 +801,10 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             payload["stop"] = json!(stop);
         }
     }
+    // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.)
+    if let Some(effort) = &request.reasoning_effort {
+        payload["reasoning_effort"] = json!(effort);
+    }
 
     payload
 }
@@ -1197,7 +1201,10 @@ mod tests {
         });
         normalize_object_schema(&mut schema2);
         assert_eq!(schema2["additionalProperties"], json!(false));
-        assert_eq!(schema2["properties"]["location"]["additionalProperties"], json!(false));
+        assert_eq!(
+            schema2["properties"]["location"]["additionalProperties"],
+            json!(false)
+        );
 
         // Existing properties/additionalProperties should not be overwritten
         let mut schema3 = json!({
@@ -1206,7 +1213,40 @@ mod tests {
             "additionalProperties": true
         });
         normalize_object_schema(&mut schema3);
-        assert_eq!(schema3["additionalProperties"], json!(true), "must not overwrite existing");
+        assert_eq!(
+            schema3["additionalProperties"],
+            json!(true),
+            "must not overwrite existing"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_is_included_when_set() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "o4-mini".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("think hard")],
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(payload["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn reasoning_effort_omitted_when_not_set() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(payload.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -1326,6 +1366,7 @@ mod tests {
             frequency_penalty: Some(0.5),
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
+            reasoning_effort: None,
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);
