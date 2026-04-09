@@ -110,7 +110,22 @@ type RuntimePluginStateBuildOutput = (
 fn main() {
     if let Err(error) = run() {
         let message = error.to_string();
-        if message.contains("`claw --help`") {
+        // When --output-format json is active, emit errors as JSON so downstream
+        // tools can parse failures the same way they parse successes (ROADMAP #42).
+        let argv: Vec<String> = std::env::args().collect();
+        let json_output = argv
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "json")
+            || argv.iter().any(|a| a == "--output-format=json");
+        if json_output {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "type": "error",
+                    "error": message,
+                })
+            );
+        } else if message.contains("`claw --help`") {
             eprintln!("error: {message}");
         } else {
             eprintln!(
