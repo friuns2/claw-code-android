@@ -578,6 +578,27 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+        // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
+        // command line, read stdin as the prompt and dispatch as a one-shot Prompt
+        // rather than starting the interactive REPL (which would consume the pipe and
+        // print the startup banner, then exit without sending anything to the API).
+        if !std::io::stdin().is_terminal() {
+            let mut buf = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
+            let piped = buf.trim().to_string();
+            if !piped.is_empty() {
+                return Ok(CliAction::Prompt {
+                    model,
+                    prompt: piped,
+                    allowed_tools,
+                    permission_mode,
+                    output_format,
+                    compact: false,
+                    base_commit,
+                    reasoning_effort,
+                });
+            }
+        }
         return Ok(CliAction::Repl {
             model,
             allowed_tools,
@@ -2196,11 +2217,33 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
         let command = match SlashCommand::parse(raw_command) {
             Ok(Some(command)) => command,
             Ok(None) => {
-                eprintln!("unsupported resumed command: {raw_command}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": format!("unsupported resumed command: {raw_command}"),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("unsupported resumed command: {raw_command}");
+                }
                 std::process::exit(2);
             }
             Err(error) => {
-                eprintln!("{error}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": error.to_string(),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("{error}");
+                }
                 std::process::exit(2);
             }
         };
@@ -2226,7 +2269,18 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 }
             }
             Err(error) => {
-                eprintln!("{error}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": error.to_string(),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("{error}");
+                }
                 std::process::exit(2);
             }
         }
