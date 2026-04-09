@@ -1657,6 +1657,16 @@ fn check_config_health(
 ) -> DiagnosticCheck {
     let discovered = config_loader.discover();
     let discovered_count = discovered.len();
+    // Separate candidate paths that actually exist from those that don't.
+    // Showing non-existent paths as "Discovered file" implies they loaded
+    // but something went wrong, which is confusing. We only surface paths
+    // that exist on disk as discovered; non-existent ones are silently
+    // omitted from the display (they are just the standard search locations).
+    let present_paths: Vec<String> = discovered
+        .iter()
+        .filter(|e| e.path.exists())
+        .map(|e| e.path.display().to_string())
+        .collect();
     let discovered_paths = discovered
         .iter()
         .map(|entry| entry.path.display().to_string())
@@ -1664,10 +1674,11 @@ fn check_config_health(
     match config {
         Ok(runtime_config) => {
             let loaded_entries = runtime_config.loaded_entries();
+            let loaded_count = loaded_entries.len();
+            let present_count = present_paths.len();
             let mut details = vec![format!(
                 "Config files      loaded {}/{}",
-                loaded_entries.len(),
-                discovered_count
+                loaded_count, present_count
             )];
             if let Some(model) = runtime_config.model() {
                 details.push(format!("Resolved model    {model}"));
@@ -1676,39 +1687,29 @@ fn check_config_health(
                 "MCP servers       {}",
                 runtime_config.mcp().servers().len()
             ));
-            if discovered_paths.is_empty() {
-                details.push("Discovered files  <none>".to_string());
+            if present_paths.is_empty() {
+                details.push("Discovered files  <none> (defaults active)".to_string());
             } else {
                 details.extend(
-                    discovered_paths
+                    present_paths
                         .iter()
                         .map(|path| format!("Discovered file   {path}")),
                 );
             }
             DiagnosticCheck::new(
                 "Config",
-                if discovered_count == 0 {
-                    DiagnosticLevel::Warn
-                } else {
-                    DiagnosticLevel::Ok
-                },
-                if discovered_count == 0 {
-                    "no config files were found; defaults are active"
+                DiagnosticLevel::Ok,
+                if present_count == 0 {
+                    "no config files present; defaults are active"
                 } else {
                     "runtime config loaded successfully"
                 },
             )
             .with_details(details)
             .with_data(Map::from_iter([
-                ("discovered_files".to_string(), json!(discovered_paths)),
-                (
-                    "discovered_files_count".to_string(),
-                    json!(discovered_count),
-                ),
-                (
-                    "loaded_config_files".to_string(),
-                    json!(loaded_entries.len()),
-                ),
+                ("discovered_files".to_string(), json!(present_paths)),
+                ("discovered_files_count".to_string(), json!(present_count)),
+                ("loaded_config_files".to_string(), json!(loaded_count)),
                 ("resolved_model".to_string(), json!(runtime_config.model())),
                 (
                     "mcp_servers".to_string(),
@@ -2661,7 +2662,7 @@ fn run_resume_command(
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_repl_help()),
-            json: None,
+            json: Some(serde_json::json!({ "kind": "help", "text": render_repl_help() })),
         }),
         SlashCommand::Compact => {
             let result = runtime::compact_session(
@@ -2816,13 +2817,16 @@ fn run_resume_command(
                 json: Some(init_json_value(&message)),
             })
         }
-        SlashCommand::Diff => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_diff_report_for(
-                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            )?),
-            json: None,
-        }),
+        SlashCommand::Diff => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let message = render_diff_report_for(&cwd)?;
+            let json = render_diff_json_for(&cwd)?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(json),
+            })
+        }
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_version_report()),
@@ -5551,6 +5555,30 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
     }
 
     Ok(format!("Diff\n\n{}", sections.join("\n\n")))
+}
+
+fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let in_git_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !in_git_repo {
+        return Ok(serde_json::json!({
+            "kind": "diff",
+            "result": "no_git_repo",
+            "detail": format!("{} is not inside a git project", cwd.display()),
+        }));
+    }
+    let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
+    let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
+    Ok(serde_json::json!({
+        "kind": "diff",
+        "result": if staged.trim().is_empty() && unstaged.trim().is_empty() { "clean" } else { "changes" },
+        "staged": staged.trim(),
+        "unstaged": unstaged.trim(),
+    }))
 }
 
 fn run_git_diff_command_in(
