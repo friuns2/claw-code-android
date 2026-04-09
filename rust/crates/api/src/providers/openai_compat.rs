@@ -797,6 +797,14 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     for message in &request.messages {
         messages.extend(translate_message(message));
     }
+    // Sanitize: drop any `role:"tool"` message that does not have a valid
+    // paired `role:"assistant"` with a `tool_calls` entry carrying the same
+    // `id` immediately before it (directly or as part of a run of tool
+    // results). OpenAI-compatible backends return 400 for orphaned tool
+    // messages regardless of how they were produced (compaction, session
+    // editing, resume, etc.). We drop rather than error so the request can
+    // still proceed with the remaining history intact.
+    messages = sanitize_tool_message_pairing(messages);
 
     // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
     let wire_model = strip_routing_prefix(&request.model);
@@ -916,6 +924,75 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             })
             .collect(),
     }
+}
+
+/// Remove `role:"tool"` messages from `messages` that have no valid paired
+/// `role:"assistant"` message with a matching `tool_calls[].id` immediately
+/// preceding them. This is a last-resort safety net at the request-building
+/// layer — the compaction boundary fix (6e301c8) prevents the most common
+/// producer path, but resume, session editing, or future compaction variants
+/// could still create orphaned tool messages.
+///
+/// Algorithm: scan left-to-right. For each `role:"tool"` message, check the
+/// immediately preceding non-tool message. If it's `role:"assistant"` with a
+/// `tool_calls` array containing an entry whose `id` matches the tool
+/// message's `tool_call_id`, the pair is valid and both are kept. Otherwise
+/// the tool message is dropped.
+fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
+    // Collect indices of tool messages that are orphaned.
+    let mut drop_indices = std::collections::HashSet::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Find the nearest preceding non-tool message.
+        let preceding = messages[..i]
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) != Some("tool"));
+        // A tool message is considered paired when:
+        // (a) the nearest preceding non-tool message is an assistant message
+        //     whose `tool_calls` array contains an entry with the matching id, OR
+        // (b) there's no clear preceding context (e.g. the message comes right
+        //     after a user turn — this can happen with translated mixed-content
+        //     user messages). In case (b) we allow the message through rather
+        //     than silently dropping potentially valid history.
+        let preceding_role = preceding
+            .and_then(|m| m.get("role"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Only apply sanitization when the preceding message is an assistant
+        // turn (the invariant is: assistant-with-tool_calls must precede tool).
+        // If the preceding is something else (user, system) don't drop — it
+        // may be a valid translation artifact or a path we don't understand.
+        if preceding_role != "assistant" {
+            continue;
+        }
+        let paired = preceding
+            .and_then(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
+            .map(|tool_calls| {
+                tool_calls
+                    .iter()
+                    .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(tool_call_id))
+            })
+            .unwrap_or(false);
+        if !paired {
+            drop_indices.insert(i);
+        }
+    }
+    if drop_indices.is_empty() {
+        return messages;
+    }
+    messages
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !drop_indices.contains(i))
+        .map(|(_, m)| m)
+        .collect()
 }
 
 fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
@@ -1654,6 +1731,51 @@ mod tests {
             .expect("assistant message with tool calls must include tool_calls field");
         assert!(tool_calls.is_array());
         assert_eq!(tool_calls.as_array().unwrap().len(), 1);
+    }
+
+    /// Orphaned tool messages (no preceding assistant tool_calls) must be
+    /// dropped by the request-builder sanitizer. Regression for the second
+    /// layer of the tool-pairing invariant fix (gaebal-gajae 2026-04-10).
+    #[test]
+    fn sanitize_drops_orphaned_tool_messages() {
+        use super::sanitize_tool_message_pairing;
+
+        // Valid pair: assistant with tool_calls → tool result
+        let valid = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "result"}),
+        ];
+        let out = sanitize_tool_message_pairing(valid);
+        assert_eq!(out.len(), 2, "valid pair must be preserved");
+
+        // Orphaned tool message: no preceding assistant tool_calls
+        let orphaned = vec![
+            json!({"role": "assistant", "content": "hi"}),
+            json!({"role": "tool", "tool_call_id": "call_2", "content": "orphaned"}),
+        ];
+        let out = sanitize_tool_message_pairing(orphaned);
+        assert_eq!(out.len(), 1, "orphaned tool message must be dropped");
+        assert_eq!(out[0]["role"], json!("assistant"));
+
+        // Mismatched tool_call_id
+        let mismatched = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_3", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "call_WRONG", "content": "bad"}),
+        ];
+        let out = sanitize_tool_message_pairing(mismatched);
+        assert_eq!(out.len(), 1, "tool message with wrong id must be dropped");
+
+        // Two tool results both valid (same preceding assistant)
+        let two_results = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "fa", "arguments": "{}"}},
+                {"id": "call_b", "type": "function", "function": {"name": "fb", "arguments": "{}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "call_a", "content": "ra"}),
+            json!({"role": "tool", "tool_call_id": "call_b", "content": "rb"}),
+        ];
+        let out = sanitize_tool_message_pairing(two_results);
+        assert_eq!(out.len(), 3, "both valid tool results must be preserved");
     }
 
     #[test]

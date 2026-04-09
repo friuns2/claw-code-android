@@ -2678,7 +2678,12 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
                 message: Some(format_compact_report(removed, kept, skipped)),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "compact",
+                    "skipped": skipped,
+                    "removed_messages": removed,
+                    "kept_messages": kept,
+                })),
             })
         }
         SlashCommand::Clear { confirm } => {
@@ -2688,7 +2693,11 @@ fn run_resume_command(
                     message: Some(
                         "clear: confirmation required; rerun with /clear --confirm".to_string(),
                     ),
-                    json: None,
+                    json: Some(serde_json::json!({
+                        "kind": "error",
+                        "error": "confirmation required",
+                        "hint": "rerun with /clear --confirm",
+                    })),
                 });
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
@@ -2704,7 +2713,13 @@ fn run_resume_command(
                     backup_path.display(),
                     session_path.display()
                 )),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "clear",
+                    "previous_session_id": previous_session_id,
+                    "new_session_id": new_session_id,
+                    "backup": backup_path.display().to_string(),
+                    "session_file": session_path.display().to_string(),
+                })),
             })
         }
         SlashCommand::Status => {
@@ -2726,7 +2741,7 @@ fn run_resume_command(
                     &context,
                 )),
                 json: Some(status_json_value(
-                    "restored-session",
+                    None,
                     StatusUsage {
                         message_count: session.messages.len(),
                         turns: tracker.turns(),
@@ -4991,7 +5006,7 @@ fn print_status_snapshot(
         CliOutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&status_json_value(
-                model,
+                Some(model),
                 usage,
                 permission_mode.as_str(),
                 &context,
@@ -5002,7 +5017,7 @@ fn print_status_snapshot(
 }
 
 fn status_json_value(
-    model: &str,
+    model: Option<&str>,
     usage: StatusUsage,
     permission_mode: &str,
     context: &StatusContext,
@@ -5031,9 +5046,9 @@ fn status_json_value(
             "untracked_files": context.git_summary.untracked_files,
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
             "session_id": context.session_path.as_ref().and_then(|path| {
-                // Session files live under .claw/sessions/<session-id>/<file>.jsonl
-                // Extract the session-id directory component.
-                path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned())
+                // Session files are named <session-id>.jsonl directly under
+                // .claw/sessions/. Extract the stem (drop the .jsonl extension).
+                path.file_stem().map(|n| n.to_string_lossy().into_owned())
             }),
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
