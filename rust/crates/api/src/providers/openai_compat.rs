@@ -157,6 +157,35 @@ impl OpenAiCompatClient {
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
+        // Some backends return {"error":{"message":"...","type":"...","code":...}}
+        // instead of a valid completion object. Check for this before attempting
+        // full deserialization so the user sees the actual error, not a cryptic
+        // "missing field 'id'" parse failure.
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(err_obj) = raw.get("error") {
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("provider returned an error")
+                    .to_string();
+                let code = err_obj
+                    .get("code")
+                    .and_then(|c| c.as_u64())
+                    .map(|c| c as u16);
+                return Err(ApiError::Api {
+                    status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                        .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                    error_type: err_obj
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned),
+                    message: Some(msg),
+                    request_id,
+                    body,
+                    retryable: false,
+                });
+            }
+        }
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
             ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
         })?;
@@ -1054,6 +1083,35 @@ fn parse_sse_frame(
     let payload = data_lines.join("\n");
     if payload == "[DONE]" {
         return Ok(None);
+    }
+    // Some backends embed an error object in a data: frame instead of using an
+    // HTTP error status. Surface the error message directly rather than letting
+    // ChatCompletionChunk deserialization fail with a cryptic 'missing field' error.
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if let Some(err_obj) = raw.get("error") {
+            let msg = err_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("provider returned an error in stream")
+                .to_string();
+            let code = err_obj
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .map(|c| c as u16);
+            let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+            return Err(ApiError::Api {
+                status,
+                error_type: err_obj
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_owned),
+                message: Some(msg),
+                request_id: None,
+                body: payload.to_string(),
+                retryable: false,
+            });
+        }
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
