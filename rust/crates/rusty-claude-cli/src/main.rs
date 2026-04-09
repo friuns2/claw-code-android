@@ -1427,16 +1427,16 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     let cwd = env::current_dir()?;
     let state_path = cwd.join(".claw").join("worker-state.json");
     if !state_path.exists() {
-        match output_format {
-            CliOutputFormat::Text => {
-                println!("No worker state file found at {}", state_path.display())
-            }
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::json!({"error": "no_state_file", "path": state_path.display().to_string()})
-            ),
-        }
-        return Ok(());
+        // Emit a structured error, then return Err so the process exits 1.
+        // Callers (scripts, CI) need a non-zero exit to detect "no state" without
+        // parsing prose output.
+        // Let the error propagate to main() which will format it correctly
+        // (prose for text mode, JSON envelope for --output-format json).
+        return Err(format!(
+            "no worker state file found at {} — run a worker first",
+            state_path.display()
+        )
+        .into());
     }
     let raw = std::fs::read_to_string(&state_path)?;
     match output_format {
@@ -4825,6 +4825,11 @@ fn status_json_value(
             "unstaged_files": context.git_summary.unstaged_files,
             "untracked_files": context.git_summary.untracked_files,
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+            "session_id": context.session_path.as_ref().and_then(|path| {
+                // Session files live under .claw/sessions/<session-id>/<file>.jsonl
+                // Extract the session-id directory component.
+                path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned())
+            }),
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
