@@ -1933,6 +1933,13 @@ fn looks_like_slash_command_token(token: &str) -> bool {
 
 fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Surface the resolved path in the error so users can diagnose missing
+    // manifest files without guessing what path the binary expected.
+    // ROADMAP #45: this path is only correct when running from the build tree;
+    // a proper fix would ship manifests alongside the binary.
+    let resolved = workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.clone());
     let paths = UpstreamPaths::from_workspace_dir(&workspace_dir);
     match extract_manifest(&paths) {
         Ok(manifest) => {
@@ -1954,7 +1961,11 @@ fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::err
             }
             Ok(())
         }
-        Err(error) => Err(format!("failed to extract manifests: {error}").into()),
+        Err(error) => Err(format!(
+            "failed to extract manifests: {error}\n  looked in: {}",
+            resolved.display()
+        )
+        .into()),
     }
 }
 
@@ -3995,7 +4006,8 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. } => {
-                eprintln!("Command registered but not yet implemented.");
+                let cmd_name = command.slash_name();
+                eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
             }
             SlashCommand::Unknown(name) => {
