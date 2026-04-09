@@ -209,6 +209,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort,
         } => {
             run_stale_base_preflight(base_commit.as_deref());
             // Only consume piped stdin as prompt context when the permission
@@ -222,11 +223,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
-                &effective_prompt,
-                output_format,
-                compact,
-            )?;
+            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            cli.set_reasoning_effort(reasoning_effort);
+            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -243,7 +242,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             base_commit,
-        } => run_repl(model, allowed_tools, permission_mode, base_commit)?,
+            reasoning_effort,
+        } => run_repl(
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit,
+            reasoning_effort,
+        )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -304,6 +310,7 @@ enum CliAction {
         permission_mode: PermissionMode,
         compact: bool,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
     },
     Login {
         output_format: CliOutputFormat,
@@ -330,6 +337,7 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -373,6 +381,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut allowed_tool_values = Vec::new();
     let mut compact = false;
     let mut base_commit: Option<String> = None;
+    let mut reasoning_effort: Option<String> = None;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -438,6 +447,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 base_commit = Some(flag[14..].to_string());
                 index += 1;
             }
+            "--reasoning-effort" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --reasoning-effort".to_string())?;
+                reasoning_effort = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--reasoning-effort=") => {
+                reasoning_effort = Some(flag[19..].to_string());
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -453,6 +473,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         .unwrap_or_else(default_permission_mode),
                     compact,
                     base_commit: base_commit.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
                 });
             }
             "--print" => {
@@ -511,6 +532,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             base_commit,
+            reasoning_effort: reasoning_effort.clone(),
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -549,6 +571,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: reasoning_effort.clone(),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -574,6 +597,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
                 compact,
                 base_commit: base_commit.clone(),
+                reasoning_effort: reasoning_effort.clone(),
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -584,6 +608,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort,
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
@@ -593,6 +618,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort: reasoning_effort.clone(),
         }),
     }
 }
@@ -686,6 +712,7 @@ fn parse_direct_slash_cli_action(
     permission_mode: PermissionMode,
     compact: bool,
     base_commit: Option<String>,
+    reasoning_effort: Option<String>,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -713,6 +740,7 @@ fn parse_direct_slash_cli_action(
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: reasoning_effort.clone(),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -2762,10 +2790,12 @@ fn run_repl(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     base_commit: Option<String>,
+    reasoning_effort: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -3346,6 +3376,12 @@ impl LiveCli {
         };
         cli.persist_session()?;
         Ok(cli)
+    }
+
+    fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        if let Some(rt) = self.runtime.runtime.as_mut() {
+            rt.api_client_mut().set_reasoning_effort(effort);
+        }
     }
 
     fn startup_banner(&self) -> String {
@@ -6370,6 +6406,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    reasoning_effort: Option<String>,
 }
 
 impl AnthropicRuntimeClient {
@@ -6434,7 +6471,12 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            reasoning_effort: None,
         })
+    }
+
+    fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort = effort;
     }
 }
 
@@ -6481,6 +6523,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
         };
 
@@ -8174,6 +8217,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8337,6 +8381,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8426,6 +8471,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8455,6 +8501,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8496,6 +8543,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8573,6 +8621,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8592,6 +8641,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8620,6 +8670,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8645,6 +8696,7 @@ mod tests {
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8754,6 +8806,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         assert_eq!(
@@ -9137,6 +9190,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9203,6 +9257,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         assert_eq!(
@@ -9228,6 +9283,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         let error = parse_args(&["/status".to_string()])
