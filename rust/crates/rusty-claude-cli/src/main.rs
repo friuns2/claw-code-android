@@ -35,8 +35,8 @@ use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    render_slash_command_help_filtered, resume_supported_slash_commands, slash_command_specs,
-    validate_slash_command_input, SkillSlashDispatch, SlashCommand,
+    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
+    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -2859,6 +2859,26 @@ fn run_repl(
                     Ok(None) => {}
                     Err(error) => {
                         eprintln!("{error}");
+                        continue;
+                    }
+                }
+                // Bare-word skill dispatch: if the first token of the input
+                // matches a known skill name, invoke it as `/skills <input>`
+                // rather than forwarding raw text to the LLM (ROADMAP #36).
+                let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
+                let looks_like_skill_name = !bare_first_token.is_empty()
+                    && !bare_first_token.starts_with('/')
+                    && bare_first_token
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+                if looks_like_skill_name {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    if let Ok(SkillSlashDispatch::Invoke(prompt)) =
+                        resolve_skill_invocation(&cwd, Some(&trimmed))
+                    {
+                        editor.push_history(input);
+                        cli.record_prompt_history(&trimmed);
+                        cli.run_turn(&prompt)?;
                         continue;
                     }
                 }
