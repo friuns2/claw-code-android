@@ -8014,7 +8014,7 @@ mod tests {
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
         CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
         InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -11159,6 +11159,58 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn rejects_invalid_reasoning_effort_value() {
+        let err = parse_args(&[
+            "--reasoning-effort".to_string(),
+            "turbo".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("invalid value for --reasoning-effort"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("turbo"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn accepts_valid_reasoning_effort_values() {
+        for value in ["low", "medium", "high"] {
+            let result = parse_args(&[
+                "--reasoning-effort".to_string(),
+                value.to_string(),
+                "prompt".to_string(),
+                "hello".to_string(),
+            ]);
+            assert!(
+                result.is_ok(),
+                "--reasoning-effort {value} should be accepted, got: {:?}",
+                result
+            );
+            if let Ok(CliAction::Prompt {
+                reasoning_effort, ..
+            }) = result
+            {
+                assert_eq!(reasoning_effort.as_deref(), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn stub_commands_absent_from_repl_completions() {
+        let candidates =
+            slash_command_completion_candidates_with_sessions("claude-3-5-sonnet", None, vec![]);
+        for stub in STUB_COMMANDS {
+            let with_slash = format!("/{stub}");
+            assert!(
+                !candidates.contains(&with_slash),
+                "stub command {with_slash} should not appear in REPL completions"
+            );
+        }
     }
 }
 
