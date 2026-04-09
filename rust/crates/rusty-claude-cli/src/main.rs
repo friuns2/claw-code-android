@@ -382,12 +382,37 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut compact = false;
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
-    let mut rest = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
         match args[index].as_str() {
             "--help" | "-h" if rest.is_empty() => {
+                wants_help = true;
+                index += 1;
+            }
+            "--help" | "-h"
+                if !rest.is_empty()
+                    && matches!(
+                        rest[0].as_str(),
+                        "prompt"
+                            | "login"
+                            | "logout"
+                            | "version"
+                            | "state"
+                            | "init"
+                            | "export"
+                            | "commit"
+                            | "pr"
+                            | "issue"
+                    ) =>
+            {
+                // `--help` following a subcommand that would otherwise forward
+                // the arg to the API (e.g. `claw prompt --help`) should show
+                // top-level help instead. Subcommands that consume their own
+                // args (agents, mcp, plugins, skills) and local help-topic
+                // subcommands (status, sandbox, doctor) must NOT be intercepted
+                // here — they handle --help in their own dispatch paths.
                 wants_help = true;
                 index += 1;
             }
