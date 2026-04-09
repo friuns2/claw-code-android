@@ -2246,6 +2246,33 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
 
     let mut session = session;
     for raw_command in commands {
+        // Intercept spec commands that have no parse arm before calling
+        // SlashCommand::parse — they return Err(SlashCommandParseError) which
+        // formats as the confusing circular "Did you mean /X?" message.
+        // STUB_COMMANDS covers both completions-filtered stubs and parse-less
+        // spec entries; treat both as unsupported in resume mode.
+        {
+            let cmd_root = raw_command
+                .trim_start_matches('/')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if STUB_COMMANDS.contains(&cmd_root) {
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": format!("/{cmd_root} is not yet implemented in this build"),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("/{cmd_root} is not yet implemented in this build");
+                }
+                std::process::exit(2);
+            }
+        }
         let command = match SlashCommand::parse(raw_command) {
             Ok(Some(command)) => command,
             Ok(None) => {
@@ -2835,14 +2862,19 @@ fn run_resume_command(
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
             fs::write(&export_path, render_export_text(session))?;
+            let msg_count = session.messages.len();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format!(
                     "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
                     export_path.display(),
-                    session.messages.len(),
+                    msg_count,
                 )),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "export",
+                    "file": export_path.display().to_string(),
+                    "message_count": msg_count,
+                })),
             })
         }
         SlashCommand::Agents { args } => {
@@ -2850,7 +2882,10 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "agents",
+                    "text": handle_agents_slash_command(args.as_deref(), &cwd)?,
+                })),
             })
         }
         SlashCommand::Skills { args } => {
@@ -7347,6 +7382,77 @@ const STUB_COMMANDS: &[&str] = &[
     "tag",
     "output-style",
     "add-dir",
+    // Spec entries with no parse arm — produce circular "Did you mean" error
+    // without this guard. Adding here routes them to the proper unsupported
+    // message and excludes them from REPL completions / help.
+    "allowed-tools",
+    "bookmarks",
+    "workspace",
+    "reasoning",
+    "budget",
+    "rate-limit",
+    "changelog",
+    "diagnostics",
+    "metrics",
+    "tool-details",
+    "focus",
+    "unfocus",
+    "pin",
+    "unpin",
+    "language",
+    "profile",
+    "max-tokens",
+    "temperature",
+    "system-prompt",
+    "notifications",
+    "telemetry",
+    "env",
+    "project",
+    "terminal-setup",
+    "api-key",
+    "reset",
+    "undo",
+    "stop",
+    "retry",
+    "paste",
+    "screenshot",
+    "image",
+    "search",
+    "listen",
+    "speak",
+    "format",
+    "test",
+    "lint",
+    "build",
+    "run",
+    "git",
+    "stash",
+    "blame",
+    "log",
+    "cron",
+    "team",
+    "benchmark",
+    "migrate",
+    "templates",
+    "explain",
+    "refactor",
+    "docs",
+    "fix",
+    "perf",
+    "chat",
+    "web",
+    "map",
+    "symbols",
+    "references",
+    "definition",
+    "hover",
+    "autofix",
+    "multi",
+    "macro",
+    "alias",
+    "parallel",
+    "subagent",
+    "agent",
 ];
 
 fn slash_command_completion_candidates_with_sessions(

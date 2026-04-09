@@ -253,7 +253,8 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         ],
     );
     assert_eq!(resumed["kind"], "status");
-    assert_eq!(resumed["model"], "restored-session");
+    // model is null in resume mode (not known without --model flag)
+    assert!(resumed["model"].is_null());
     assert_eq!(resumed["usage"]["messages"], 1);
     assert!(resumed["workspace"]["cwd"].as_str().is_some());
     assert!(resumed["sandbox"]["filesystem_mode"].as_str().is_some());

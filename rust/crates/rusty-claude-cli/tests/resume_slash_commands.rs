@@ -261,7 +261,8 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     let parsed: Value =
         serde_json::from_str(stdout.trim()).expect("resume status output should be json");
     assert_eq!(parsed["kind"], "status");
-    assert_eq!(parsed["model"], "restored-session");
+    // model is null in resume mode (not known without --model flag)
+    assert!(parsed["model"].is_null());
     assert_eq!(parsed["permission_mode"], "danger-full-access");
     assert_eq!(parsed["usage"]["messages"], 1);
     assert!(parsed["usage"]["turns"].is_number());
