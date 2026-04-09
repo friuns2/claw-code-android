@@ -759,9 +759,18 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
     let wire_model = strip_routing_prefix(&request.model);
 
+    // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
+    // We send the correct field based on the wire model name so gpt-5.x requests
+    // don't fail with "unknown field max_tokens".
+    let max_tokens_key = if wire_model.starts_with("gpt-5") {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+
     let mut payload = json!({
         "model": wire_model,
-        "max_tokens": request.max_tokens,
+        max_tokens_key: request.max_tokens,
         "messages": messages,
         "stream": request.stream,
     });
@@ -1450,5 +1459,46 @@ mod tests {
         assert!(payload.get("frequency_penalty").is_none());
         assert!(payload.get("presence_penalty").is_none());
         assert!(payload.get("stop").is_none());
+    }
+
+    #[test]
+    fn gpt5_uses_max_completion_tokens_not_max_tokens() {
+        // gpt-5* models require `max_completion_tokens`; legacy `max_tokens` causes
+        // a request-validation failure. Verify the correct key is emitted.
+        let request = MessageRequest {
+            model: "gpt-5.2".to_string(),
+            max_tokens: 512,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(
+            payload["max_completion_tokens"],
+            json!(512),
+            "gpt-5.2 should emit max_completion_tokens"
+        );
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "gpt-5.2 must not emit max_tokens"
+        );
+    }
+
+    #[test]
+    fn non_gpt5_uses_max_tokens() {
+        // Older OpenAI models expect `max_tokens`; verify gpt-4o is unaffected.
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 512,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["max_tokens"], json!(512));
+        assert!(
+            payload.get("max_completion_tokens").is_none(),
+            "gpt-4o must not emit max_completion_tokens"
+        );
     }
 }
