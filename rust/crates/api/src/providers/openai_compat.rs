@@ -1652,6 +1652,7 @@ mod tests {
         }"#;
 
         use super::deserialize_null_as_empty_vec;
+        #[allow(dead_code)]
         #[derive(serde::Deserialize, Debug)]
         struct Delta {
             content: Option<String>,
@@ -1666,7 +1667,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// Regression: when building a multi-turn request where a prior assistant
     /// turn has no tool calls, the serialized assistant message must NOT include
     /// `tool_calls: []`. Some providers reject requests that carry an empty
