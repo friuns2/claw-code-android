@@ -2708,7 +2708,7 @@ fn run_resume_command(
         SlashCommand::Diff => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_diff_report_for(
-                session_path.parent().unwrap_or_else(|| Path::new(".")),
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             )?),
             json: None,
         }),
@@ -2760,10 +2760,19 @@ fn run_resume_command(
             let limit = parse_history_count(count.as_deref())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let entries = collect_session_prompt_history(session);
+            let shown: Vec<_> = entries.iter().rev().take(limit).rev().collect();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(render_prompt_history_report(&entries, limit)),
-                json: None,
+                json: Some(serde_json::json!({
+                    "kind": "history",
+                    "total": entries.len(),
+                    "showing": shown.len(),
+                    "entries": shown.iter().map(|e| serde_json::json!({
+                        "timestamp_ms": e.timestamp_ms,
+                        "text": e.text,
+                    })).collect::<Vec<_>>(),
+                })),
             })
         }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
@@ -5233,6 +5242,21 @@ fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    // Verify we are inside a git repository before calling `git diff`.
+    // Running `git diff --cached` outside a git tree produces a misleading
+    // "unknown option `cached`" error because git falls back to --no-index mode.
+    let in_git_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !in_git_repo {
+        return Ok(format!(
+            "Diff\n  Result           no git repository\n  Detail           {} is not inside a git project",
+            cwd.display()
+        ));
+    }
     let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
     let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
     if staged.trim().is_empty() && unstaged.trim().is_empty() {
