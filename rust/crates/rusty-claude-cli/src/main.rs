@@ -2256,11 +2256,23 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
     };
 
     if commands.is_empty() {
-        println!(
-            "Restored session from {} ({} messages).",
-            resolved_path.display(),
-            session.messages.len()
-        );
+        if output_format == CliOutputFormat::Json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind": "restored",
+                    "session_id": session.session_id,
+                    "path": resolved_path.display().to_string(),
+                    "message_count": session.messages.len(),
+                })
+            );
+        } else {
+            println!(
+                "Restored session from {} ({} messages).",
+                resolved_path.display(),
+                session.messages.len()
+            );
+        }
         return;
     }
 
