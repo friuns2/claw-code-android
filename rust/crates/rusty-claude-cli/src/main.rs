@@ -6907,10 +6907,60 @@ fn slash_command_completion_candidates_with_sessions(
 ) -> Vec<String> {
     let mut completions = BTreeSet::new();
 
+    // Commands that are registered in the spec list but not yet implemented
+    // in this build. Exclude them from completions so the discovery surface
+    // matches what actually works (ROADMAP #39).
+    const STUB_COMMANDS: &[&str] = &[
+        "login",
+        "logout",
+        "vim",
+        "upgrade",
+        "stats",
+        "share",
+        "feedback",
+        "files",
+        "fast",
+        "exit",
+        "summary",
+        "desktop",
+        "brief",
+        "advisor",
+        "stickers",
+        "insights",
+        "thinkback",
+        "release-notes",
+        "security-review",
+        "keybindings",
+        "privacy-settings",
+        "plan",
+        "review",
+        "tasks",
+        "theme",
+        "voice",
+        "usage",
+        "rename",
+        "copy",
+        "hooks",
+        "context",
+        "color",
+        "effort",
+        "branch",
+        "rewind",
+        "ide",
+        "tag",
+        "output-style",
+        "add-dir",
+    ];
+
     for spec in slash_command_specs() {
+        if STUB_COMMANDS.contains(&spec.name) {
+            continue;
+        }
         completions.insert(format!("/{}", spec.name));
         for alias in spec.aliases {
-            completions.insert(format!("/{alias}"));
+            if !STUB_COMMANDS.contains(alias) {
+                completions.insert(format!("/{alias}"));
+            }
         }
     }
 
