@@ -1938,6 +1938,42 @@ pub fn suggest_slash_commands(input: &str, limit: usize) -> Vec<String> {
 }
 
 #[must_use]
+/// Render the slash-command help section, optionally excluding stub commands
+/// (commands that are registered in the spec list but not yet implemented).
+/// Pass an empty slice to include all commands.
+pub fn render_slash_command_help_filtered(exclude: &[&str]) -> String {
+    let mut lines = vec![
+        "Slash commands".to_string(),
+        "  Start here        /status, /diff, /agents, /skills, /commit".to_string(),
+        "  [resume]          also works with --resume SESSION.jsonl".to_string(),
+        String::new(),
+    ];
+
+    let categories = ["Session", "Tools", "Config", "Debug"];
+
+    for category in categories {
+        lines.push(category.to_string());
+        for spec in slash_command_specs()
+            .iter()
+            .filter(|spec| slash_command_category(spec.name) == category)
+            .filter(|spec| !exclude.contains(&spec.name))
+        {
+            lines.push(format_slash_command_help_line(spec));
+        }
+        lines.push(String::new());
+    }
+
+    lines
+        .into_iter()
+        .rev()
+        .skip_while(String::is_empty)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn render_slash_command_help() -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
