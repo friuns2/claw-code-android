@@ -1320,7 +1320,7 @@ pub fn validate_slash_command_input(
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
-        "doctor" => {
+        "doctor" | "providers" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
         }
