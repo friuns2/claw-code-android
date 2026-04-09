@@ -1340,7 +1340,7 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Upgrade
         }
-        "stats" => {
+        "stats" | "tokens" | "cache" => {
             validate_no_args(command, &args)?;
             SlashCommand::Stats
         }

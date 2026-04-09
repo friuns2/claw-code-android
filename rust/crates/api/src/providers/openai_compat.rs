@@ -255,6 +255,19 @@ impl OpenAiCompatClient {
 static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Returns a random additive jitter in `[0, base]` to decorrelate retries
+/// Deserialize a JSON field as a `Vec<T>`, treating an explicit `null` value
+/// the same as a missing field (i.e. as an empty vector).
+/// Some OpenAI-compatible providers emit `"tool_calls": null` instead of
+/// omitting the field or using `[]`, which serde's `#[serde(default)]` alone
+/// does not tolerate — `default` only handles absent keys, not null values.
+fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// from multiple concurrent clients. Entropy is drawn from the nanosecond
 /// wall clock mixed with a monotonic counter and run through a splitmix64
 /// finalizer; adequate for retry jitter (no cryptographic requirement).
@@ -673,7 +686,7 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
 }
 
@@ -840,11 +853,16 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             if text.is_empty() && tool_calls.is_empty() {
                 Vec::new()
             } else {
-                vec![json!({
+                let mut msg = serde_json::json!({
                     "role": "assistant",
                     "content": (!text.is_empty()).then_some(text),
-                    "tool_calls": tool_calls,
-                })]
+                });
+                // Only include tool_calls when non-empty: some providers reject
+                // assistant messages with an explicit empty tool_calls array.
+                if !tool_calls.is_empty() {
+                    msg["tool_calls"] = json!(tool_calls);
+                }
+                vec![msg]
             }
         }
         _ => message
@@ -1482,6 +1500,102 @@ mod tests {
             payload.get("max_tokens").is_none(),
             "gpt-5.2 must not emit max_tokens"
         );
+    }
+
+    /// Regression test: some OpenAI-compatible providers emit `"tool_calls": null`
+    /// in stream delta chunks instead of omitting the field or using `[]`.
+    /// Before the fix this produced: `invalid type: null, expected a sequence`.
+    #[test]
+    fn delta_with_null_tool_calls_deserializes_as_empty_vec() {
+        // Simulate the exact shape observed in the wild (gaebal-gajae repro 2026-04-09)
+        let json = r#"{
+            "content": "",
+            "function_call": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+        }"#;
+
+        use super::deserialize_null_as_empty_vec;
+        #[derive(serde::Deserialize, Debug)]
+        struct Delta {
+            content: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+            tool_calls: Vec<super::DeltaToolCall>,
+        }
+        let delta: Delta = serde_json::from_str(json)
+            .expect("delta with tool_calls:null must deserialize without error");
+        assert!(
+            delta.tool_calls.is_empty(),
+            "tool_calls:null must produce an empty vec, not an error"
+        );
+    }
+
+    #[test]
+    /// Regression: when building a multi-turn request where a prior assistant
+    /// turn has no tool calls, the serialized assistant message must NOT include
+    /// `tool_calls: []`. Some providers reject requests that carry an empty
+    /// tool_calls array on assistant turns (gaebal-gajae repro 2026-04-09).
+    #[test]
+    fn assistant_message_without_tool_calls_omits_tool_calls_field() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "Hello".to_string(),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().unwrap();
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        assert!(
+            assistant_msg.get("tool_calls").is_none(),
+            "assistant message without tool calls must omit tool_calls field: {:?}",
+            assistant_msg
+        );
+    }
+
+    /// Regression: assistant messages WITH tool calls must still include
+    /// the tool_calls array (normal multi-turn tool-use flow).
+    #[test]
+    fn assistant_message_with_tool_calls_includes_tool_calls_field() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/test"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().unwrap();
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        let tool_calls = assistant_msg
+            .get("tool_calls")
+            .expect("assistant message with tool calls must include tool_calls field");
+        assert!(tool_calls.is_array());
+        assert_eq!(tool_calls.as_array().unwrap().len(), 1);
     }
 
     #[test]

@@ -225,7 +225,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             compact,
             base_commit,
             reasoning_effort,
+            allow_broad_cwd,
         } => {
+            enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
             // Only consume piped stdin as prompt context when the permission
             // mode is fully unattended. In modes where the permission
@@ -258,12 +260,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             base_commit,
             reasoning_effort,
+            allow_broad_cwd,
         } => run_repl(
             model,
             allowed_tools,
             permission_mode,
             base_commit,
             reasoning_effort,
+            allow_broad_cwd,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -326,6 +330,7 @@ enum CliAction {
         compact: bool,
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
+        allow_broad_cwd: bool,
     },
     Login {
         output_format: CliOutputFormat,
@@ -353,6 +358,7 @@ enum CliAction {
         permission_mode: PermissionMode,
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
+        allow_broad_cwd: bool,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -397,6 +403,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut compact = false;
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
+    let mut allow_broad_cwd = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -509,6 +516,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 reasoning_effort = Some(value.to_string());
                 index += 1;
             }
+            "--allow-broad-cwd" => {
+                allow_broad_cwd = true;
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -525,6 +536,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     compact,
                     base_commit: base_commit.clone(),
                     reasoning_effort: reasoning_effort.clone(),
+                    allow_broad_cwd,
                 });
             }
             "--print" => {
@@ -596,6 +608,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     compact: false,
                     base_commit,
                     reasoning_effort,
+                    allow_broad_cwd,
                 });
             }
         }
@@ -605,6 +618,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
+            allow_broad_cwd,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -644,6 +658,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     compact,
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
+                    allow_broad_cwd,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -670,6 +685,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 compact,
                 base_commit: base_commit.clone(),
                 reasoning_effort: reasoning_effort.clone(),
+                allow_broad_cwd,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -681,6 +697,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             compact,
             base_commit,
             reasoning_effort,
+            allow_broad_cwd,
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
@@ -691,6 +708,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             compact,
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
+            allow_broad_cwd,
         }),
     }
 }
@@ -785,6 +803,7 @@ fn parse_direct_slash_cli_action(
     compact: bool,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -813,6 +832,7 @@ fn parse_direct_slash_cli_action(
                     compact,
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
+                    allow_broad_cwd,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -2727,11 +2747,15 @@ fn run_resume_command(
                 json: None,
             })
         }
-        SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_config_report(section.as_deref())?),
-            json: None,
-        }),
+        SlashCommand::Config { section } => {
+            let message = render_config_report(section.as_deref())?;
+            let json = render_config_json(section.as_deref())?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(json),
+            })
+        }
         SlashCommand::Mcp { action, target } => {
             let cwd = env::current_dir()?;
             let args = match (action.as_deref(), target.as_deref()) {
@@ -2810,6 +2834,21 @@ fn run_resume_command(
             message: Some(render_doctor_report()?.render()),
             json: None,
         }),
+        SlashCommand::Stats => {
+            let usage = UsageTracker::from_session(session).cumulative_usage();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_cost_report(usage)),
+                json: Some(serde_json::json!({
+                    "kind": "stats",
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    "total_tokens": usage.total_tokens(),
+                })),
+            })
+        }
         SlashCommand::History { count } => {
             let limit = parse_history_count(count.as_deref())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
@@ -2846,7 +2885,6 @@ fn run_resume_command(
         | SlashCommand::Logout
         | SlashCommand::Vim
         | SlashCommand::Upgrade
-        | SlashCommand::Stats
         | SlashCommand::Share
         | SlashCommand::Feedback
         | SlashCommand::Files
@@ -2884,9 +2922,85 @@ fn run_resume_command(
     }
 }
 
-/// Stale-base preflight: verify the worktree HEAD matches the expected base
-/// commit (from `--base-commit` flag or `.claw-base` file). Emits a warning to
-/// stderr when the HEAD has diverged.
+/// Detect if the current working directory is "broad" (home directory or
+/// filesystem root). Returns the cwd path if broad, None otherwise.
+fn detect_broad_cwd() -> Option<PathBuf> {
+    let Ok(cwd) = env::current_dir() else {
+        return None;
+    };
+    let is_home = env::var_os("HOME")
+        .map(|h| PathBuf::from(h) == cwd)
+        .unwrap_or(false);
+    let is_root = cwd.parent().is_none();
+    if is_home || is_root {
+        Some(cwd)
+    } else {
+        None
+    }
+}
+
+/// Enforce the broad-CWD policy: when running from home or root, either
+/// require the --allow-broad-cwd flag, or prompt for confirmation (interactive),
+/// or exit with an error (non-interactive).
+fn enforce_broad_cwd_policy(
+    allow_broad_cwd: bool,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if allow_broad_cwd {
+        return Ok(());
+    }
+    let Some(cwd) = detect_broad_cwd() else {
+        return Ok(());
+    };
+
+    let is_interactive = io::stdin().is_terminal();
+
+    if is_interactive {
+        // Interactive mode: print warning and ask for confirmation
+        eprintln!(
+            "Warning: claw is running from a very broad directory ({}).\n\
+             The agent can read and search everything under this path.\n\
+             Consider running from inside your project: cd /path/to/project && claw",
+            cwd.display()
+        );
+        eprint!("Continue anyway? [y/N]: ");
+        io::stderr().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim().to_lowercase();
+        if trimmed != "y" && trimmed != "yes" {
+            eprintln!("Aborted.");
+            std::process::exit(0);
+        }
+        Ok(())
+    } else {
+        // Non-interactive mode: exit with error (JSON or text)
+        let message = format!(
+            "claw is running from a very broad directory ({}). \
+             The agent can read and search everything under this path. \
+             Use --allow-broad-cwd to proceed anyway, \
+             or run from inside your project: cd /path/to/project && claw",
+            cwd.display()
+        );
+        match output_format {
+            CliOutputFormat::Json => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "error",
+                        "error": message,
+                    })
+                );
+            }
+            CliOutputFormat::Text => {
+                eprintln!("error: {message}");
+            }
+        }
+        std::process::exit(1);
+    }
+}
+
 fn run_stale_base_preflight(flag_value: Option<&str>) {
     let cwd = match env::current_dir() {
         Ok(cwd) => cwd,
@@ -2905,7 +3019,9 @@ fn run_repl(
     permission_mode: PermissionMode,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
@@ -3826,11 +3942,15 @@ impl LiveCli {
                 self.print_prompt_history(count.as_deref());
                 false
             }
+            SlashCommand::Stats => {
+                let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
+                println!("{}", format_cost_report(usage));
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Upgrade
-            | SlashCommand::Stats
             | SlashCommand::Share
             | SlashCommand::Feedback
             | SlashCommand::Files
@@ -5217,6 +5337,49 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
         "
 ",
     ))
+}
+
+fn render_config_json(
+    _section: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let discovered = loader.discover();
+    let runtime_config = loader.load()?;
+
+    let loaded_paths: Vec<_> = runtime_config
+        .loaded_entries()
+        .iter()
+        .map(|e| e.path.display().to_string())
+        .collect();
+
+    let files: Vec<_> = discovered
+        .iter()
+        .map(|e| {
+            let source = match e.source {
+                ConfigSource::User => "user",
+                ConfigSource::Project => "project",
+                ConfigSource::Local => "local",
+            };
+            let loaded = runtime_config
+                .loaded_entries()
+                .iter()
+                .any(|le| le.path == e.path);
+            serde_json::json!({
+                "path": e.path.display().to_string(),
+                "source": source,
+                "loaded": loaded,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "kind": "config",
+        "cwd": cwd.display().to_string(),
+        "loaded_files": loaded_paths.len(),
+        "merged_keys": runtime_config.merged().len(),
+        "files": files,
+    }))
 }
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
@@ -8422,6 +8585,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8586,6 +8750,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8676,6 +8841,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8706,6 +8872,7 @@ mod tests {
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8748,6 +8915,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8826,6 +8994,7 @@ mod tests {
                 permission_mode: PermissionMode::ReadOnly,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8846,6 +9015,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8875,6 +9045,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -8901,6 +9072,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -9011,6 +9183,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
         assert_eq!(
@@ -9395,6 +9568,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
     }
@@ -9462,6 +9636,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
         assert_eq!(
@@ -9488,6 +9663,7 @@ mod tests {
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
+                allow_broad_cwd: false,
             }
         );
         let error = parse_args(&["/status".to_string()])
