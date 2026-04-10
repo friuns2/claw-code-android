@@ -308,12 +308,20 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
         base_dir.join(pattern).to_string_lossy().into_owned()
     };
 
+    // The `glob` crate does not support brace expansion ({a,b,c}).
+    // Expand braces into multiple patterns so patterns like
+    // `Assets/**/*.{cs,uxml,uss}` work correctly.
+    let expanded = expand_braces(&search_pattern);
+
+    let mut seen = std::collections::HashSet::new();
     let mut matches = Vec::new();
-    let entries = glob::glob(&search_pattern)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    for entry in entries.flatten() {
-        if entry.is_file() {
-            matches.push(entry);
+    for pat in &expanded {
+        let entries = glob::glob(pat)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        for entry in entries.flatten() {
+            if entry.is_file() && seen.insert(entry.clone()) {
+                matches.push(entry);
+            }
         }
     }
 
@@ -619,13 +627,35 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
     Ok(!resolved.starts_with(&canonical_root))
 }
 
+/// Expand shell-style brace groups in a glob pattern.
+///
+/// Handles one level of braces: `foo.{a,b,c}` → `["foo.a", "foo.b", "foo.c"]`.
+/// Nested braces are not expanded (uncommon in practice).
+/// Patterns without braces pass through unchanged.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let Some(open) = pattern.find('{') else {
+        return vec![pattern.to_owned()];
+    };
+    let Some(close) = pattern[open..].find('}').map(|i| open + i) else {
+        // Unmatched brace — treat as literal.
+        return vec![pattern.to_owned()];
+    };
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let alternatives = &pattern[open + 1..close];
+    alternatives
+        .split(',')
+        .flat_map(|alt| expand_braces(&format!("{prefix}{alt}{suffix}")))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, glob_search, grep_search, is_symlink_escape, read_file, read_file_in_workspace,
-        write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        edit_file, expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
+        read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -758,5 +788,52 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn expand_braces_no_braces() {
+        assert_eq!(expand_braces("*.rs"), vec!["*.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_single_group() {
+        let mut result = expand_braces("Assets/**/*.{cs,uxml,uss}");
+        result.sort();
+        assert_eq!(
+            result,
+            vec!["Assets/**/*.cs", "Assets/**/*.uss", "Assets/**/*.uxml",]
+        );
+    }
+
+    #[test]
+    fn expand_braces_nested() {
+        let mut result = expand_braces("src/{a,b}.{rs,toml}");
+        result.sort();
+        assert_eq!(
+            result,
+            vec!["src/a.rs", "src/a.toml", "src/b.rs", "src/b.toml"]
+        );
+    }
+
+    #[test]
+    fn expand_braces_unmatched() {
+        assert_eq!(expand_braces("foo.{bar"), vec!["foo.{bar"]);
+    }
+
+    #[test]
+    fn glob_search_with_braces_finds_files() {
+        let dir = temp_path("glob-braces");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("b.toml"), "[package]").unwrap();
+        std::fs::write(dir.join("c.txt"), "hello").unwrap();
+
+        let result =
+            glob_search("*.{rs,toml}", Some(dir.to_str().unwrap())).expect("glob should succeed");
+        assert_eq!(
+            result.num_files, 2,
+            "should match .rs and .toml but not .txt"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
