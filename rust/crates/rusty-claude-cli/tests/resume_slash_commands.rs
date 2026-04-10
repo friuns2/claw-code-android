@@ -277,6 +277,47 @@ fn resumed_status_command_emits_structured_json_when_requested() {
 }
 
 #[test]
+fn resumed_status_surfaces_persisted_model() {
+    // given — create a session with model already set
+    let temp_dir = unique_temp_dir("resume-status-model");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+
+    let mut session = Session::new();
+    session.model = Some("claude-sonnet-4-6".to_string());
+    session
+        .push_user_text("model persistence fixture")
+        .expect("write ok");
+    session.save_to_path(&session_path).expect("persist ok");
+
+    // when
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/status",
+        ],
+    );
+
+    // then
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
+    assert_eq!(parsed["kind"], "status");
+    assert_eq!(
+        parsed["model"], "claude-sonnet-4-6",
+        "model should round-trip through session metadata"
+    );
+}
+
+#[test]
 fn resumed_sandbox_command_emits_structured_json_when_requested() {
     // given
     let temp_dir = unique_temp_dir("resume-sandbox-json");

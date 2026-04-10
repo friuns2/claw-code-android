@@ -96,6 +96,9 @@ pub struct Session {
     pub fork: Option<SessionFork>,
     pub workspace_root: Option<PathBuf>,
     pub prompt_history: Vec<SessionPromptEntry>,
+    /// The model used in this session, persisted so resumed sessions can
+    /// report which model was originally used.
+    pub model: Option<String>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -161,6 +164,7 @@ impl Session {
             fork: None,
             workspace_root: None,
             prompt_history: Vec::new(),
+            model: None,
             persistence: None,
         }
     }
@@ -263,6 +267,7 @@ impl Session {
             }),
             workspace_root: self.workspace_root.clone(),
             prompt_history: self.prompt_history.clone(),
+            model: self.model.clone(),
             persistence: None,
         }
     }
@@ -371,6 +376,10 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
+        let model = object
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .map(String::from);
         Ok(Self {
             version,
             session_id,
@@ -381,6 +390,7 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            model,
             persistence: None,
         })
     }
@@ -394,6 +404,7 @@ impl Session {
         let mut compaction = None;
         let mut fork = None;
         let mut workspace_root = None;
+        let mut model = None;
         let mut prompt_history = Vec::new();
 
         for (line_number, raw_line) in contents.lines().enumerate() {
@@ -433,6 +444,10 @@ impl Session {
                         .get("workspace_root")
                         .and_then(JsonValue::as_str)
                         .map(PathBuf::from);
+                    model = object
+                        .get("model")
+                        .and_then(JsonValue::as_str)
+                        .map(String::from);
                 }
                 "message" => {
                     let message_value = object.get("message").ok_or_else(|| {
@@ -475,6 +490,7 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            model,
             persistence: None,
         })
     }
@@ -579,6 +595,9 @@ impl Session {
                 "workspace_root".to_string(),
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
             );
+        }
+        if let Some(model) = &self.model {
+            object.insert("model".to_string(), JsonValue::String(model.clone()));
         }
         Ok(JsonValue::Object(object))
     }

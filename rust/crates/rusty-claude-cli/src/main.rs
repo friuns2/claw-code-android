@@ -2789,7 +2789,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_status_report(
-                    "restored-session",
+                    session.model.as_deref().unwrap_or("restored-session"),
                     StatusUsage {
                         message_count: session.messages.len(),
                         turns: tracker.turns(),
@@ -2801,7 +2801,7 @@ fn run_resume_command(
                     &context,
                 )),
                 json: Some(status_json_value(
-                    None,
+                    session.model.as_deref(),
                     StatusUsage {
                         message_count: session.messages.len(),
                         turns: tracker.turns(),
@@ -6752,7 +6752,7 @@ fn build_runtime(
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 fn build_runtime_with_plugin_state(
-    session: Session,
+    mut session: Session,
     session_id: &str,
     model: String,
     system_prompt: Vec<String>,
@@ -6763,6 +6763,10 @@ fn build_runtime_with_plugin_state(
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    // Persist the model in session metadata so resumed sessions can report it.
+    if session.model.is_none() {
+        session.model = Some(model.clone());
+    }
     let RuntimePluginState {
         feature_config,
         tool_registry,
