@@ -3055,6 +3055,7 @@ fn detect_broad_cwd() -> Option<PathBuf> {
         return None;
     };
     let is_home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
         .map(|h| PathBuf::from(h) == cwd)
         .unwrap_or(false);
     let is_root = cwd.parent().is_none();
