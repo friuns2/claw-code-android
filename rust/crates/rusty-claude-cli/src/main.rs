@@ -778,6 +778,22 @@ fn removed_auth_surface_error(command_name: &str) -> String {
     )
 }
 
+fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
+    let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
+    let looks_like_skill_name = !bare_first_token.is_empty()
+        && !bare_first_token.starts_with('/')
+        && bare_first_token
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    if !looks_like_skill_name {
+        return None;
+    }
+    match resolve_skill_invocation(cwd, Some(trimmed)) {
+        Ok(SkillSlashDispatch::Invoke(prompt)) => Some(prompt),
+        _ => None,
+    }
+}
+
 fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
@@ -2977,22 +2993,12 @@ fn run_repl(
                 // Bare-word skill dispatch: if the first token of the input
                 // matches a known skill name, invoke it as `/skills <input>`
                 // rather than forwarding raw text to the LLM (ROADMAP #36).
-                let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
-                let looks_like_skill_name = !bare_first_token.is_empty()
-                    && !bare_first_token.starts_with('/')
-                    && bare_first_token
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
-                if looks_like_skill_name {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    if let Ok(SkillSlashDispatch::Invoke(prompt)) =
-                        resolve_skill_invocation(&cwd, Some(&trimmed))
-                    {
-                        editor.push_history(input);
-                        cli.record_prompt_history(&trimmed);
-                        cli.run_turn(&prompt)?;
-                        continue;
-                    }
+                let cwd = std::env::current_dir().unwrap_or_default();
+                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
+                    editor.push_history(input);
+                    cli.record_prompt_history(&trimmed);
+                    cli.run_turn(&prompt)?;
+                    continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
@@ -8176,10 +8182,11 @@ mod tests {
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8418,6 +8425,16 @@ mod tests {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
         }
+    }
+
+    fn write_skill_fixture(root: &Path, name: &str, description: &str) {
+        let skill_dir = root.join(name);
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
+        )
+        .expect("skill file should write");
     }
 
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {
@@ -9711,6 +9728,38 @@ mod tests {
         let help = commands::render_slash_command_help();
         assert!(help.contains("Slash commands"));
         assert!(help.contains("works with --resume SESSION.jsonl"));
+    }
+
+    #[test]
+    fn bare_skill_dispatch_resolves_known_project_skill_to_prompt() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        write_skill_fixture(
+            &workspace.join(".codex").join("skills"),
+            "caveman",
+            "Project skill fixture",
+        );
+
+        let prompt = try_resolve_bare_skill_prompt(&workspace, "caveman sharpen club")
+            .expect("known bare skill should dispatch");
+        assert_eq!(prompt, "$caveman sharpen club");
+
+        fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn bare_skill_dispatch_ignores_unknown_or_non_skill_input() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        assert_eq!(
+            try_resolve_bare_skill_prompt(&workspace, "not-a-known-skill do thing"),
+            None
+        );
+        assert_eq!(try_resolve_bare_skill_prompt(&workspace, "/status"), None);
+
+        fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
     #[test]
