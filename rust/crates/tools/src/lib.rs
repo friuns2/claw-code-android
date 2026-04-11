@@ -1182,8 +1182,11 @@ fn execute_tool_with_enforcer(
 ) -> Result<String, String> {
     match name {
         "bash" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<BashCommandInput>(input).and_then(run_bash)
+            // Parse input to get the command for permission classification
+            let bash_input: BashCommandInput = from_value(input)?;
+            let classified_mode = classify_bash_permission(&bash_input.command);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            run_bash(bash_input)
         }
         "read_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -1221,7 +1224,13 @@ fn execute_tool_with_enforcer(
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
         "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
-        "PowerShell" => from_value::<PowerShellInput>(input).and_then(run_powershell),
+        "PowerShell" => {
+            // Parse input to get the command for permission classification
+            let ps_input: PowerShellInput = from_value(input)?;
+            let classified_mode = classify_powershell_permission(&ps_input.command);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            run_powershell(ps_input)
+        }
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
@@ -1275,6 +1284,28 @@ fn maybe_enforce_permission_check(
         enforce_permission_check(enforcer, tool_name, input)?;
     }
     Ok(())
+}
+
+/// Enforce permission check with a dynamically classified permission mode.
+/// Used for tools like bash and PowerShell where the required permission
+/// depends on the actual command being executed.
+fn maybe_enforce_permission_check_with_mode(
+    enforcer: Option<&PermissionEnforcer>,
+    tool_name: &str,
+    input: &Value,
+    required_mode: PermissionMode,
+) -> Result<(), String> {
+    if let Some(enforcer) = enforcer {
+        let input_str = serde_json::to_string(input).unwrap_or_default();
+        let result = enforcer.check_with_required_mode(tool_name, &input_str, required_mode);
+
+        match result {
+            EnforcementResult::Allowed => Ok(()),
+            EnforcementResult::Denied { reason, .. } => Err(reason),
+        }
+    } else {
+        Ok(())
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1788,6 +1819,73 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
 
+/// Classify bash command permission based on command type and path.
+/// ROADMAP #50: Read-only commands targeting CWD paths get WorkspaceWrite,
+/// all others remain DangerFullAccess.
+fn classify_bash_permission(command: &str) -> PermissionMode {
+    // Read-only commands that are safe when targeting workspace paths
+    const READ_ONLY_COMMANDS: &[&str] = &[
+        "cat", "head", "tail", "less", "more", "ls", "ll", "dir", "find", "test", "[", "[[",
+        "grep", "rg", "awk", "sed", "file", "stat", "readlink", "wc", "sort", "uniq", "cut", "tr",
+        "pwd", "echo", "printf",
+    ];
+
+    // Get the base command (first word before any args or pipes)
+    let base_cmd = command.trim().split_whitespace().next().unwrap_or("");
+    let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
+    let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
+    let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
+    let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
+
+    // Check if it's a read-only command
+    let cmd_name = base_cmd.split('/').last().unwrap_or(base_cmd);
+    let is_read_only = READ_ONLY_COMMANDS.contains(&cmd_name);
+
+    if !is_read_only {
+        return PermissionMode::DangerFullAccess;
+    }
+
+    // Check if any path argument is outside workspace
+    // Simple heuristic: check for absolute paths not starting with CWD
+    if has_dangerous_paths(command) {
+        return PermissionMode::DangerFullAccess;
+    }
+
+    PermissionMode::WorkspaceWrite
+}
+
+/// Check if command has dangerous paths (outside workspace).
+fn has_dangerous_paths(command: &str) -> bool {
+    // Look for absolute paths
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+
+    for token in tokens {
+        // Skip flags/options
+        if token.starts_with('-') {
+            continue;
+        }
+
+        // Check for absolute paths
+        if token.starts_with('/') || token.starts_with("~/") {
+            // Check if it's within CWD
+            let path =
+                PathBuf::from(token.replace("~", &std::env::var("HOME").unwrap_or_default()));
+            if let Ok(cwd) = std::env::current_dir() {
+                if !path.starts_with(&cwd) {
+                    return true; // Path outside workspace
+                }
+            }
+        }
+
+        // Check for parent directory traversal that escapes workspace
+        if token.contains("../..") || token.starts_with("../") && !token.starts_with("./") {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
     if let Some(output) = workspace_test_branch_preflight(&input.command) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
@@ -2031,6 +2129,78 @@ fn run_structured_output(input: StructuredOutputInput) -> Result<String, String>
 
 fn run_repl(input: ReplInput) -> Result<String, String> {
     to_pretty_json(execute_repl(input)?)
+}
+
+/// Classify PowerShell command permission based on command type and path.
+/// ROADMAP #50: Read-only commands targeting CWD paths get WorkspaceWrite,
+/// all others remain DangerFullAccess.
+fn classify_powershell_permission(command: &str) -> PermissionMode {
+    // Read-only commands that are safe when targeting workspace paths
+    const READ_ONLY_COMMANDS: &[&str] = &[
+        "Get-Content",
+        "Get-ChildItem",
+        "Test-Path",
+        "Get-Item",
+        "Get-ItemProperty",
+        "Get-FileHash",
+        "Select-String",
+    ];
+
+    // Check if command starts with a read-only cmdlet
+    let cmd_lower = command.trim().to_lowercase();
+    let is_read_only_cmd = READ_ONLY_COMMANDS
+        .iter()
+        .any(|cmd| cmd_lower.starts_with(&cmd.to_lowercase()));
+
+    if !is_read_only_cmd {
+        return PermissionMode::DangerFullAccess;
+    }
+
+    // Check if the path is within workspace (CWD or subdirectory)
+    // Extract path from command - look for -Path or positional parameter
+    let path = extract_powershell_path(command);
+    match path {
+        Some(p) if is_within_workspace(&p) => PermissionMode::WorkspaceWrite,
+        _ => PermissionMode::DangerFullAccess,
+    }
+}
+
+/// Extract the path argument from a PowerShell command.
+fn extract_powershell_path(command: &str) -> Option<String> {
+    // Look for -Path parameter
+    if let Some(idx) = command.to_lowercase().find("-path") {
+        let after_path = &command[idx + 5..];
+        let path = after_path.trim().split_whitespace().next()?;
+        return Some(path.trim_matches('"').trim_matches('\'').to_string());
+    }
+
+    // Look for positional path parameter (after command name)
+    let parts: Vec<&str> = command.trim().split_whitespace().collect();
+    if parts.len() >= 2 {
+        // Skip the cmdlet name and take the first argument
+        let first_arg = parts[1];
+        // Check if it looks like a path (contains \, /, or .)
+        if first_arg.contains(['\\', '/', '.']) {
+            return Some(first_arg.trim_matches('"').trim_matches('\'').to_string());
+        }
+    }
+
+    None
+}
+
+/// Check if a path is within the current workspace.
+fn is_within_workspace(path: &str) -> bool {
+    let path = PathBuf::from(path);
+
+    // If path is absolute, check if it starts with CWD
+    if path.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            return path.starts_with(&cwd);
+        }
+    }
+
+    // Relative paths are assumed to be within workspace
+    !path.starts_with("/") && !path.starts_with("\\") && !path.starts_with("..")
 }
 
 fn run_powershell(input: PowerShellInput) -> Result<String, String> {
@@ -3771,10 +3941,7 @@ impl ProviderRuntimeClient {
         allowed_tools: BTreeSet<String>,
         fallback_config: &ProviderFallbackConfig,
     ) -> Result<Self, String> {
-        let primary_model = fallback_config
-            .primary()
-            .map(str::to_string)
-            .unwrap_or(model);
+        let primary_model = fallback_config.primary().map_or(model, str::to_string);
         let primary = build_provider_entry(&primary_model)?;
         let mut chain = vec![primary];
         for fallback_model in fallback_config.fallbacks() {
@@ -3852,17 +4019,15 @@ impl ApiClient for ProviderRuntimeClient {
                         entry.model
                     );
                     last_error = Some(error);
-                    continue;
                 }
                 Err(error) => return Err(RuntimeError::new(error.to_string())),
             }
         }
 
-        Err(RuntimeError::new(
-            last_error
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| String::from("provider chain exhausted with no attempts")),
-        ))
+        Err(RuntimeError::new(last_error.map_or_else(
+            || String::from("provider chain exhausted with no attempts"),
+            |error| error.to_string(),
+        )))
     }
 }
 
@@ -8263,11 +8428,12 @@ printf 'pwsh:%s' "$1"
     #[test]
     fn given_read_only_enforcer_when_bash_then_denied() {
         let registry = read_only_registry();
+        // Use a command that requires DangerFullAccess (rm) to ensure it's blocked in read-only mode
         let err = registry
-            .execute("bash", &json!({ "command": "echo hi" }))
+            .execute("bash", &json!({ "command": "rm -rf /" }))
             .expect_err("bash should be denied in read-only mode");
         assert!(
-            err.contains("current mode is read-only"),
+            err.contains("current mode is 'read-only'"),
             "should cite active mode: {err}"
         );
     }

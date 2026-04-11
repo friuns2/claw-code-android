@@ -24,7 +24,7 @@ pub enum ApiError {
         env_vars: &'static [&'static str],
         /// Optional, runtime-computed hint appended to the error Display
         /// output. Populated when the provider resolver can infer what the
-        /// user probably intended (e.g. an OpenAI key is set but Anthropic
+        /// user probably intended (e.g. an `OpenAI` key is set but Anthropic
         /// was selected because no Anthropic credentials exist).
         hint: Option<String>,
     },

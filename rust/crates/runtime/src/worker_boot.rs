@@ -575,27 +575,27 @@ fn push_event(
 /// Write current worker state to `.claw/worker-state.json` under the worker's cwd.
 /// This is the file-based observability surface: external observers (clawhip, orchestrators)
 /// poll this file instead of requiring an HTTP route on the opencode binary.
+#[derive(serde::Serialize)]
+struct StateSnapshot<'a> {
+    worker_id: &'a str,
+    status: WorkerStatus,
+    is_ready: bool,
+    trust_gate_cleared: bool,
+    prompt_in_flight: bool,
+    last_event: Option<&'a WorkerEvent>,
+    updated_at: u64,
+    /// Seconds since last state transition. Clawhip uses this to detect
+    /// stalled workers without computing epoch deltas.
+    seconds_since_update: u64,
+}
+
 fn emit_state_file(worker: &Worker) {
     let state_dir = std::path::Path::new(&worker.cwd).join(".claw");
-    if let Err(_) = std::fs::create_dir_all(&state_dir) {
+    if std::fs::create_dir_all(&state_dir).is_err() {
         return;
     }
     let state_path = state_dir.join("worker-state.json");
     let tmp_path = state_dir.join("worker-state.json.tmp");
-
-    #[derive(serde::Serialize)]
-    struct StateSnapshot<'a> {
-        worker_id: &'a str,
-        status: WorkerStatus,
-        is_ready: bool,
-        trust_gate_cleared: bool,
-        prompt_in_flight: bool,
-        last_event: Option<&'a WorkerEvent>,
-        updated_at: u64,
-        /// Seconds since last state transition. Clawhip uses this to detect
-        /// stalled workers without computing epoch deltas.
-        seconds_since_update: u64,
-    }
 
     let now = now_secs();
     let snapshot = StateSnapshot {

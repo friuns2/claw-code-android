@@ -135,8 +135,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             let starts_with_tool_result = first_preserved
                 .blocks
                 .first()
-                .map(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                .unwrap_or(false);
+                .is_some_and(|b| matches!(b, ContentBlock::ToolResult { .. }));
             if !starts_with_tool_result {
                 break;
             }
@@ -741,7 +740,7 @@ mod tests {
 
     /// Regression: compaction must not split an assistant(ToolUse) /
     /// user(ToolResult) pair at the boundary. An orphaned tool-result message
-    /// without the preceding assistant tool_calls causes a 400 on the
+    /// without the preceding assistant `tool_calls` causes a 400 on the
     /// OpenAI-compat path (gaebal-gajae repro 2026-04-09).
     #[test]
     fn compaction_does_not_split_tool_use_tool_result_pair() {
@@ -795,8 +794,7 @@ mod tests {
             let curr_is_tool_result = messages[i]
                 .blocks
                 .first()
-                .map(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                .unwrap_or(false);
+                .is_some_and(|b| matches!(b, ContentBlock::ToolResult { .. }));
             if curr_is_tool_result {
                 let prev_has_tool_use = messages[i - 1]
                     .blocks

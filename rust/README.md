@@ -34,10 +34,10 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export ANTHROPIC_BASE_URL="https://your-proxy.com"
 ```
 
-Or authenticate via OAuth and let the CLI persist credentials locally:
+Or provide an OAuth bearer token directly:
 
 ```bash
-cargo run -p rusty-claude-cli -- login
+export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 ```
 
 ## Mock parity harness
@@ -80,7 +80,7 @@ Primary artifacts:
 | Feature | Status |
 |---------|--------|
 | Anthropic / OpenAI-compatible provider flows + streaming | ✅ |
-| OAuth login/logout | ✅ |
+| Direct bearer-token auth via `ANTHROPIC_AUTH_TOKEN` | ✅ |
 | Interactive REPL (rustyline) | ✅ |
 | Tool system (bash, read, write, edit, grep, glob) | ✅ |
 | Web tools (search, fetch) | ✅ |
@@ -141,8 +141,6 @@ Top-level commands:
   mcp
   skills
   system-prompt
-  login
-  logout
   init
 ```
 
@@ -159,8 +157,8 @@ Tab completion expands slash commands, model aliases, permission modes, and rece
 The REPL now exposes a much broader surface than the original minimal shell:
 
 - session / visibility: `/help`, `/status`, `/sandbox`, `/cost`, `/resume`, `/session`, `/version`, `/usage`, `/stats`
-- workspace / git: `/compact`, `/clear`, `/config`, `/memory`, `/init`, `/diff`, `/commit`, `/pr`, `/issue`, `/export`, `/hooks`, `/files`, `/branch`, `/release-notes`, `/add-dir`
-- discovery / debugging: `/mcp`, `/agents`, `/skills`, `/doctor`, `/tasks`, `/context`, `/desktop`, `/ide`
+- workspace / git: `/compact`, `/clear`, `/config`, `/memory`, `/init`, `/diff`, `/commit`, `/pr`, `/issue`, `/export`, `/hooks`, `/files`, `/release-notes`
+- discovery / debugging: `/mcp`, `/agents`, `/skills`, `/doctor`, `/tasks`, `/context`, `/desktop`
 - automation / analysis: `/review`, `/advisor`, `/insights`, `/security-review`, `/subagent`, `/team`, `/telemetry`, `/providers`, `/cron`, and more
 - plugin management: `/plugin` (with aliases `/plugins`, `/marketplace`)
 
@@ -194,7 +192,7 @@ rust/
 
 ### Crate Responsibilities
 
-- **api** — provider clients, SSE streaming, request/response types, auth (API key + OAuth bearer), request-size/context-window preflight
+- **api** — provider clients, SSE streaming, request/response types, auth (`ANTHROPIC_API_KEY` + bearer-token support), request-size/context-window preflight
 - **commands** — slash command definitions, parsing, help text generation, JSON/text command rendering
 - **compat-harness** — extracts tool/prompt manifests from upstream TS source
 - **mock-anthropic-service** — deterministic `/v1/messages` mock for CLI parity tests and local harness runs

@@ -1467,12 +1467,8 @@ mod tests {
 /// Called by external consumers (e.g. clawhip) to enumerate sessions for a CWD.
 #[allow(dead_code)]
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
-    let store = crate::session_control::SessionStore::from_cwd(cwd).map_err(|e| {
-        SessionError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    let store = crate::session_control::SessionStore::from_cwd(cwd)
+        .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))?;
     Ok(store.sessions_dir().to_path_buf())
 }
 
@@ -1489,8 +1485,7 @@ mod workspace_sessions_dir_tests {
         let result = workspace_sessions_dir(&tmp);
         assert!(
             result.is_ok(),
-            "workspace_sessions_dir should succeed for a valid CWD, got: {:?}",
-            result
+            "workspace_sessions_dir should succeed for a valid CWD, got: {result:?}"
         );
         let dir = result.unwrap();
         // The returned path should be non-empty and end with a hash component

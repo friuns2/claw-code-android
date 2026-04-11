@@ -88,12 +88,12 @@ pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, A
         .as_deref()
         .and_then(reqwest::NoProxy::from_string);
 
-    let (http_proxy_url, https_proxy_url) = match config.proxy_url.as_deref() {
+    let (http_proxy_url, https_url) = match config.proxy_url.as_deref() {
         Some(unified) => (Some(unified), Some(unified)),
         None => (config.http_proxy.as_deref(), config.https_proxy.as_deref()),
     };
 
-    if let Some(url) = https_proxy_url {
+    if let Some(url) = https_url {
         let mut proxy = reqwest::Proxy::https(url)?;
         if let Some(filter) = no_proxy.clone() {
             proxy = proxy.no_proxy(Some(filter));

@@ -508,9 +508,10 @@ mod tests {
         // ANTHROPIC_API_KEY was set because metadata_for_model returned None
         // and detect_provider_kind fell through to auth-sniffer order.
         // The model prefix must win over env-var presence.
-        let kind = super::metadata_for_model("openai/gpt-4.1-mini")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("openai/gpt-4.1-mini"));
+        let kind = super::metadata_for_model("openai/gpt-4.1-mini").map_or_else(
+            || detect_provider_kind("openai/gpt-4.1-mini"),
+            |m| m.provider,
+        );
         assert_eq!(
             kind,
             ProviderKind::OpenAi,
@@ -519,8 +520,7 @@ mod tests {
 
         // Also cover bare gpt- prefix
         let kind2 = super::metadata_for_model("gpt-4o")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("gpt-4o"));
+            .map_or_else(|| detect_provider_kind("gpt-4o"), |m| m.provider);
         assert_eq!(kind2, ProviderKind::OpenAi);
     }
 

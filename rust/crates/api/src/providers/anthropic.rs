@@ -502,9 +502,8 @@ impl AnthropicClient {
         // Best-effort refinement using the Anthropic count_tokens endpoint.
         // On any failure (network, parse, auth), fall back to the local
         // byte-estimate result which already passed above.
-        let counted_input_tokens = match self.count_tokens(request).await {
-            Ok(count) => count,
-            Err(_) => return Ok(()),
+        let Ok(counted_input_tokens) = self.count_tokens(request).await else {
+            return Ok(());
         };
         let estimated_total_tokens = counted_input_tokens.saturating_add(request.max_tokens);
         if estimated_total_tokens > limit.context_window_tokens {
@@ -631,21 +630,7 @@ impl AuthSource {
         if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             return Ok(Self::BearerToken(bearer_token));
         }
-        match load_saved_oauth_token() {
-            Ok(Some(token_set)) if oauth_token_is_expired(&token_set) => {
-                if token_set.refresh_token.is_some() {
-                    Err(ApiError::Auth(
-                        "saved OAuth token is expired; load runtime OAuth config to refresh it"
-                            .to_string(),
-                    ))
-                } else {
-                    Err(ApiError::ExpiredOAuthToken)
-                }
-            }
-            Ok(Some(token_set)) => Ok(Self::BearerToken(token_set.access_token)),
-            Ok(None) => Err(anthropic_missing_credentials()),
-            Err(error) => Err(error),
-        }
+        Err(anthropic_missing_credentials())
     }
 }
 
@@ -665,14 +650,14 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
     Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
-        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
-        || load_saved_oauth_token()?.is_some())
+        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some())
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
 where
     F: FnOnce() -> Result<Option<OAuthConfig>, ApiError>,
 {
+    let _ = load_oauth_config;
     if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
         return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             Some(bearer_token) => Ok(AuthSource::ApiKeyAndBearer {
@@ -685,25 +670,7 @@ where
     if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
     }
-
-    let Some(token_set) = load_saved_oauth_token()? else {
-        return Err(anthropic_missing_credentials());
-    };
-    if !oauth_token_is_expired(&token_set) {
-        return Ok(AuthSource::BearerToken(token_set.access_token));
-    }
-    if token_set.refresh_token.is_none() {
-        return Err(ApiError::ExpiredOAuthToken);
-    }
-
-    let Some(config) = load_oauth_config()? else {
-        return Err(ApiError::Auth(
-            "saved OAuth token is expired; runtime OAuth config is missing".to_string(),
-        ));
-    };
-    Ok(AuthSource::from(resolve_saved_oauth_token_set(
-        &config, token_set,
-    )?))
+    Err(anthropic_missing_credentials())
 }
 
 fn resolve_saved_oauth_token_set(
@@ -1016,7 +983,7 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
         object.remove("presence_penalty");
         // Anthropic uses "stop_sequences" not "stop". Convert if present.
         if let Some(stop_val) = object.remove("stop") {
-            if stop_val.as_array().map_or(false, |a| !a.is_empty()) {
+            if stop_val.as_array().is_some_and(|a| !a.is_empty()) {
                 object.insert("stop_sequences".to_string(), stop_val);
             }
         }
@@ -1180,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_source_from_saved_oauth_when_env_absent() {
+    fn auth_source_from_env_or_saved_ignores_saved_oauth_when_env_absent() {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
@@ -1194,8 +1161,8 @@ mod tests {
         })
         .expect("save oauth credentials");
 
-        let auth = AuthSource::from_env_or_saved().expect("saved auth");
-        assert_eq!(auth.bearer_token(), Some("saved-access-token"));
+        let error = AuthSource::from_env_or_saved().expect_err("saved oauth should be ignored");
+        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAW_CONFIG_HOME");
@@ -1251,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_startup_auth_source_uses_saved_oauth_without_loading_config() {
+    fn resolve_startup_auth_source_ignores_saved_oauth_without_loading_config() {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
@@ -1265,41 +1232,9 @@ mod tests {
         })
         .expect("save oauth credentials");
 
-        let auth = resolve_startup_auth_source(|| panic!("config should not be loaded"))
-            .expect("startup auth");
-        assert_eq!(auth.bearer_token(), Some("saved-access-token"));
-
-        clear_oauth_credentials().expect("clear credentials");
-        std::env::remove_var("CLAW_CONFIG_HOME");
-        cleanup_temp_config_home(&config_home);
-    }
-
-    #[test]
-    fn resolve_startup_auth_source_errors_when_refreshable_token_lacks_config() {
-        let _guard = env_lock();
-        let config_home = temp_config_home();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        save_oauth_credentials(&runtime::OAuthTokenSet {
-            access_token: "expired-access-token".to_string(),
-            refresh_token: Some("refresh-token".to_string()),
-            expires_at: Some(1),
-            scopes: vec!["scope:a".to_string()],
-        })
-        .expect("save expired oauth credentials");
-
-        let error =
-            resolve_startup_auth_source(|| Ok(None)).expect_err("missing config should error");
-        assert!(
-            matches!(error, crate::error::ApiError::Auth(message) if message.contains("runtime OAuth config is missing"))
-        );
-
-        let stored = runtime::load_oauth_credentials()
-            .expect("load stored credentials")
-            .expect("stored token set");
-        assert_eq!(stored.access_token, "expired-access-token");
-        assert_eq!(stored.refresh_token.as_deref(), Some("refresh-token"));
+        let error = resolve_startup_auth_source(|| panic!("config should not be loaded"))
+            .expect_err("saved oauth should be ignored");
+        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAW_CONFIG_HOME");

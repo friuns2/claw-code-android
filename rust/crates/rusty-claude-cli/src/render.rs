@@ -639,10 +639,16 @@ fn apply_code_block_background(line: &str) -> String {
 /// fence markers of equal or greater length are wrapped with a longer fence.
 ///
 /// LLMs frequently emit triple-backtick code blocks that contain triple-backtick
-/// examples.  CommonMark (and pulldown-cmark) treats the inner marker as the
+/// examples.  `CommonMark` (and pulldown-cmark) treats the inner marker as the
 /// closing fence, breaking the render.  This function detects the situation and
 /// upgrades the outer fence to use enough backticks (or tildes) that the inner
 /// markers become ordinary content.
+#[allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::manual_repeat_n,
+    clippy::manual_str_repeat
+)]
 fn normalize_nested_fences(markdown: &str) -> String {
     // A fence line is either "labeled" (has an info string ⇒ always an opener)
     // or "bare" (no info string ⇒ could be opener or closer).

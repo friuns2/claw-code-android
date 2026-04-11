@@ -58,10 +58,10 @@ impl OpenAiCompatConfig {
         }
     }
 
-    /// Alibaba DashScope compatible-mode endpoint (Qwen family models).
+    /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
     /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
     /// Requested via Discord #clawcode-get-help: native Alibaba API for
-    /// higher rate limits than going through OpenRouter.
+    /// higher rate limits than going through `OpenRouter`.
     #[must_use]
     pub const fn dashscope() -> Self {
         Self {
@@ -170,7 +170,7 @@ impl OpenAiCompatClient {
                     .to_string();
                 let code = err_obj
                     .get("code")
-                    .and_then(|c| c.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .map(|c| c as u16);
                 return Err(ApiError::Api {
                     status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
@@ -750,7 +750,7 @@ struct ErrorBody {
 }
 
 /// Returns true for models known to reject tuning parameters like temperature,
-/// top_p, frequency_penalty, and presence_penalty. These are typically
+/// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
 /// reasoning/chain-of-thought models with fixed sampling.
 fn is_reasoning_model(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
@@ -974,12 +974,11 @@ fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
         }
         let paired = preceding
             .and_then(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
-            .map(|tool_calls| {
+            .is_some_and(|tool_calls| {
                 tool_calls
                     .iter()
                     .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(tool_call_id))
-            })
-            .unwrap_or(false);
+            });
         if !paired {
             drop_indices.insert(i);
         }
@@ -1008,7 +1007,7 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
 
 /// Recursively ensure every object-type node in a JSON Schema has
 /// `"properties"` (at least `{}`) and `"additionalProperties": false`.
-/// The OpenAI `/responses` endpoint validates schemas strictly and rejects
+/// The `OpenAI` `/responses` endpoint validates schemas strictly and rejects
 /// objects that omit these fields; `/chat/completions` is lenient but also
 /// accepts them, so we normalise unconditionally.
 fn normalize_object_schema(schema: &mut Value) {
@@ -1173,7 +1172,7 @@ fn parse_sse_frame(
                 .to_string();
             let code = err_obj
                 .get("code")
-                .and_then(|c| c.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map(|c| c as u16);
             let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
                 .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
@@ -1185,7 +1184,7 @@ fn parse_sse_frame(
                     .map(str::to_owned),
                 message: Some(msg),
                 request_id: None,
-                body: payload.to_string(),
+                body: payload.clone(),
                 retryable: false,
             });
         }
@@ -1642,6 +1641,16 @@ mod tests {
     /// Before the fix this produced: `invalid type: null, expected a sequence`.
     #[test]
     fn delta_with_null_tool_calls_deserializes_as_empty_vec() {
+        use super::deserialize_null_as_empty_vec;
+
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize, Debug)]
+        struct Delta {
+            content: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+            tool_calls: Vec<super::DeltaToolCall>,
+        }
+
         // Simulate the exact shape observed in the wild (gaebal-gajae repro 2026-04-09)
         let json = r#"{
             "content": "",
@@ -1650,15 +1659,6 @@ mod tests {
             "role": "assistant",
             "tool_calls": null
         }"#;
-
-        use super::deserialize_null_as_empty_vec;
-        #[allow(dead_code)]
-        #[derive(serde::Deserialize, Debug)]
-        struct Delta {
-            content: Option<String>,
-            #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
-            tool_calls: Vec<super::DeltaToolCall>,
-        }
         let delta: Delta = serde_json::from_str(json)
             .expect("delta with tool_calls:null must deserialize without error");
         assert!(
@@ -1670,7 +1670,7 @@ mod tests {
     /// Regression: when building a multi-turn request where a prior assistant
     /// turn has no tool calls, the serialized assistant message must NOT include
     /// `tool_calls: []`. Some providers reject requests that carry an empty
-    /// tool_calls array on assistant turns (gaebal-gajae repro 2026-04-09).
+    /// `tool_calls` array on assistant turns (gaebal-gajae repro 2026-04-09).
     #[test]
     fn assistant_message_without_tool_calls_omits_tool_calls_field() {
         use crate::types::{InputContentBlock, InputMessage};
@@ -1695,13 +1695,12 @@ mod tests {
             .expect("assistant message must be present");
         assert!(
             assistant_msg.get("tool_calls").is_none(),
-            "assistant message without tool calls must omit tool_calls field: {:?}",
-            assistant_msg
+            "assistant message without tool calls must omit tool_calls field: {assistant_msg:?}"
         );
     }
 
     /// Regression: assistant messages WITH tool calls must still include
-    /// the tool_calls array (normal multi-turn tool-use flow).
+    /// the `tool_calls` array (normal multi-turn tool-use flow).
     #[test]
     fn assistant_message_with_tool_calls_includes_tool_calls_field() {
         use crate::types::{InputContentBlock, InputMessage};
@@ -1733,7 +1732,7 @@ mod tests {
         assert_eq!(tool_calls.as_array().unwrap().len(), 1);
     }
 
-    /// Orphaned tool messages (no preceding assistant tool_calls) must be
+    /// Orphaned tool messages (no preceding assistant `tool_calls`) must be
     /// dropped by the request-builder sanitizer. Regression for the second
     /// layer of the tool-pairing invariant fix (gaebal-gajae 2026-04-10).
     #[test]

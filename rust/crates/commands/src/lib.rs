@@ -258,20 +258,6 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
-        name: "login",
-        aliases: &[],
-        summary: "Log in to the service",
-        argument_hint: None,
-        resume_supported: false,
-    },
-    SlashCommandSpec {
-        name: "logout",
-        aliases: &[],
-        summary: "Log out of the current session",
-        argument_hint: None,
-        resume_supported: false,
-    },
-    SlashCommandSpec {
         name: "plan",
         aliases: &[],
         summary: "Toggle or inspect planning mode",
@@ -1291,7 +1277,6 @@ impl SlashCommand {
             Self::Tag { .. } => "/tag",
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
-            Self::Unknown(_) => "/unknown",
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
@@ -1402,13 +1387,12 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
         }
-        "login" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Login
-        }
-        "logout" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Logout
+        "login" | "logout" => {
+            return Err(command_error(
+                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
+                command,
+                "",
+            ));
         }
         "vim" => {
             validate_no_args(command, &args)?;
@@ -1893,20 +1877,12 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 
 fn slash_command_category(name: &str) -> &'static str {
     match name {
-        "help" | "status" | "cost" | "resume" | "session" | "version" | "login" | "logout"
-        | "usage" | "stats" | "rename" | "clear" | "compact" | "history" | "tokens" | "cache"
-        | "exit" | "summary" | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind"
-        | "pin" | "unpin" | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry"
-        | "stop" | "undo" => "Session",
-        "diff" | "commit" | "pr" | "issue" | "branch" | "blame" | "log" | "git" | "stash"
-        | "init" | "export" | "plan" | "review" | "security-review" | "bughunter" | "ultraplan"
-        | "teleport" | "refactor" | "fix" | "autofix" | "explain" | "docs" | "perf" | "search"
-        | "references" | "definition" | "hover" | "symbols" | "map" | "web" | "image"
-        | "screenshot" | "paste" | "listen" | "speak" | "test" | "lint" | "build" | "run"
-        | "format" | "parallel" | "multi" | "macro" | "alias" | "templates" | "migrate"
-        | "benchmark" | "cron" | "agent" | "subagent" | "agents" | "skills" | "team" | "plugin"
-        | "mcp" | "hooks" | "tasks" | "advisor" | "insights" | "release-notes" | "chat"
-        | "approve" | "deny" | "allowed-tools" | "add-dir" => "Tools",
+        "help" | "status" | "cost" | "resume" | "session" | "version" | "usage" | "stats"
+        | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit" | "summary"
+        | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin" | "unpin"
+        | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => {
+            "Session"
+        }
         "model" | "permissions" | "config" | "memory" | "theme" | "vim" | "voice" | "color"
         | "effort" | "fast" | "brief" | "output-style" | "keybindings" | "privacy-settings"
         | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
@@ -2477,7 +2453,8 @@ pub fn resolve_skill_invocation(
                         .map(|s| s.name.clone())
                         .collect();
                     if !names.is_empty() {
-                        message.push_str(&format!("\n  Available skills: {}", names.join(", ")));
+                        message.push_str("\n  Available skills: ");
+                        message.push_str(&names.join(", "));
                     }
                 }
                 message.push_str("\n  Usage: /skills [list|install <path>|help|<skill> [args]]");
@@ -2699,7 +2676,7 @@ pub fn render_plugins_report_with_failures(
 
     // Show warnings for broken plugins
     if !failures.is_empty() {
-        lines.push("".to_string());
+        lines.push(String::new());
         lines.push("Warnings:".to_string());
         for failure in failures {
             lines.push(format!(
@@ -4599,6 +4576,14 @@ mod tests {
     }
 
     #[test]
+    fn removed_login_and_logout_commands_report_env_auth_guidance() {
+        let login_error = parse_error_message("/login");
+        assert!(login_error.contains("ANTHROPIC_API_KEY"));
+        let logout_error = parse_error_message("/logout");
+        assert!(logout_error.contains("ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[test]
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
         assert!(help.contains("Start here        /status, /diff, /agents, /skills, /commit"));
@@ -4639,7 +4624,9 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert!(!help.contains("/login"));
+        assert!(!help.contains("/logout"));
+        assert_eq!(slash_command_specs().len(), 139);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
