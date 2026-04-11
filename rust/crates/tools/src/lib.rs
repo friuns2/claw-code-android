@@ -1287,7 +1287,7 @@ fn maybe_enforce_permission_check(
 }
 
 /// Enforce permission check with a dynamically classified permission mode.
-/// Used for tools like bash and PowerShell where the required permission
+/// Used for tools like bash and `PowerShell` where the required permission
 /// depends on the actual command being executed.
 fn maybe_enforce_permission_check_with_mode(
     enforcer: Option<&PermissionEnforcer>,
@@ -1820,8 +1820,8 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 }
 
 /// Classify bash command permission based on command type and path.
-/// ROADMAP #50: Read-only commands targeting CWD paths get WorkspaceWrite,
-/// all others remain DangerFullAccess.
+/// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
+/// all others remain `DangerFullAccess`.
 fn classify_bash_permission(command: &str) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
@@ -1831,14 +1831,14 @@ fn classify_bash_permission(command: &str) -> PermissionMode {
     ];
 
     // Get the base command (first word before any args or pipes)
-    let base_cmd = command.trim().split_whitespace().next().unwrap_or("");
+    let base_cmd = command.split_whitespace().next().unwrap_or("");
     let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
     let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
     let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
     let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
 
     // Check if it's a read-only command
-    let cmd_name = base_cmd.split('/').last().unwrap_or(base_cmd);
+    let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
     let is_read_only = READ_ONLY_COMMANDS.contains(&cmd_name);
 
     if !is_read_only {
@@ -1869,7 +1869,7 @@ fn has_dangerous_paths(command: &str) -> bool {
         if token.starts_with('/') || token.starts_with("~/") {
             // Check if it's within CWD
             let path =
-                PathBuf::from(token.replace("~", &std::env::var("HOME").unwrap_or_default()));
+                PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
             if let Ok(cwd) = std::env::current_dir() {
                 if !path.starts_with(&cwd) {
                     return true; // Path outside workspace
@@ -2131,9 +2131,9 @@ fn run_repl(input: ReplInput) -> Result<String, String> {
     to_pretty_json(execute_repl(input)?)
 }
 
-/// Classify PowerShell command permission based on command type and path.
-/// ROADMAP #50: Read-only commands targeting CWD paths get WorkspaceWrite,
-/// all others remain DangerFullAccess.
+/// Classify `PowerShell` command permission based on command type and path.
+/// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
+/// all others remain `DangerFullAccess`.
 fn classify_powershell_permission(command: &str) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
@@ -2165,17 +2165,17 @@ fn classify_powershell_permission(command: &str) -> PermissionMode {
     }
 }
 
-/// Extract the path argument from a PowerShell command.
+/// Extract the path argument from a `PowerShell` command.
 fn extract_powershell_path(command: &str) -> Option<String> {
     // Look for -Path parameter
     if let Some(idx) = command.to_lowercase().find("-path") {
         let after_path = &command[idx + 5..];
-        let path = after_path.trim().split_whitespace().next()?;
+        let path = after_path.split_whitespace().next()?;
         return Some(path.trim_matches('"').trim_matches('\'').to_string());
     }
 
     // Look for positional path parameter (after command name)
-    let parts: Vec<&str> = command.trim().split_whitespace().collect();
+    let parts: Vec<&str> = command.split_whitespace().collect();
     if parts.len() >= 2 {
         // Skip the cmdlet name and take the first argument
         let first_arg = parts[1];

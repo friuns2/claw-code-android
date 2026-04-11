@@ -1612,6 +1612,88 @@ mod tests {
     }
 
     #[test]
+    fn compaction_health_probe_blocks_turn_when_tool_executor_is_broken() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                panic!("API should not run when health probe fails");
+            }
+        }
+
+        let mut session = Session::new();
+        session.record_compaction("summarized earlier work", 4);
+        session
+            .push_user_text("previous message")
+            .expect("message should append");
+
+        let tool_executor = StaticToolExecutor::new().register("glob_search", |_input| {
+            Err(ToolError::new("transport unavailable"))
+        });
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("trigger", None)
+            .expect_err("health probe failure should abort the turn");
+        assert!(
+            error
+                .to_string()
+                .contains("Session health probe failed after compaction"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("transport unavailable"),
+            "expected underlying probe error: {error}"
+        );
+    }
+
+    #[test]
+    fn compaction_health_probe_skips_empty_compacted_session() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.record_compaction("fresh summary", 2);
+
+        let tool_executor = StaticToolExecutor::new().register("glob_search", |_input| {
+            Err(ToolError::new(
+                "glob_search should not run for an empty compacted session",
+            ))
+        });
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("empty compacted session should not fail health probe");
+        assert_eq!(summary.auto_compaction, None);
+        assert_eq!(runtime.session().messages.len(), 2);
+    }
+
+    #[test]
     fn build_assistant_message_requires_message_stop_event() {
         // given
         let events = vec![AssistantEvent::TextDelta("hello".to_string())];

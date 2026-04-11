@@ -11521,22 +11521,23 @@ mod dump_manifests_tests {
             let result = dump_manifests_at_path(&temp_dir, CliOutputFormat::Text);
 
             // Assert that the call fails
-            assert!(result.is_err(), "expected an error when manifests are missing");
+            assert!(
+                result.is_err(),
+                "expected an error when manifests are missing"
+            );
 
             let error_msg = result.unwrap_err().to_string();
 
             // Assert the error message contains "Manifest files (commands.ts, tools.ts)"
             assert!(
                 error_msg.contains("Manifest files (commands.ts, tools.ts)"),
-                "error message should mention manifest files: {}",
-                error_msg
+                "error message should mention manifest files: {error_msg}"
             );
 
             // Assert the error message contains the expected path
             assert!(
                 error_msg.contains(&temp_dir.display().to_string()),
-                "error message should contain the expected path: {}",
-                error_msg
+                "error message should contain the expected path: {error_msg}"
             );
         });
 
