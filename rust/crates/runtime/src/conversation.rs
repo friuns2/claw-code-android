@@ -292,6 +292,24 @@ where
         }
     }
 
+    /// Run a session health probe to verify the runtime is functional after compaction.
+    /// Returns Ok(()) if healthy, Err if the session appears broken.
+    fn run_session_health_probe(&mut self) -> Result<(), String> {
+        // Check if we have basic session integrity
+        if self.session.messages.is_empty() && self.session.compaction.is_some() {
+            // Freshly compacted with no messages - this is normal
+            return Ok(());
+        }
+
+        // Verify tool executor is responsive with a non-destructive probe
+        // Using glob_search with a pattern that won't match anything
+        let probe_input = r#"{"pattern": "*.health-check-probe-"}"#;
+        match self.tool_executor.execute("glob_search", probe_input) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Tool executor probe failed: {e}")),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
@@ -299,6 +317,18 @@ where
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
+
+        // ROADMAP #38: Session-health canary - probe if context was compacted
+        if self.session.compaction.is_some() {
+            if let Err(error) = self.run_session_health_probe() {
+                return Err(RuntimeError::new(format!(
+                    "Session health probe failed after compaction: {error}. \
+                     The session may be in an inconsistent state. \
+                     Consider starting a fresh session with /session new."
+                )));
+            }
+        }
+
         self.record_turn_started(&user_input);
         self.session
             .push_user_text(user_input)

@@ -98,6 +98,8 @@ pub struct Session {
     pub prompt_history: Vec<SessionPromptEntry>,
     /// The model used in this session, persisted so resumed sessions can
     /// report which model was originally used.
+    /// Timestamp of last successful health check (ROADMAP #38)
+    pub last_health_check_ms: Option<u64>,
     pub model: Option<String>,
     persistence: Option<SessionPersistence>,
 }
@@ -113,6 +115,7 @@ impl PartialEq for Session {
             && self.fork == other.fork
             && self.workspace_root == other.workspace_root
             && self.prompt_history == other.prompt_history
+            && self.last_health_check_ms == other.last_health_check_ms
     }
 }
 
@@ -164,6 +167,7 @@ impl Session {
             fork: None,
             workspace_root: None,
             prompt_history: Vec::new(),
+            last_health_check_ms: None,
             model: None,
             persistence: None,
         }
@@ -267,6 +271,7 @@ impl Session {
             }),
             workspace_root: self.workspace_root.clone(),
             prompt_history: self.prompt_history.clone(),
+            last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
             persistence: None,
         }
@@ -390,6 +395,7 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            last_health_check_ms: None,
             model,
             persistence: None,
         })
@@ -490,6 +496,7 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            last_health_check_ms: None,
             model,
             persistence: None,
         })
