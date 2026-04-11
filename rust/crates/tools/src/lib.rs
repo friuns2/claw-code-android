@@ -3734,6 +3734,8 @@ fn classify_lane_failure(error: &str) -> LaneFailureClass {
         || normalized.contains("tool runtime")
     {
         LaneFailureClass::ToolRuntime
+    } else if normalized.contains("workspace") && normalized.contains("mismatch") {
+        LaneFailureClass::WorkspaceMismatch
     } else if normalized.contains("plugin") {
         LaneFailureClass::PluginStartup
     } else if normalized.contains("mcp") && normalized.contains("handshake") {
@@ -7253,6 +7255,10 @@ mod tests {
                 "tool failed: denied tool execution from hook",
                 LaneFailureClass::ToolRuntime,
             ),
+            (
+                "workspace mismatch while resuming the managed session",
+                LaneFailureClass::WorkspaceMismatch,
+            ),
             ("thread creation failed", LaneFailureClass::Infra),
         ];
 
@@ -7278,6 +7284,10 @@ mod tests {
             (
                 LaneEventName::BranchStaleAgainstMain,
                 "branch.stale_against_main",
+            ),
+            (
+                LaneEventName::BranchWorkspaceMismatch,
+                "branch.workspace_mismatch",
             ),
         ];
 

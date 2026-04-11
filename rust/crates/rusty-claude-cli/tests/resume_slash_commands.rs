@@ -20,7 +20,7 @@ fn resumed_binary_accepts_slash_commands_with_arguments() {
     let session_path = temp_dir.join("session.jsonl");
     let export_path = temp_dir.join("notes.txt");
 
-    let mut session = Session::new();
+    let mut session = workspace_session(&temp_dir);
     session
         .push_user_text("ship the slash command harness")
         .expect("session write should succeed");
@@ -122,7 +122,7 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
     fs::create_dir_all(&config_home).expect("config home should exist");
 
     let session_path = project_dir.join("session.jsonl");
-    Session::new()
+    workspace_session(&project_dir)
         .with_persistence_path(&session_path)
         .save_to_path(&session_path)
         .expect("session should persist");
@@ -180,13 +180,11 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     // given
     let temp_dir = unique_temp_dir("resume-latest");
     let project_dir = temp_dir.join("project");
-    let sessions_dir = project_dir.join(".claw").join("sessions");
-    fs::create_dir_all(&sessions_dir).expect("sessions dir should exist");
+    let store = runtime::SessionStore::from_cwd(&project_dir).expect("session store should build");
+    let older_path = store.create_handle("session-older").path;
+    let newer_path = store.create_handle("session-newer").path;
 
-    let older_path = sessions_dir.join("session-older.jsonl");
-    let newer_path = sessions_dir.join("session-newer.jsonl");
-
-    let mut older = Session::new().with_persistence_path(&older_path);
+    let mut older = workspace_session(&project_dir).with_persistence_path(&older_path);
     older
         .push_user_text("older session")
         .expect("older session write should succeed");
@@ -194,7 +192,7 @@ fn resume_latest_restores_the_most_recent_managed_session() {
         .save_to_path(&older_path)
         .expect("older session should persist");
 
-    let mut newer = Session::new().with_persistence_path(&newer_path);
+    let mut newer = workspace_session(&project_dir).with_persistence_path(&newer_path);
     newer
         .push_user_text("newer session")
         .expect("newer session write should succeed");
@@ -229,7 +227,7 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
     let session_path = temp_dir.join("session.jsonl");
 
-    let mut session = Session::new();
+    let mut session = workspace_session(&temp_dir);
     session
         .push_user_text("resume status json fixture")
         .expect("session write should succeed");
@@ -283,7 +281,7 @@ fn resumed_status_surfaces_persisted_model() {
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
     let session_path = temp_dir.join("session.jsonl");
 
-    let mut session = Session::new();
+    let mut session = workspace_session(&temp_dir);
     session.model = Some("claude-sonnet-4-6".to_string());
     session
         .push_user_text("model persistence fixture")
@@ -324,7 +322,7 @@ fn resumed_sandbox_command_emits_structured_json_when_requested() {
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
     let session_path = temp_dir.join("session.jsonl");
 
-    Session::new()
+    workspace_session(&temp_dir)
         .save_to_path(&session_path)
         .expect("session should persist");
 
@@ -365,7 +363,7 @@ fn resumed_version_command_emits_structured_json() {
     let temp_dir = unique_temp_dir("resume-version-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
     let session_path = temp_dir.join("session.jsonl");
-    Session::new()
+    workspace_session(&temp_dir)
         .save_to_path(&session_path)
         .expect("session should persist");
 
@@ -398,7 +396,7 @@ fn resumed_export_command_emits_structured_json() {
     let temp_dir = unique_temp_dir("resume-export-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
     let session_path = temp_dir.join("session.jsonl");
-    let mut session = Session::new();
+    let mut session = workspace_session(&temp_dir);
     session
         .push_user_text("export json fixture")
         .expect("write ok");
@@ -432,7 +430,7 @@ fn resumed_help_command_emits_structured_json() {
     let temp_dir = unique_temp_dir("resume-help-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
     let session_path = temp_dir.join("session.jsonl");
-    Session::new()
+    workspace_session(&temp_dir)
         .save_to_path(&session_path)
         .expect("persist ok");
 
@@ -465,7 +463,7 @@ fn resumed_no_command_emits_restored_json() {
     let temp_dir = unique_temp_dir("resume-no-cmd-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
     let session_path = temp_dir.join("session.jsonl");
-    let mut session = Session::new();
+    let mut session = workspace_session(&temp_dir);
     session
         .push_user_text("restored json fixture")
         .expect("write ok");
@@ -499,7 +497,7 @@ fn resumed_stub_command_emits_not_implemented_json() {
     let temp_dir = unique_temp_dir("resume-stub-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
     let session_path = temp_dir.join("session.jsonl");
-    Session::new()
+    workspace_session(&temp_dir)
         .save_to_path(&session_path)
         .expect("persist ok");
 
@@ -531,6 +529,10 @@ fn resumed_stub_command_emits_not_implemented_json() {
 
 fn run_claw(current_dir: &Path, args: &[&str]) -> Output {
     run_claw_with_env(current_dir, args, &[])
+}
+
+fn workspace_session(root: &Path) -> Session {
+    Session::new().with_workspace_root(root.to_path_buf())
 }
 
 fn run_claw_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {

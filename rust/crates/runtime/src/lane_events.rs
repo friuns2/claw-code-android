@@ -36,6 +36,8 @@ pub enum LaneEventName {
     Closed,
     #[serde(rename = "branch.stale_against_main")]
     BranchStaleAgainstMain,
+    #[serde(rename = "branch.workspace_mismatch")]
+    BranchWorkspaceMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +69,7 @@ pub enum LaneFailureClass {
     McpHandshake,
     GatewayRouting,
     ToolRuntime,
+    WorkspaceMismatch,
     Infra,
 }
 
@@ -277,6 +280,10 @@ mod tests {
                 LaneEventName::BranchStaleAgainstMain,
                 "branch.stale_against_main",
             ),
+            (
+                LaneEventName::BranchWorkspaceMismatch,
+                "branch.workspace_mismatch",
+            ),
         ];
 
         for (event, expected) in cases {
@@ -300,6 +307,7 @@ mod tests {
             (LaneFailureClass::McpHandshake, "mcp_handshake"),
             (LaneFailureClass::GatewayRouting, "gateway_routing"),
             (LaneFailureClass::ToolRuntime, "tool_runtime"),
+            (LaneFailureClass::WorkspaceMismatch, "workspace_mismatch"),
             (LaneFailureClass::Infra, "infra"),
         ];
 
@@ -327,6 +335,38 @@ mod tests {
         assert_eq!(failed.event, LaneEventName::Failed);
         assert_eq!(failed.status, LaneEventStatus::Failed);
         assert_eq!(failed.detail.as_deref(), Some("broken server"));
+    }
+
+    #[test]
+    fn workspace_mismatch_failure_class_round_trips_in_branch_event_payloads() {
+        let mismatch = LaneEvent::new(
+            LaneEventName::BranchWorkspaceMismatch,
+            LaneEventStatus::Blocked,
+            "2026-04-04T00:00:02Z",
+        )
+        .with_failure_class(LaneFailureClass::WorkspaceMismatch)
+        .with_detail("session belongs to /tmp/repo-a but current workspace is /tmp/repo-b")
+        .with_data(json!({
+            "expectedWorkspaceRoot": "/tmp/repo-a",
+            "actualWorkspaceRoot": "/tmp/repo-b",
+            "sessionId": "sess-123",
+        }));
+
+        let mismatch_json = serde_json::to_value(&mismatch).expect("lane event should serialize");
+        assert_eq!(mismatch_json["event"], "branch.workspace_mismatch");
+        assert_eq!(mismatch_json["failureClass"], "workspace_mismatch");
+        assert_eq!(
+            mismatch_json["data"]["expectedWorkspaceRoot"],
+            "/tmp/repo-a"
+        );
+
+        let round_trip: LaneEvent =
+            serde_json::from_value(mismatch_json).expect("lane event should deserialize");
+        assert_eq!(round_trip.event, LaneEventName::BranchWorkspaceMismatch);
+        assert_eq!(
+            round_trip.failure_class,
+            Some(LaneFailureClass::WorkspaceMismatch)
+        );
     }
 
     #[test]

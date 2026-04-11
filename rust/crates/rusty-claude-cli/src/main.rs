@@ -2215,30 +2215,9 @@ fn version_json_value() -> serde_json::Value {
 }
 
 fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
-    let resolved_path = if session_path.exists() {
-        session_path.to_path_buf()
-    } else {
-        match resolve_session_reference(&session_path.display().to_string()) {
-            Ok(handle) => handle.path,
-            Err(error) => {
-                if output_format == CliOutputFormat::Json {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "type": "error",
-                            "error": format!("failed to restore session: {error}"),
-                        })
-                    );
-                } else {
-                    eprintln!("failed to restore session: {error}");
-                }
-                std::process::exit(1);
-            }
-        }
-    };
-
-    let session = match Session::load_from_path(&resolved_path) {
-        Ok(session) => session,
+    let session_reference = session_path.display().to_string();
+    let (handle, session) = match load_session_reference(&session_reference) {
+        Ok(loaded) => loaded,
         Err(error) => {
             if output_format == CliOutputFormat::Json {
                 eprintln!(
@@ -2254,6 +2233,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             std::process::exit(1);
         }
     };
+    let resolved_path = handle.path.clone();
 
     if commands.is_empty() {
         if output_format == CliOutputFormat::Json {
@@ -2262,14 +2242,14 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 serde_json::json!({
                     "kind": "restored",
                     "session_id": session.session_id,
-                    "path": resolved_path.display().to_string(),
+                    "path": handle.path.display().to_string(),
                     "message_count": session.messages.len(),
                 })
             );
         } else {
             println!(
                 "Restored session from {} ({} messages).",
-                resolved_path.display(),
+                handle.path.display(),
                 session.messages.len()
             );
         }
@@ -2762,7 +2742,7 @@ fn run_resume_command(
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
             let previous_session_id = session.session_id.clone();
-            let cleared = Session::new();
+            let cleared = new_cli_session()?;
             let new_session_id = cleared.session_id.clone();
             cleared.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
@@ -3729,7 +3709,7 @@ impl LiveCli {
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
-        let session_state = Session::new();
+        let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
@@ -4314,7 +4294,7 @@ impl LiveCli {
         }
 
         let previous_session = self.session.clone();
-        let session_state = Session::new();
+        let session_state = new_cli_session()?;
         self.session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(self.session.path.clone()),
@@ -4354,8 +4334,7 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let handle = resolve_session_reference(&session_ref)?;
-        let session = Session::load_from_path(&handle.path)?;
+        let (handle, session) = load_session_reference(&session_ref)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(
@@ -4510,8 +4489,7 @@ impl LiveCli {
                     println!("Usage: /session switch <session-id>");
                     return Ok(false);
                 };
-                let handle = resolve_session_reference(target)?;
-                let session = Session::load_from_path(&handle.path)?;
+                let (handle, session) = load_session_reference(target)?;
                 let message_count = session.messages.len();
                 let session_id = session.session_id.clone();
                 let runtime = build_runtime(
@@ -4772,177 +4750,88 @@ impl LiveCli {
 }
 
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(current_session_store()?.sessions_dir().to_path_buf())
+}
+
+fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let store = runtime::SessionStore::from_cwd(&cwd)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    Ok(store.sessions_dir().to_path_buf())
+    runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
+    Ok(Session::new().with_workspace_root(env::current_dir()?))
 }
 
 fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let id = session_id.to_string();
-    let path = sessions_dir()?.join(format!("{id}.{PRIMARY_SESSION_EXTENSION}"));
-    Ok(SessionHandle { id, path })
+    let handle = current_session_store()?
+        .create_handle(session_id);
+    Ok(SessionHandle {
+        id: handle.id,
+        path: handle.path,
+    })
 }
 
 fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    if SESSION_REFERENCE_ALIASES
-        .iter()
-        .any(|alias| reference.eq_ignore_ascii_case(alias))
-    {
-        let latest = latest_managed_session()?;
-        return Ok(SessionHandle {
-            id: latest.id,
-            path: latest.path,
-        });
-    }
-
-    let direct = PathBuf::from(reference);
-    let looks_like_path = direct.extension().is_some() || direct.components().count() > 1;
-    let path = if direct.exists() {
-        direct
-    } else if looks_like_path {
-        return Err(format_missing_session_reference(reference).into());
-    } else {
-        resolve_managed_session_path(reference)?
-    };
-    let id = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .and_then(|name| {
-            name.strip_suffix(&format!(".{PRIMARY_SESSION_EXTENSION}"))
-                .or_else(|| name.strip_suffix(&format!(".{LEGACY_SESSION_EXTENSION}")))
-        })
-        .unwrap_or(reference)
-        .to_string();
-    Ok(SessionHandle { id, path })
+    let handle = current_session_store()?
+        .resolve_reference(reference)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    Ok(SessionHandle {
+        id: handle.id,
+        path: handle.path,
+    })
 }
 
 fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let directory = sessions_dir()?;
-    for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
-        let path = directory.join(format!("{session_id}.{extension}"));
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-    // Backward compatibility: pre-isolation sessions were stored at
-    // `.claw/sessions/<id>.{jsonl,json}` without the per-workspace hash
-    // subdirectory. Walk up from `directory` to the `.claw/sessions/` root
-    // and try the flat layout as a fallback so users do not lose access
-    // to their pre-upgrade managed sessions.
-    if let Some(legacy_root) = directory
-        .parent()
-        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
-    {
-        for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
-            let path = legacy_root.join(format!("{session_id}.{extension}"));
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-    }
-    Err(format_missing_session_reference(session_id).into())
-}
-
-fn is_managed_session_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|extension| {
-            extension == PRIMARY_SESSION_EXTENSION || extension == LEGACY_SESSION_EXTENSION
-        })
-}
-
-fn collect_sessions_from_dir(
-    directory: &Path,
-    sessions: &mut Vec<ManagedSessionSummary>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !directory.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !is_managed_session_file(&path) {
-            continue;
-        }
-        let metadata = entry.metadata()?;
-        let modified_epoch_millis = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
-            match Session::load_from_path(&path) {
-                Ok(session) => {
-                    let parent_session_id = session
-                        .fork
-                        .as_ref()
-                        .map(|fork| fork.parent_session_id.clone());
-                    let branch_name = session
-                        .fork
-                        .as_ref()
-                        .and_then(|fork| fork.branch_name.clone());
-                    (
-                        session.session_id,
-                        session.messages.len(),
-                        parent_session_id,
-                        branch_name,
-                    )
-                }
-                Err(_) => (
-                    path.file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    0,
-                    None,
-                    None,
-                ),
-            };
-        sessions.push(ManagedSessionSummary {
-            id,
-            path,
-            modified_epoch_millis,
-            message_count,
-            parent_session_id,
-            branch_name,
-        });
-    }
-    Ok(())
+    current_session_store()?
+        .resolve_managed_path(session_id)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    let mut sessions = Vec::new();
-    let primary_dir = sessions_dir()?;
-    collect_sessions_from_dir(&primary_dir, &mut sessions)?;
-
-    // Backward compatibility: include sessions stored in the pre-isolation
-    // flat `.claw/sessions/` root so users do not lose access to existing
-    // managed sessions after the workspace-hashed subdirectory rollout.
-    if let Some(legacy_root) = primary_dir
-        .parent()
-        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
-    {
-        collect_sessions_from_dir(legacy_root, &mut sessions)?;
-    }
-
-    sessions.sort_by(|left, right| {
-        right
-            .modified_epoch_millis
-            .cmp(&left.modified_epoch_millis)
-            .then_with(|| right.id.cmp(&left.id))
-    });
-    Ok(sessions)
+    Ok(current_session_store()?
+        .list_sessions()
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+        .into_iter()
+        .map(|session| ManagedSessionSummary {
+            id: session.id,
+            path: session.path,
+            modified_epoch_millis: session.modified_epoch_millis,
+            message_count: session.message_count,
+            parent_session_id: session.parent_session_id,
+            branch_name: session.branch_name,
+        })
+        .collect())
 }
 
 fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
-    list_managed_sessions()?
-        .into_iter()
-        .next()
-        .ok_or_else(|| format_no_managed_sessions().into())
+    let session = current_session_store()?
+        .latest_session()
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    Ok(ManagedSessionSummary {
+        id: session.id,
+        path: session.path,
+        modified_epoch_millis: session.modified_epoch_millis,
+        message_count: session.message_count,
+        parent_session_id: session.parent_session_id,
+        branch_name: session.branch_name,
+    })
+}
+
+fn load_session_reference(
+    reference: &str,
+) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
+    let loaded = current_session_store()?
+        .load_session(reference)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    Ok((
+        SessionHandle {
+            id: loaded.handle.id,
+            path: loaded.handle.path,
+        },
+        loaded.session,
+    ))
 }
 
 fn delete_managed_session(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -4961,18 +4850,6 @@ fn confirm_session_deletion(session_id: &str) -> bool {
         return false;
     }
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
-}
-
-fn format_missing_session_reference(reference: &str) -> String {
-    format!(
-        "session not found: {reference}\nHint: managed sessions live in .claw/sessions/. Try `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
-    )
-}
-
-fn format_no_managed_sessions() -> String {
-    format!(
-        "no managed sessions found in .claw/sessions/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
-    )
 }
 
 fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -6161,8 +6038,7 @@ fn run_export(
     output_path: Option<&Path>,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let handle = resolve_session_reference(session_reference)?;
-    let session = Session::load_from_path(&handle.path)?;
+    let (handle, session) = load_session_reference(session_reference)?;
     let markdown = render_session_markdown(&session, &handle.id, &handle.path);
 
     if let Some(path) = output_path {
@@ -10760,6 +10636,7 @@ UU conflicted.rs",
         )
         .expect("session dir should exist");
         Session::new()
+            .with_workspace_root(workspace.clone())
             .with_persistence_path(legacy_path.clone())
             .save_to_path(&legacy_path)
             .expect("legacy session should save");
@@ -10810,6 +10687,53 @@ UU conflicted.rs",
 
         std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn load_session_reference_rejects_workspace_mismatch() {
+        let _guard = cwd_lock().lock().expect("cwd lock");
+        let workspace_a = temp_workspace("session-mismatch-a");
+        let workspace_b = temp_workspace("session-mismatch-b");
+        std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
+        std::fs::create_dir_all(&workspace_b).expect("workspace b should create");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace_b).expect("switch cwd");
+
+        let session_path = workspace_a.join(".claw/sessions/legacy-cross.jsonl");
+        std::fs::create_dir_all(
+            session_path
+                .parent()
+                .expect("session path should have parent directory"),
+        )
+        .expect("session dir should exist");
+        Session::new()
+            .with_workspace_root(workspace_a.clone())
+            .with_persistence_path(session_path.clone())
+            .save_to_path(&session_path)
+            .expect("session should save");
+
+        let error = crate::load_session_reference(&session_path.display().to_string())
+            .expect_err("mismatched workspace should fail");
+        assert!(
+            error.to_string().contains("session workspace mismatch"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&workspace_b.display().to_string()),
+            "expected current workspace in error: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&workspace_a.display().to_string()),
+            "expected originating workspace in error: {error}"
+        );
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        std::fs::remove_dir_all(workspace_a).expect("workspace a should clean up");
+        std::fs::remove_dir_all(workspace_b).expect("workspace b should clean up");
     }
 
     #[test]

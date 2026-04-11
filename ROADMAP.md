@@ -344,7 +344,7 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
     - Forks inherit the parent's workspace root by default; an explicit re-bind is required to move a session to a new worktree, and that re-bind is itself recorded as a structured event so the orchestrator can audit cross-worktree handoffs.
     - Surface a `branch.workspace_mismatch` lane event so clawhip stops counting wrong-CWD writes as lane completions.
 
-    **Status.** A `workspace_root` field has been added to `Session` in `rust/crates/runtime/src/session.rs` (with builder, accessor, JSON + JSONL round-trip, fork inheritance, and given/when/then test coverage in `persists_workspace_root_round_trip_and_forks_inherit_it`). The CWD validation, the namespaced on-disk path, and the `branch.workspace_mismatch` lane event are still outstanding and tracked under this item.
+    **Status.** Done. Managed-session creation/list/latest/load/fork now route through the per-worktree `SessionStore` namespace in runtime + CLI paths, session loads/resumes reject wrong-workspace access with typed `SessionControlError::WorkspaceMismatch` details, `branch.workspace_mismatch` / `workspace_mismatch` are available on the lane-event surface, and same-workspace legacy flat sessions remain readable while mismatched legacy access is blocked. Focused runtime/CLI/tools coverage for the isolation path is green, and `cargo test --workspace --exclude compat-harness` passes. `cargo clippy --workspace --all-targets -- -D warnings` still fails on pre-existing lints in unchanged `rust/crates/rusty-claude-cli/build.rs`, so that lint cleanup remains outside this roadmap item.
 
 ## Deployment Architecture Gap (filed from dogfood 2026-04-08)
 
