@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use plugins::{PluginError, PluginManager, PluginSummary};
+use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
     ScopedMcpServerConfig, Session,
@@ -2210,10 +2210,15 @@ pub fn handle_plugins_slash_command(
     manager: &mut PluginManager,
 ) -> Result<PluginsCommandResult, PluginError> {
     match action {
-        None | Some("list") => Ok(PluginsCommandResult {
-            message: render_plugins_report(&manager.list_installed_plugins()?),
-            reload_runtime: false,
-        }),
+        None | Some("list") => {
+            let report = manager.installed_plugin_registry_report()?;
+            let plugins = report.summaries();
+            let failures = report.failures();
+            Ok(PluginsCommandResult {
+                message: render_plugins_report_with_failures(&plugins, failures),
+                reload_runtime: false,
+            })
+        }
         Some("install") => {
             let Some(target) = target else {
                 return Ok(PluginsCommandResult {
@@ -2664,6 +2669,48 @@ pub fn render_plugins_report(plugins: &[PluginSummary]) -> String {
             version = plugin.metadata.version,
         ));
     }
+    lines.join("\n")
+}
+
+#[must_use]
+pub fn render_plugins_report_with_failures(
+    plugins: &[PluginSummary],
+    failures: &[PluginLoadFailure],
+) -> String {
+    let mut lines = vec!["Plugins".to_string()];
+
+    // Show successfully loaded plugins
+    if plugins.is_empty() {
+        lines.push("  No plugins installed.".to_string());
+    } else {
+        for plugin in plugins {
+            let enabled = if plugin.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            lines.push(format!(
+                "  {name:<20} v{version:<10} {enabled}",
+                name = plugin.metadata.name,
+                version = plugin.metadata.version,
+            ));
+        }
+    }
+
+    // Show warnings for broken plugins
+    if !failures.is_empty() {
+        lines.push("".to_string());
+        lines.push("Warnings:".to_string());
+        for failure in failures {
+            lines.push(format!(
+                "  ⚠️  Failed to load {} plugin from `{}`",
+                failure.kind,
+                failure.plugin_root.display()
+            ));
+            lines.push(format!("      Error: {}", failure.error()));
+        }
+    }
+
     lines.join("\n")
 }
 
