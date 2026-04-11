@@ -4121,12 +4121,15 @@ mod tests {
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
         load_agents_from_roots, load_skills_from_roots, render_agents_report,
         render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
-        render_skills_report, render_slash_command_help, render_slash_command_help_detail,
-        resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
-        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
-        SkillRoot, SkillSlashDispatch, SlashCommand,
+        render_plugins_report_with_failures, render_skills_report, render_slash_command_help,
+        render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
+        slash_command_specs, suggest_slash_commands, validate_slash_command_input,
+        DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
     };
-    use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
+    use plugins::{
+        PluginError, PluginKind, PluginLoadFailure, PluginManager, PluginManagerConfig,
+        PluginMetadata, PluginSummary,
+    };
     use runtime::{
         CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, Session,
     };
@@ -4882,6 +4885,36 @@ mod tests {
         assert!(rendered.contains("sample"));
         assert!(rendered.contains("v0.9.0"));
         assert!(rendered.contains("disabled"));
+    }
+
+    #[test]
+    fn renders_plugins_report_with_broken_plugin_warnings() {
+        let rendered = render_plugins_report_with_failures(
+            &[PluginSummary {
+                metadata: PluginMetadata {
+                    id: "demo@external".to_string(),
+                    name: "demo".to_string(),
+                    version: "1.2.3".to_string(),
+                    description: "demo plugin".to_string(),
+                    kind: PluginKind::External,
+                    source: "demo".to_string(),
+                    default_enabled: false,
+                    root: None,
+                },
+                enabled: true,
+            }],
+            &[PluginLoadFailure::new(
+                PathBuf::from("/tmp/broken-plugin"),
+                PluginKind::External,
+                "broken".to_string(),
+                PluginError::InvalidManifest("hook path `hooks/pre.sh` does not exist".to_string()),
+            )],
+        );
+
+        assert!(rendered.contains("Warnings:"));
+        assert!(rendered.contains("Failed to load external plugin"));
+        assert!(rendered.contains("/tmp/broken-plugin"));
+        assert!(rendered.contains("does not exist"));
     }
 
     #[test]
