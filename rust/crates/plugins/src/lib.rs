@@ -4,7 +4,6 @@ pub mod test_isolation;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

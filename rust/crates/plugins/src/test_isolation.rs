@@ -2,7 +2,6 @@
 // ROADMAP #41: Stop ambient plugin state from skewing CLI regression checks
 
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
