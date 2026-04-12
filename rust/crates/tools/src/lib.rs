@@ -3783,6 +3783,11 @@ fn persist_agent_terminal_state(
 }
 
 const MIN_LANE_SUMMARY_WORDS: usize = 7;
+const REVIEW_VERDICTS: &[(&str, &str)] = &[
+    ("APPROVE", "approve"),
+    ("REJECT", "reject"),
+    ("BLOCKED", "blocked"),
+];
 const CONTROL_ONLY_SUMMARY_WORDS: &[&str] = &[
     "ack",
     "commit",
@@ -3831,6 +3836,12 @@ struct LaneFinishedSummaryData {
     raw_summary: Option<String>,
     #[serde(rename = "wordCount")]
     word_count: usize,
+    #[serde(rename = "reviewVerdict", skip_serializing_if = "Option::is_none")]
+    review_verdict: Option<String>,
+    #[serde(rename = "reviewTarget", skip_serializing_if = "Option::is_none")]
+    review_target: Option<String>,
+    #[serde(rename = "reviewRationale", skip_serializing_if = "Option::is_none")]
+    review_rationale: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3844,6 +3855,13 @@ struct LaneSummaryAssessment {
     apply_quality_floor: bool,
     reasons: Vec<String>,
     word_count: usize,
+    review_outcome: Option<ReviewLaneOutcome>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewLaneOutcome {
+    verdict: String,
+    rationale: Option<String>,
 }
 
 fn build_lane_finished_summary(
@@ -3857,6 +3875,12 @@ fn build_lane_finished_summary(
         Some(summary) => Some(compose_lane_summary_fallback(manifest, Some(summary))),
         None => Some(compose_lane_summary_fallback(manifest, None)),
     };
+    let review_outcome = assessment.review_outcome.clone();
+    let review_target = review_outcome
+        .as_ref()
+        .map(|_| manifest.description.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     LaneFinishedSummary {
         detail,
@@ -3865,6 +3889,11 @@ fn build_lane_finished_summary(
             reasons: assessment.reasons,
             raw_summary: raw_summary.map(str::to_string),
             word_count: assessment.word_count,
+            review_verdict: review_outcome
+                .as_ref()
+                .map(|outcome| outcome.verdict.clone()),
+            review_target,
+            review_rationale: review_outcome.and_then(|outcome| outcome.rationale),
         },
     }
 }
@@ -3882,11 +3911,13 @@ fn assess_lane_summary_quality(summary: &str) -> LaneSummaryAssessment {
         reasons.push(String::from("empty"));
     }
 
+    let review_outcome = extract_review_outcome(summary);
+
     let control_only = !words.is_empty()
         && words
             .iter()
             .all(|word| CONTROL_ONLY_SUMMARY_WORDS.contains(&word.as_str()));
-    if control_only {
+    if control_only && review_outcome.is_none() {
         reasons.push(String::from("control_only"));
     }
 
@@ -3894,6 +3925,7 @@ fn assess_lane_summary_quality(summary: &str) -> LaneSummaryAssessment {
         || summary.contains('/')
         || summary.contains(':')
         || summary.contains('#')
+        || review_outcome.is_some()
         || words
             .iter()
             .any(|word| CONTEXTUAL_SUMMARY_WORDS.contains(&word.as_str()));
@@ -3905,6 +3937,7 @@ fn assess_lane_summary_quality(summary: &str) -> LaneSummaryAssessment {
         apply_quality_floor: !reasons.is_empty(),
         reasons,
         word_count,
+        review_outcome,
     }
 }
 
@@ -3926,6 +3959,24 @@ fn compose_lane_summary_fallback(manifest: &AgentOutput, raw_summary: Option<&st
         ),
         None => format!("{base} No usable stop summary was produced by the lane."),
     }
+}
+
+fn extract_review_outcome(summary: &str) -> Option<ReviewLaneOutcome> {
+    let mut lines = summary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = lines.next()?;
+    let verdict = REVIEW_VERDICTS.iter().find_map(|(prefix, verdict)| {
+        first
+            .eq_ignore_ascii_case(prefix)
+            .then(|| (*verdict).to_string())
+    })?;
+    let rationale = lines.collect::<Vec<_>>().join(" ").trim().to_string();
+    Some(ReviewLaneOutcome {
+        verdict,
+        rationale: (!rationale.is_empty()).then_some(compress_summary_text(&rationale)),
+    })
 }
 
 fn derive_agent_state(
@@ -7520,6 +7571,46 @@ mod tests {
         assert_eq!(
             normalized_manifest_json["laneEvents"][1]["data"]["reasons"][0],
             "control_only"
+        );
+
+        let review = execute_agent_with_spawn(
+            AgentInput {
+                description: "Review commit 1234abcd for ROADMAP #67".to_string(),
+                prompt: "Review the scoped diff".to_string(),
+                subagent_type: Some("Verification".to_string()),
+                name: Some("review-lane".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some("APPROVE\n\nTarget: commit 1234abcd\nRationale: scoped diff is safe."),
+                    None,
+                )
+            },
+        )
+        .expect("review agent should succeed");
+
+        let review_manifest =
+            std::fs::read_to_string(&review.manifest_file).expect("review manifest should exist");
+        let review_manifest_json: serde_json::Value =
+            serde_json::from_str(&review_manifest).expect("review manifest json");
+        assert_eq!(
+            review_manifest_json["laneEvents"][1]["data"]["reviewVerdict"],
+            "approve"
+        );
+        assert_eq!(
+            review_manifest_json["laneEvents"][1]["data"]["reviewTarget"],
+            "Review commit 1234abcd for ROADMAP #67"
+        );
+        assert_eq!(
+            review_manifest_json["laneEvents"][1]["data"]["reviewRationale"],
+            "Target: commit 1234abcd Rationale: scoped diff is safe."
+        );
+        assert_eq!(
+            review_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
+            false
         );
 
         let spawn_error = execute_agent_with_spawn(
