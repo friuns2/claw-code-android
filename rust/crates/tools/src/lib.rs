@@ -3743,12 +3743,13 @@ fn persist_agent_terminal_state(
             .push(LaneEvent::failed(iso8601_now(), &blocker));
     } else {
         next_manifest.current_blocker = None;
-        let compressed_detail = result
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| compress_summary_text(value.trim()));
-        next_manifest
-            .lane_events
-            .push(LaneEvent::finished(iso8601_now(), compressed_detail));
+        let finished_summary = build_lane_finished_summary(&next_manifest, result);
+        next_manifest.lane_events.push(
+            LaneEvent::finished(iso8601_now(), finished_summary.detail).with_data(
+                serde_json::to_value(&finished_summary.data)
+                    .expect("lane summary metadata should serialize"),
+            ),
+        );
         if let Some(provenance) = maybe_commit_provenance(result) {
             next_manifest.lane_events.push(LaneEvent::commit_created(
                 iso8601_now(),
@@ -3758,6 +3759,152 @@ fn persist_agent_terminal_state(
         }
     }
     write_agent_manifest(&next_manifest)
+}
+
+const MIN_LANE_SUMMARY_WORDS: usize = 7;
+const CONTROL_ONLY_SUMMARY_WORDS: &[&str] = &[
+    "ack",
+    "commit",
+    "continue",
+    "everyting",
+    "everything",
+    "keep",
+    "next",
+    "push",
+    "ralph",
+    "resume",
+    "retry",
+    "run",
+    "stop",
+    "sweep",
+    "sweeping",
+    "team",
+];
+const CONTEXTUAL_SUMMARY_WORDS: &[&str] = &[
+    "added",
+    "audited",
+    "blocked",
+    "completed",
+    "documented",
+    "failed",
+    "finished",
+    "fixed",
+    "implemented",
+    "investigated",
+    "merged",
+    "pushed",
+    "refactored",
+    "removed",
+    "reviewed",
+    "tested",
+    "updated",
+    "verified",
+];
+
+#[derive(Debug, Clone, Serialize)]
+struct LaneFinishedSummaryData {
+    #[serde(rename = "qualityFloorApplied")]
+    quality_floor_applied: bool,
+    reasons: Vec<String>,
+    #[serde(rename = "rawSummary", skip_serializing_if = "Option::is_none")]
+    raw_summary: Option<String>,
+    #[serde(rename = "wordCount")]
+    word_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LaneFinishedSummary {
+    detail: Option<String>,
+    data: LaneFinishedSummaryData,
+}
+
+#[derive(Debug)]
+struct LaneSummaryAssessment {
+    apply_quality_floor: bool,
+    reasons: Vec<String>,
+    word_count: usize,
+}
+
+fn build_lane_finished_summary(
+    manifest: &AgentOutput,
+    result: Option<&str>,
+) -> LaneFinishedSummary {
+    let raw_summary = result.map(str::trim).filter(|value| !value.is_empty());
+    let assessment = assess_lane_summary_quality(raw_summary.unwrap_or_default());
+    let detail = match raw_summary {
+        Some(summary) if !assessment.apply_quality_floor => Some(compress_summary_text(summary)),
+        Some(summary) => Some(compose_lane_summary_fallback(manifest, Some(summary))),
+        None => Some(compose_lane_summary_fallback(manifest, None)),
+    };
+
+    LaneFinishedSummary {
+        detail,
+        data: LaneFinishedSummaryData {
+            quality_floor_applied: raw_summary.is_none() || assessment.apply_quality_floor,
+            reasons: assessment.reasons,
+            raw_summary: raw_summary.map(str::to_string),
+            word_count: assessment.word_count,
+        },
+    }
+}
+
+fn assess_lane_summary_quality(summary: &str) -> LaneSummaryAssessment {
+    let words = summary
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '#'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    let word_count = words.len();
+    let mut reasons = Vec::new();
+    if summary.trim().is_empty() {
+        reasons.push(String::from("empty"));
+    }
+
+    let control_only = !words.is_empty()
+        && words
+            .iter()
+            .all(|word| CONTROL_ONLY_SUMMARY_WORDS.contains(&word.as_str()));
+    if control_only {
+        reasons.push(String::from("control_only"));
+    }
+
+    let has_context_signal = summary.contains('`')
+        || summary.contains('/')
+        || summary.contains(':')
+        || summary.contains('#')
+        || words
+            .iter()
+            .any(|word| CONTEXTUAL_SUMMARY_WORDS.contains(&word.as_str()));
+    if word_count < MIN_LANE_SUMMARY_WORDS && !has_context_signal {
+        reasons.push(String::from("too_short_without_context"));
+    }
+
+    LaneSummaryAssessment {
+        apply_quality_floor: !reasons.is_empty(),
+        reasons,
+        word_count,
+    }
+}
+
+fn compose_lane_summary_fallback(manifest: &AgentOutput, raw_summary: Option<&str>) -> String {
+    let target = manifest.description.trim();
+    let base = format!(
+        "Completed lane `{}` for target: {}. Status: completed.",
+        manifest.name,
+        if target.is_empty() {
+            "unspecified task"
+        } else {
+            target
+        }
+    );
+    match raw_summary {
+        Some(summary) => format!(
+            "{base} Original stop summary was too vague to keep as the lane result: \"{}\".",
+            summary.trim()
+        ),
+        None => format!("{base} No usable stop summary was produced by the lane."),
+    }
 }
 
 fn derive_agent_state(
@@ -7241,6 +7388,14 @@ mod tests {
             "lane.finished"
         );
         assert_eq!(
+            completed_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
+            false
+        );
+        assert_eq!(
+            completed_manifest_json["laneEvents"][1]["detail"],
+            "Finished successfully in commit abc1234"
+        );
+        assert_eq!(
             completed_manifest_json["laneEvents"][2]["event"],
             "lane.commit.created"
         );
@@ -7300,6 +7455,51 @@ mod tests {
             "tool_runtime"
         );
         assert_eq!(failed_manifest_json["derivedState"], "truly_idle");
+
+        let normalized = execute_agent_with_spawn(
+            AgentInput {
+                description: "Sweep the next backlog item".to_string(),
+                prompt: "Produce a low-signal stop summary".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("summary-floor".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some("commit push everyting, keep sweeping $ralph"),
+                    None,
+                )
+            },
+        )
+        .expect("normalized agent should succeed");
+
+        let normalized_manifest = std::fs::read_to_string(&normalized.manifest_file)
+            .expect("normalized manifest should exist");
+        let normalized_manifest_json: serde_json::Value =
+            serde_json::from_str(&normalized_manifest).expect("normalized manifest json");
+        assert_eq!(
+            normalized_manifest_json["laneEvents"][1]["event"],
+            "lane.finished"
+        );
+        let normalized_detail = normalized_manifest_json["laneEvents"][1]["detail"]
+            .as_str()
+            .expect("normalized detail");
+        assert!(normalized_detail.contains("Completed lane `summary-floor`"));
+        assert!(normalized_detail.contains("Sweep the next backlog item"));
+        assert_eq!(
+            normalized_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
+            true
+        );
+        assert_eq!(
+            normalized_manifest_json["laneEvents"][1]["data"]["rawSummary"],
+            "commit push everyting, keep sweeping $ralph"
+        );
+        assert_eq!(
+            normalized_manifest_json["laneEvents"][1]["data"]["reasons"][0],
+            "control_only"
+        );
 
         let spawn_error = execute_agent_with_spawn(
             AgentInput {

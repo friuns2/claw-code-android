@@ -78,6 +78,9 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
+const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
+const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
+const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
@@ -1477,6 +1480,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         checks: vec![
             check_auth_health(),
             check_config_health(&config_loader, config.as_ref()),
+            check_install_source_health(),
             check_workspace_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_system_health(&cwd, config.as_ref().ok()),
@@ -1762,6 +1766,36 @@ fn check_config_health(
             ("load_error".to_string(), json!(error.to_string())),
         ])),
     }
+}
+
+fn check_install_source_health() -> DiagnosticCheck {
+    DiagnosticCheck::new(
+        "Install source",
+        DiagnosticLevel::Ok,
+        format!(
+            "official source of truth is {OFFICIAL_REPO_SLUG}; avoid `{DEPRECATED_INSTALL_COMMAND}`"
+        ),
+    )
+    .with_details(vec![
+        format!("Official repo     {OFFICIAL_REPO_URL}"),
+        "Recommended path  build from this repo or use the upstream binary documented in README.md"
+            .to_string(),
+        format!(
+            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `claw` binary"
+        )
+            .to_string(),
+    ])
+    .with_data(Map::from_iter([
+        ("official_repo".to_string(), json!(OFFICIAL_REPO_URL)),
+        (
+            "deprecated_install".to_string(),
+            json!(DEPRECATED_INSTALL_COMMAND),
+        ),
+        (
+            "recommended_install".to_string(),
+            json!("build from source or follow the upstream binary instructions in README.md"),
+        ),
+    ]))
 }
 
 fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
@@ -8111,6 +8145,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
+    writeln!(
+        out,
+        "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
+    )?;
     writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
@@ -8200,6 +8239,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
     writeln!(out, "  claw doctor")?;
+    writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
+    writeln!(
+        out,
+        "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
+    )?;
     writeln!(out, "  claw init")?;
     writeln!(out, "  claw export")?;
     writeln!(out, "  claw export conversation.md")?;
@@ -10082,6 +10126,8 @@ mod tests {
         assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));
         assert!(help.contains("claw /skills"));
+        assert!(help.contains("ultraworkers/claw-code"));
+        assert!(help.contains("cargo install claw-code"));
         assert!(!help.contains("claw login"));
         assert!(!help.contains("claw logout"));
     }
