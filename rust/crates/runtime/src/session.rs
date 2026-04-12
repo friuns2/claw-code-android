@@ -13,6 +13,7 @@ const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LAST_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Speaker role associated with a persisted conversation message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1030,10 +1031,27 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 }
 
 fn current_time_millis() -> u64 {
-    SystemTime::now()
+    let wall_clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    let mut candidate = wall_clock;
+    loop {
+        let previous = LAST_TIMESTAMP_MS.load(Ordering::Relaxed);
+        if candidate <= previous {
+            candidate = previous.saturating_add(1);
+        }
+        match LAST_TIMESTAMP_MS.compare_exchange(
+            previous,
+            candidate,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return candidate,
+            Err(actual) => candidate = actual.saturating_add(1),
+        }
+    }
 }
 
 fn generate_session_id() -> String {
@@ -1125,14 +1143,24 @@ fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_rotated_logs, rotate_session_file_if_needed, ContentBlock, ConversationMessage,
-        MessageRole, Session, SessionFork,
+        cleanup_rotated_logs, current_time_millis, rotate_session_file_if_needed, ContentBlock,
+        ConversationMessage, MessageRole, Session, SessionFork,
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn session_timestamps_are_monotonic_under_tight_loops() {
+        let first = current_time_millis();
+        let second = current_time_millis();
+        let third = current_time_millis();
+
+        assert!(first < second);
+        assert!(second < third);
+    }
 
     #[test]
     fn persists_and_restores_session_jsonl() {

@@ -3,8 +3,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::ContentBlock;
@@ -193,7 +191,6 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     older
         .save_to_path(&older_path)
         .expect("older session should persist");
-    thread::sleep(Duration::from_millis(2));
 
     let mut newer = workspace_session(&project_dir).with_persistence_path(&newer_path);
     newer
