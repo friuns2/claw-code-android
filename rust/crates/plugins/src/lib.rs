@@ -2294,12 +2294,30 @@ fn env_lock() -> &'static std::sync::Mutex<()> {
 mod tests {
     use super::*;
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("plugins-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn env_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = env_guard();
+            panic!("poison env lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = env_guard();
     }
 
     fn write_file(path: &Path, contents: &str) {
@@ -2485,7 +2503,7 @@ mod tests {
 
     #[test]
     fn load_plugin_from_directory_validates_required_fields() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let root = temp_dir("manifest-required");
         write_file(
             root.join(MANIFEST_FILE_NAME).as_path(),
@@ -2500,7 +2518,7 @@ mod tests {
 
     #[test]
     fn load_plugin_from_directory_reads_root_manifest_and_validates_entries() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let root = temp_dir("manifest-root");
         write_loader_plugin(&root);
 
@@ -2530,7 +2548,7 @@ mod tests {
 
     #[test]
     fn load_plugin_from_directory_supports_packaged_manifest_path() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let root = temp_dir("manifest-packaged");
         write_external_plugin(&root, "packaged-demo", "1.0.0");
 
@@ -2544,7 +2562,7 @@ mod tests {
 
     #[test]
     fn load_plugin_from_directory_defaults_optional_fields() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let root = temp_dir("manifest-defaults");
         write_file(
             root.join(MANIFEST_FILE_NAME).as_path(),
@@ -2566,7 +2584,7 @@ mod tests {
 
     #[test]
     fn load_plugin_from_directory_rejects_duplicate_permissions_and_commands() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let root = temp_dir("manifest-duplicates");
         write_file(
             root.join("commands").join("sync.sh").as_path(),
@@ -2862,7 +2880,7 @@ mod tests {
 
     #[test]
     fn discovers_builtin_and_bundled_plugins() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let manager = PluginManager::new(PluginManagerConfig::new(temp_dir("discover")));
         let plugins = manager.list_plugins().expect("plugins should list");
         assert!(plugins
@@ -2875,7 +2893,7 @@ mod tests {
 
     #[test]
     fn installs_enables_updates_and_uninstalls_external_plugins() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("home");
         let source_root = temp_dir("source");
         write_external_plugin(&source_root, "demo", "1.0.0");
@@ -2924,7 +2942,7 @@ mod tests {
 
     #[test]
     fn auto_installs_bundled_plugins_into_the_registry() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("bundled-home");
         let bundled_root = temp_dir("bundled-root");
         write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", false);
@@ -2956,7 +2974,7 @@ mod tests {
 
     #[test]
     fn default_bundled_root_loads_repo_bundles_as_installed_plugins() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("default-bundled-home");
         let manager = PluginManager::new(PluginManagerConfig::new(&config_home));
 
@@ -2975,7 +2993,7 @@ mod tests {
 
     #[test]
     fn bundled_sync_prunes_removed_bundled_registry_entries() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("bundled-prune-home");
         let bundled_root = temp_dir("bundled-prune-root");
         let stale_install_path = config_home
@@ -3039,7 +3057,7 @@ mod tests {
 
     #[test]
     fn installed_plugin_discovery_keeps_registry_entries_outside_install_root() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("registry-fallback-home");
         let bundled_root = temp_dir("registry-fallback-bundled");
         let install_root = config_home.join("plugins").join("installed");
@@ -3094,7 +3112,7 @@ mod tests {
 
     #[test]
     fn installed_plugin_discovery_prunes_stale_registry_entries() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("registry-prune-home");
         let bundled_root = temp_dir("registry-prune-bundled");
         let install_root = config_home.join("plugins").join("installed");
@@ -3140,7 +3158,7 @@ mod tests {
 
     #[test]
     fn persists_bundled_plugin_enable_state_across_reloads() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("bundled-state-home");
         let bundled_root = temp_dir("bundled-state-root");
         write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", false);
@@ -3174,7 +3192,7 @@ mod tests {
 
     #[test]
     fn persists_bundled_plugin_disable_state_across_reloads() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("bundled-disabled-home");
         let bundled_root = temp_dir("bundled-disabled-root");
         write_bundled_plugin(&bundled_root.join("starter"), "starter", "0.1.0", true);
@@ -3208,7 +3226,7 @@ mod tests {
 
     #[test]
     fn validates_plugin_source_before_install() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("validate-home");
         let source_root = temp_dir("validate-source");
         write_external_plugin(&source_root, "validator", "1.0.0");
@@ -3223,7 +3241,7 @@ mod tests {
 
     #[test]
     fn plugin_registry_tracks_enabled_state_and_lookup() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("registry-home");
         let source_root = temp_dir("registry-source");
         write_external_plugin(&source_root, "registry-demo", "1.0.0");
@@ -3251,7 +3269,7 @@ mod tests {
 
     #[test]
     fn plugin_registry_report_collects_load_failures_without_dropping_valid_plugins() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         // given
         let config_home = temp_dir("report-home");
         let external_root = temp_dir("report-external");
@@ -3296,7 +3314,7 @@ mod tests {
 
     #[test]
     fn installed_plugin_registry_report_collects_load_failures_from_install_root() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         // given
         let config_home = temp_dir("installed-report-home");
         let bundled_root = temp_dir("installed-report-bundled");
@@ -3327,7 +3345,7 @@ mod tests {
 
     #[test]
     fn rejects_plugin_sources_with_missing_hook_paths() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         // given
         let config_home = temp_dir("broken-home");
         let source_root = temp_dir("broken-source");
@@ -3355,7 +3373,7 @@ mod tests {
 
     #[test]
     fn rejects_plugin_sources_with_missing_failure_hook_paths() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         // given
         let config_home = temp_dir("broken-failure-home");
         let source_root = temp_dir("broken-failure-source");
@@ -3383,7 +3401,7 @@ mod tests {
 
     #[test]
     fn plugin_registry_runs_initialize_and_shutdown_for_enabled_plugins() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("lifecycle-home");
         let source_root = temp_dir("lifecycle-source");
         let _ = write_lifecycle_plugin(&source_root, "lifecycle-demo", "1.0.0");
@@ -3407,7 +3425,7 @@ mod tests {
 
     #[test]
     fn aggregates_and_executes_plugin_tools() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("tool-home");
         let source_root = temp_dir("tool-source");
         write_tool_plugin(&source_root, "tool-demo", "1.0.0");
@@ -3436,7 +3454,7 @@ mod tests {
 
     #[test]
     fn list_installed_plugins_scans_install_root_without_registry_entries() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("installed-scan-home");
         let bundled_root = temp_dir("installed-scan-bundled");
         let install_root = config_home.join("plugins").join("installed");
@@ -3468,7 +3486,7 @@ mod tests {
 
     #[test]
     fn list_installed_plugins_scans_packaged_manifests_in_install_root() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let config_home = temp_dir("installed-packaged-scan-home");
         let bundled_root = temp_dir("installed-packaged-scan-bundled");
         let install_root = config_home.join("plugins").join("installed");
@@ -3502,7 +3520,7 @@ mod tests {
     /// host `~/.claw/plugins/` from bleeding into test runs.
     #[test]
     fn claw_config_home_isolation_prevents_host_plugin_leakage() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
 
         // Create a temp directory to act as our isolated CLAW_CONFIG_HOME
         let config_home = temp_dir("isolated-home");
@@ -3556,7 +3574,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
 
         // Shared base directory for all threads
         let base_dir = temp_dir("parallel-base");

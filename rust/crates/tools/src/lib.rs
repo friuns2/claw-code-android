@@ -6047,6 +6047,24 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn env_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = env_guard();
+            panic!("poison env lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = env_guard();
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7167,7 +7185,7 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let home = temp_path("skills-home");
         let skill_dir = home.join(".agents").join("skills").join("help");
         fs::create_dir_all(&skill_dir).expect("skill dir should exist");
@@ -7224,7 +7242,7 @@ mod tests {
 
     #[test]
     fn skill_resolves_project_local_skills_and_legacy_commands() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("project-skills");
         let skill_dir = root.join(".claw").join("skills").join("plan");
         let command_dir = root.join(".claw").join("commands");
@@ -7268,7 +7286,7 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_claude_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("project-skills");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -7319,7 +7337,7 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_omc_and_agents_skill_prompts() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("project-omc-skills");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -7389,7 +7407,7 @@ mod tests {
 
     #[test]
     fn skill_loads_learned_skill_from_claude_config_dir() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("claude-config-learned-skill");
         let home = root.join("home");
         let claude_config_dir = root.join("claude-config");
@@ -7444,7 +7462,7 @@ mod tests {
 
     #[test]
     fn skill_loads_direct_skill_and_legacy_command_from_claude_config_dir() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("claude-config-direct-skill");
         let home = root.join("home");
         let claude_config_dir = root.join("claude-config");
@@ -7516,7 +7534,7 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_legacy_command_markdown() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("project-legacy-command");
         let home = root.join("home");
         let workspace = root.join("workspace");

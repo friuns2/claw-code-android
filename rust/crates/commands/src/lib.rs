@@ -4152,6 +4152,24 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn env_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = env_guard();
+            panic!("poison env lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = env_guard();
+    }
+
     fn restore_env_var(key: &str, original: Option<OsString>) {
         match original {
             Some(value) => std::env::set_var(key, value),
@@ -5214,7 +5232,7 @@ mod tests {
 
     #[test]
     fn discovers_omc_skills_from_project_and_user_compatibility_roots() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_guard();
         let workspace = temp_dir("skills-omc-workspace");
         let user_home = temp_dir("skills-omc-home");
         let claude_config_dir = temp_dir("skills-omc-claude-config");

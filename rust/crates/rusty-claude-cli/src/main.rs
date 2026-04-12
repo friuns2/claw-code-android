@@ -10534,7 +10534,7 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_guard();
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -10573,7 +10573,7 @@ UU conflicted.rs",
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_guard();
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -10606,7 +10606,7 @@ UU conflicted.rs",
 
     #[test]
     fn load_session_reference_rejects_workspace_mismatch() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_guard();
         let workspace_a = temp_workspace("session-mismatch-a");
         let workspace_b = temp_workspace("session-mismatch-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
@@ -10678,6 +10678,24 @@ UU conflicted.rs",
     fn cwd_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn cwd_guard() -> MutexGuard<'static, ()> {
+        cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn cwd_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = cwd_guard();
+            panic!("poison cwd lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = cwd_guard();
     }
 
     fn temp_workspace(label: &str) -> PathBuf {
