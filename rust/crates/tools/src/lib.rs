@@ -3842,6 +3842,8 @@ struct LaneFinishedSummaryData {
     review_target: Option<String>,
     #[serde(rename = "reviewRationale", skip_serializing_if = "Option::is_none")]
     review_rationale: Option<String>,
+    #[serde(rename = "selectionOutcome", skip_serializing_if = "Option::is_none")]
+    selection_outcome: Option<SelectionOutcome>,
 }
 
 #[derive(Debug, Clone)]
@@ -3861,6 +3863,17 @@ struct LaneSummaryAssessment {
 #[derive(Debug, Clone)]
 struct ReviewLaneOutcome {
     verdict: String,
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SelectionOutcome {
+    #[serde(rename = "chosenItems", skip_serializing_if = "Vec::is_empty")]
+    chosen_items: Vec<String>,
+    #[serde(rename = "skippedItems", skip_serializing_if = "Vec::is_empty")]
+    skipped_items: Vec<String>,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     rationale: Option<String>,
 }
 
@@ -3894,6 +3907,7 @@ fn build_lane_finished_summary(
                 .map(|outcome| outcome.verdict.clone()),
             review_target,
             review_rationale: review_outcome.and_then(|outcome| outcome.rationale),
+            selection_outcome: extract_selection_outcome(raw_summary.unwrap_or_default()),
         },
     }
 }
@@ -3977,6 +3991,97 @@ fn extract_review_outcome(summary: &str) -> Option<ReviewLaneOutcome> {
         verdict,
         rationale: (!rationale.is_empty()).then_some(compress_summary_text(&rationale)),
     })
+}
+
+fn extract_selection_outcome(summary: &str) -> Option<SelectionOutcome> {
+    let mut chosen_items = Vec::new();
+    let mut skipped_items = Vec::new();
+    let mut action = None;
+    let mut rationale = None;
+
+    for line in summary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let lowered = line.to_ascii_lowercase();
+        let roadmap_items = extract_roadmap_items(line);
+
+        if lowered.starts_with("chosen:")
+            || lowered.starts_with("picked:")
+            || lowered.starts_with("selected:")
+            || (lowered.contains("picked") && !roadmap_items.is_empty())
+            || (lowered.contains("selected") && !roadmap_items.is_empty())
+        {
+            chosen_items.extend(roadmap_items);
+        } else if lowered.starts_with("skipped:")
+            || lowered.starts_with("skip:")
+            || (lowered.contains("skipped") && !roadmap_items.is_empty())
+        {
+            skipped_items.extend(roadmap_items);
+        }
+
+        if let Some(rest) = lowered.strip_prefix("action:") {
+            if rest.contains("execute") || rest.contains("implement") || rest.contains("fix") {
+                action = Some(String::from("execute"));
+            } else if rest.contains("review") || rest.contains("audit") {
+                action = Some(String::from("review"));
+            } else if rest.contains("no-op") || rest.contains("noop") {
+                action = Some(String::from("no-op"));
+            }
+        }
+
+        if let Some(rest) = line.strip_prefix("Rationale:") {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                rationale = Some(compress_summary_text(trimmed));
+            }
+        }
+    }
+
+    chosen_items.sort();
+    chosen_items.dedup();
+    skipped_items.sort();
+    skipped_items.dedup();
+
+    if chosen_items.is_empty() && skipped_items.is_empty() && action.is_none() {
+        return None;
+    }
+
+    let default_action = if chosen_items.is_empty() {
+        String::from("no-op")
+    } else {
+        String::from("execute")
+    };
+
+    Some(SelectionOutcome {
+        chosen_items,
+        skipped_items,
+        action: action.unwrap_or(default_action),
+        rationale,
+    })
+}
+
+fn extract_roadmap_items(line: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '#' {
+            let mut digits = String::new();
+            while let Some(next) = chars.peek() {
+                if next.is_ascii_digit() {
+                    digits.push(*next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !digits.is_empty() {
+                items.push(format!("ROADMAP #{digits}"));
+            }
+        }
+    }
+    items
 }
 
 fn derive_agent_state(
@@ -7611,6 +7716,52 @@ mod tests {
         assert_eq!(
             review_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
             false
+        );
+
+        let selection = execute_agent_with_spawn(
+            AgentInput {
+                description: "Scan ROADMAP Immediate Backlog for the next repo-local item".to_string(),
+                prompt: "Choose the next backlog target".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("backlog-scan".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some(
+                        "Selected next backlog target.\nChosen: ROADMAP #65\nSkipped: ROADMAP #63, ROADMAP #64\nAction: execute\nRationale: #65 is the next repo-local lane-finished metadata task.",
+                    ),
+                    None,
+                )
+            },
+        )
+        .expect("selection agent should succeed");
+
+        let selection_manifest = std::fs::read_to_string(&selection.manifest_file)
+            .expect("selection manifest should exist");
+        let selection_manifest_json: serde_json::Value =
+            serde_json::from_str(&selection_manifest).expect("selection manifest json");
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["chosenItems"][0],
+            "ROADMAP #65"
+        );
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["skippedItems"][0],
+            "ROADMAP #63"
+        );
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["skippedItems"][1],
+            "ROADMAP #64"
+        );
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["action"],
+            "execute"
+        );
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["rationale"],
+            "#65 is the next repo-local lane-finished metadata task."
         );
 
         let spawn_error = execute_agent_with_spawn(
