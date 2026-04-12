@@ -144,12 +144,7 @@ impl SessionStore {
         if let Some(legacy_root) = self.legacy_sessions_root() {
             self.collect_sessions_from_dir(&legacy_root, &mut sessions)?;
         }
-        sessions.sort_by(|left, right| {
-            right
-                .modified_epoch_millis
-                .cmp(&left.modified_epoch_millis)
-                .then_with(|| right.id.cmp(&left.id))
-        });
+        sort_managed_sessions(&mut sessions);
         Ok(sessions)
     }
 
@@ -260,6 +255,7 @@ impl SessionStore {
                     ManagedSessionSummary {
                         id: session.session_id,
                         path,
+                        updated_at_ms: session.updated_at_ms,
                         modified_epoch_millis,
                         message_count: session.messages.len(),
                         parent_session_id: session
@@ -279,6 +275,7 @@ impl SessionStore {
                         .unwrap_or("unknown")
                         .to_string(),
                     path,
+                    updated_at_ms: 0,
                     modified_epoch_millis,
                     message_count: 0,
                     parent_session_id: None,
@@ -322,10 +319,21 @@ pub struct SessionHandle {
 pub struct ManagedSessionSummary {
     pub id: String,
     pub path: PathBuf,
+    pub updated_at_ms: u64,
     pub modified_epoch_millis: u128,
     pub message_count: usize,
     pub parent_session_id: Option<String>,
     pub branch_name: Option<String>,
+}
+
+fn sort_managed_sessions(sessions: &mut [ManagedSessionSummary]) {
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.modified_epoch_millis.cmp(&left.modified_epoch_millis))
+            .then_with(|| right.id.cmp(&left.id))
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,6 +604,35 @@ mod tests {
             .iter()
             .find(|summary| summary.id == id)
             .expect("session summary should exist")
+    }
+
+    #[test]
+    fn latest_session_prefers_semantic_updated_at_over_file_mtime() {
+        let mut sessions = vec![
+            ManagedSessionSummary {
+                id: "older-file-newer-session".to_string(),
+                path: PathBuf::from("/tmp/older"),
+                updated_at_ms: 200,
+                modified_epoch_millis: 100,
+                message_count: 2,
+                parent_session_id: None,
+                branch_name: None,
+            },
+            ManagedSessionSummary {
+                id: "newer-file-older-session".to_string(),
+                path: PathBuf::from("/tmp/newer"),
+                updated_at_ms: 100,
+                modified_epoch_millis: 200,
+                message_count: 1,
+                parent_session_id: None,
+                branch_name: None,
+            },
+        ];
+
+        crate::session_control::sort_managed_sessions(&mut sessions);
+
+        assert_eq!(sessions[0].id, "older-file-newer-session");
+        assert_eq!(sessions[1].id, "newer-file-older-session");
     }
 
     #[test]

@@ -3122,6 +3122,7 @@ struct SessionHandle {
 struct ManagedSessionSummary {
     id: String,
     path: PathBuf,
+    updated_at_ms: u64,
     modified_epoch_millis: u128,
     message_count: usize,
     parent_session_id: Option<String>,
@@ -4711,6 +4712,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
         .map(|session| ManagedSessionSummary {
             id: session.id,
             path: session.path,
+            updated_at_ms: session.updated_at_ms,
             modified_epoch_millis: session.modified_epoch_millis,
             message_count: session.message_count,
             parent_session_id: session.parent_session_id,
@@ -4726,6 +4728,7 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
     Ok(ManagedSessionSummary {
         id: session.id,
         path: session.path,
+        updated_at_ms: session.updated_at_ms,
         modified_epoch_millis: session.modified_epoch_millis,
         message_count: session.message_count,
         parent_session_id: session.parent_session_id,
