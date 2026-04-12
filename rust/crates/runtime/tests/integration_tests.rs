@@ -304,7 +304,7 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
         .observe(&worker.worker_id, "Ready for your input\n>")
         .expect("ready observe should succeed");
     registry
-        .send_prompt(&worker.worker_id, Some("Run analysis"))
+        .send_prompt(&worker.worker_id, Some("Run analysis"), None)
         .expect("prompt send should succeed");
 
     // Session completes with provider failure (finish="unknown", tokens=0)
