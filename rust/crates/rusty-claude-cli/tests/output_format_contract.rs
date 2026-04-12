@@ -174,13 +174,15 @@ fn dump_manifests_and_init_emit_json_when_requested() {
     fs::create_dir_all(&root).expect("temp dir should exist");
 
     let upstream = write_upstream_fixture(&root);
-    let manifests = assert_json_command_with_env(
+    let manifests = assert_json_command(
         &root,
-        &["--output-format", "json", "dump-manifests"],
-        &[(
-            "CLAUDE_CODE_UPSTREAM",
+        &[
+            "--output-format",
+            "json",
+            "dump-manifests",
+            "--manifests-dir",
             upstream.to_str().expect("utf8 upstream"),
-        )],
+        ],
     );
     assert_eq!(manifests["kind"], "dump-manifests");
     assert_eq!(manifests["commands"], 1);
