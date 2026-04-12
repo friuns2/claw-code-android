@@ -3845,6 +3845,8 @@ struct LaneFinishedSummaryData {
     review_rationale: Option<String>,
     #[serde(rename = "selectionOutcome", skip_serializing_if = "Option::is_none")]
     selection_outcome: Option<SelectionOutcome>,
+    #[serde(rename = "recoveryOutcome", skip_serializing_if = "Option::is_none")]
+    recovery_outcome: Option<RecoveryOutcome>,
     #[serde(rename = "artifactProvenance", skip_serializing_if = "Option::is_none")]
     artifact_provenance: Option<ArtifactProvenance>,
     #[serde(rename = "disabledCronIds", skip_serializing_if = "Vec::is_empty")]
@@ -3863,6 +3865,7 @@ struct LaneSummaryAssessment {
     reasons: Vec<String>,
     word_count: usize,
     review_outcome: Option<ReviewLaneOutcome>,
+    recovery_outcome: Option<RecoveryOutcome>,
 }
 
 #[derive(Debug, Clone)]
@@ -3880,6 +3883,15 @@ struct SelectionOutcome {
     action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecoveryOutcome {
+    cause: String,
+    #[serde(rename = "targetLane", skip_serializing_if = "Option::is_none")]
+    target_lane: Option<String>,
+    #[serde(rename = "preservedState", skip_serializing_if = "Option::is_none")]
+    preserved_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3906,10 +3918,15 @@ fn build_lane_finished_summary(
     let assessment = assess_lane_summary_quality(raw_summary.unwrap_or_default());
     let detail = match raw_summary {
         Some(summary) if !assessment.apply_quality_floor => Some(compress_summary_text(summary)),
-        Some(summary) => Some(compose_lane_summary_fallback(manifest, Some(summary))),
-        None => Some(compose_lane_summary_fallback(manifest, None)),
+        Some(summary) => Some(compose_lane_summary_fallback(
+            manifest,
+            Some(summary),
+            assessment.recovery_outcome.as_ref(),
+        )),
+        None => Some(compose_lane_summary_fallback(manifest, None, None)),
     };
     let review_outcome = assessment.review_outcome.clone();
+    let recovery_outcome = assessment.recovery_outcome.clone();
     let review_target = review_outcome
         .as_ref()
         .map(|_| manifest.description.trim())
@@ -3930,6 +3947,7 @@ fn build_lane_finished_summary(
             review_target,
             review_rationale: review_outcome.and_then(|outcome| outcome.rationale),
             selection_outcome: extract_selection_outcome(raw_summary.unwrap_or_default()),
+            recovery_outcome,
             artifact_provenance,
             disabled_cron_ids: Vec::new(),
         },
@@ -3950,6 +3968,10 @@ fn assess_lane_summary_quality(summary: &str) -> LaneSummaryAssessment {
     }
 
     let review_outcome = extract_review_outcome(summary);
+    let recovery_outcome = extract_recovery_outcome(summary);
+    if recovery_outcome.is_some() {
+        reasons.push(String::from("recovery_control_prose"));
+    }
 
     let control_only = !words.is_empty()
         && words
@@ -3976,10 +3998,15 @@ fn assess_lane_summary_quality(summary: &str) -> LaneSummaryAssessment {
         reasons,
         word_count,
         review_outcome,
+        recovery_outcome,
     }
 }
 
-fn compose_lane_summary_fallback(manifest: &AgentOutput, raw_summary: Option<&str>) -> String {
+fn compose_lane_summary_fallback(
+    manifest: &AgentOutput,
+    raw_summary: Option<&str>,
+    recovery_outcome: Option<&RecoveryOutcome>,
+) -> String {
     let target = manifest.description.trim();
     let base = format!(
         "Completed lane `{}` for target: {}. Status: completed.",
@@ -3990,6 +4017,25 @@ fn compose_lane_summary_fallback(manifest: &AgentOutput, raw_summary: Option<&st
             target
         }
     );
+    if let Some(outcome) = recovery_outcome {
+        let mut detail = format!(
+            "{base} Recovery handoff observed via tmux reinjection (cause: `{}`).",
+            outcome.cause
+        );
+        if let Some(target_lane) = &outcome.target_lane {
+            let _ = std::fmt::Write::write_fmt(
+                &mut detail,
+                format_args!(" Target lane: `{target_lane}`."),
+            );
+        }
+        if let Some(preserved_state) = &outcome.preserved_state {
+            let _ = std::fmt::Write::write_fmt(
+                &mut detail,
+                format_args!(" Preserved state: {preserved_state}."),
+            );
+        }
+        return detail;
+    }
     match raw_summary {
         Some(summary) => format!(
             "{base} Original stop summary was too vague to keep as the lane result: \"{}\".",
@@ -4083,6 +4129,59 @@ fn extract_selection_outcome(summary: &str) -> Option<SelectionOutcome> {
         skipped_items,
         action: action.unwrap_or(default_action),
         rationale,
+    })
+}
+
+fn extract_recovery_outcome(summary: &str) -> Option<RecoveryOutcome> {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    let has_tmux_inject_marker = lowered.contains("omx_tmux_inject");
+    let has_recovery_phrase = lowered.contains("continue from current mode state")
+        || (lowered.starts_with("team ") && lowered.contains(" next:"));
+    if !has_tmux_inject_marker && !has_recovery_phrase {
+        return None;
+    }
+
+    let cause = if lowered.contains("current mode state") {
+        "resume_after_stop"
+    } else if lowered.contains("tool failure") {
+        "retry_after_tool_failure"
+    } else if lowered.contains("worker panes stalled")
+        || lowered.contains("no progress")
+        || lowered.contains("leader stale")
+        || lowered.contains("all workers idle")
+        || lowered.contains("all 1 worker idle")
+        || lowered.contains("pane(s) active")
+    {
+        "tmux_reinject_after_idle"
+    } else {
+        "manual_recovery"
+    };
+
+    let target_lane = trimmed.lines().map(str::trim).find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        if !lower.starts_with("team ") {
+            return None;
+        }
+        line[5..]
+            .split_once(':')
+            .map(|(name, _)| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    });
+
+    let preserved_state = lowered
+        .contains("current mode state")
+        .then(|| String::from("current mode state"));
+
+    Some(RecoveryOutcome {
+        cause: cause.to_string(),
+        target_lane,
+        preserved_state,
     })
 }
 
@@ -6028,11 +6127,11 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
+        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -7856,6 +7955,54 @@ mod tests {
             "control_only"
         );
 
+        let recovery = execute_agent_with_spawn(
+            AgentInput {
+                description: "Recover the stalled audit lane".to_string(),
+                prompt: "Normalize OMX reinjection control prose".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("recovery-lane".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some(
+                        "Team read-only-audit-only-for-roadm: worker panes stalled, no progress 2m30s. Next: omx team status read-only-audit-only-for-roadm; read worker messages; unblock/reassign or shutdown. [OMX_TMUX_INJECT]",
+                    ),
+                    None,
+                )
+            },
+        )
+        .expect("recovery agent should succeed");
+
+        let recovery_manifest = std::fs::read_to_string(&recovery.manifest_file)
+            .expect("recovery manifest should exist");
+        let recovery_manifest_json: serde_json::Value =
+            serde_json::from_str(&recovery_manifest).expect("recovery manifest json");
+        let recovery_detail = recovery_manifest_json["laneEvents"][1]["detail"]
+            .as_str()
+            .expect("recovery detail");
+        assert!(recovery_detail.contains("Recovery handoff observed via tmux reinjection"));
+        assert!(recovery_detail.contains("read-only-audit-only-for-roadm"));
+        assert!(!recovery_detail.contains("OMX_TMUX_INJECT"));
+        assert_eq!(
+            recovery_manifest_json["laneEvents"][1]["data"]["recoveryOutcome"]["cause"],
+            "tmux_reinject_after_idle"
+        );
+        assert_eq!(
+            recovery_manifest_json["laneEvents"][1]["data"]["recoveryOutcome"]["targetLane"],
+            "read-only-audit-only-for-roadm"
+        );
+        assert_eq!(
+            recovery_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
+            true
+        );
+        assert_eq!(
+            recovery_manifest_json["laneEvents"][1]["data"]["reasons"][0],
+            "recovery_control_prose"
+        );
+
         let review = execute_agent_with_spawn(
             AgentInput {
                 description: "Review commit 1234abcd for ROADMAP #67".to_string(),
@@ -8043,6 +8190,15 @@ mod tests {
             .get(&cron.cron_id)
             .expect("cron should still exist");
         assert!(!disabled_entry.enabled);
+
+        let resume_outcome =
+            extract_recovery_outcome("Continue from current mode state. [OMX_TMUX_INJECT]")
+                .expect("resume outcome should be detected");
+        assert_eq!(resume_outcome.cause, "resume_after_stop");
+        assert_eq!(
+            resume_outcome.preserved_state.as_deref(),
+            Some("current mode state")
+        );
 
         let spawn_error = execute_agent_with_spawn(
             AgentInput {
