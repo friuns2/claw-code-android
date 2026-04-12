@@ -3764,7 +3764,8 @@ fn persist_agent_terminal_state(
             .push(LaneEvent::failed(iso8601_now(), &blocker));
     } else {
         next_manifest.current_blocker = None;
-        let finished_summary = build_lane_finished_summary(&next_manifest, result);
+        let mut finished_summary = build_lane_finished_summary(&next_manifest, result);
+        finished_summary.data.disabled_cron_ids = disable_matching_crons(&next_manifest, result);
         next_manifest.lane_events.push(
             LaneEvent::finished(iso8601_now(), finished_summary.detail).with_data(
                 serde_json::to_value(&finished_summary.data)
@@ -3846,6 +3847,8 @@ struct LaneFinishedSummaryData {
     selection_outcome: Option<SelectionOutcome>,
     #[serde(rename = "artifactProvenance", skip_serializing_if = "Option::is_none")]
     artifact_provenance: Option<ArtifactProvenance>,
+    #[serde(rename = "disabledCronIds", skip_serializing_if = "Vec::is_empty")]
+    disabled_cron_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3928,6 +3931,7 @@ fn build_lane_finished_summary(
             review_rationale: review_outcome.and_then(|outcome| outcome.rationale),
             selection_outcome: extract_selection_outcome(raw_summary.unwrap_or_default()),
             artifact_provenance,
+            disabled_cron_ids: Vec::new(),
         },
     }
 }
@@ -4198,6 +4202,46 @@ fn normalize_diff_stat(value: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+fn disable_matching_crons(manifest: &AgentOutput, result: Option<&str>) -> Vec<String> {
+    let tokens = cron_match_tokens(manifest, result);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut disabled = Vec::new();
+    for entry in global_cron_registry().list(true) {
+        let haystack = format!(
+            "{} {}",
+            entry.prompt,
+            entry.description.as_deref().unwrap_or_default()
+        )
+        .to_ascii_lowercase();
+        if tokens.iter().any(|token| haystack.contains(token))
+            && global_cron_registry().disable(&entry.cron_id).is_ok()
+        {
+            disabled.push(entry.cron_id);
+        }
+    }
+    disabled.sort();
+    disabled
+}
+
+fn cron_match_tokens(manifest: &AgentOutput, result: Option<&str>) -> Vec<String> {
+    let mut tokens = extract_roadmap_items(manifest.description.as_str())
+        .into_iter()
+        .chain(extract_roadmap_items(result.unwrap_or_default()))
+        .map(|item| item.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if tokens.is_empty() && !manifest.name.trim().is_empty() {
+        tokens.push(manifest.name.trim().to_ascii_lowercase());
+    }
+
+    tokens.sort();
+    tokens.dedup();
+    tokens
 }
 
 fn derive_agent_state(
@@ -5985,7 +6029,7 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
         GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
         SubagentToolExecutor,
@@ -7944,6 +7988,43 @@ mod tests {
             artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["commitSha"],
             "deadbee"
         );
+
+        let cron = global_cron_registry().create(
+            "*/10 * * * *",
+            "roadmap-nudge-10min for ROADMAP #66",
+            Some("ROADMAP #66 reminder"),
+        );
+        let reminder = execute_agent_with_spawn(
+            AgentInput {
+                description: "Close ROADMAP #66 reminder shutdown".to_string(),
+                prompt: "Finish the cron shutdown fix".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("cron-closeout".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some("Completed ROADMAP #66 after verification."),
+                    None,
+                )
+            },
+        )
+        .expect("reminder agent should succeed");
+
+        let reminder_manifest = std::fs::read_to_string(&reminder.manifest_file)
+            .expect("reminder manifest should exist");
+        let reminder_manifest_json: serde_json::Value =
+            serde_json::from_str(&reminder_manifest).expect("reminder manifest json");
+        assert_eq!(
+            reminder_manifest_json["laneEvents"][1]["data"]["disabledCronIds"][0],
+            cron.cron_id
+        );
+        let disabled_entry = global_cron_registry()
+            .get(&cron.cron_id)
+            .expect("cron should still exist");
+        assert!(!disabled_entry.enabled);
 
         let spawn_error = execute_agent_with_spawn(
             AgentInput {
