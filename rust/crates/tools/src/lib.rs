@@ -3844,6 +3844,8 @@ struct LaneFinishedSummaryData {
     review_rationale: Option<String>,
     #[serde(rename = "selectionOutcome", skip_serializing_if = "Option::is_none")]
     selection_outcome: Option<SelectionOutcome>,
+    #[serde(rename = "artifactProvenance", skip_serializing_if = "Option::is_none")]
+    artifact_provenance: Option<ArtifactProvenance>,
 }
 
 #[derive(Debug, Clone)]
@@ -3877,6 +3879,22 @@ struct SelectionOutcome {
     rationale: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ArtifactProvenance {
+    #[serde(rename = "sourceLanes", skip_serializing_if = "Vec::is_empty")]
+    source_lanes: Vec<String>,
+    #[serde(rename = "roadmapIds", skip_serializing_if = "Vec::is_empty")]
+    roadmap_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    files: Vec<String>,
+    #[serde(rename = "diffStat", skip_serializing_if = "Option::is_none")]
+    diff_stat: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    verification: Vec<String>,
+    #[serde(rename = "commitSha", skip_serializing_if = "Option::is_none")]
+    commit_sha: Option<String>,
+}
+
 fn build_lane_finished_summary(
     manifest: &AgentOutput,
     result: Option<&str>,
@@ -3894,6 +3912,7 @@ fn build_lane_finished_summary(
         .map(|_| manifest.description.trim())
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let artifact_provenance = extract_artifact_provenance(manifest, raw_summary);
 
     LaneFinishedSummary {
         detail,
@@ -3908,6 +3927,7 @@ fn build_lane_finished_summary(
             review_target,
             review_rationale: review_outcome.and_then(|outcome| outcome.rationale),
             selection_outcome: extract_selection_outcome(raw_summary.unwrap_or_default()),
+            artifact_provenance,
         },
     }
 }
@@ -4082,6 +4102,102 @@ fn extract_roadmap_items(line: &str) -> Vec<String> {
         }
     }
     items
+}
+
+fn extract_artifact_provenance(
+    manifest: &AgentOutput,
+    raw_summary: Option<&str>,
+) -> Option<ArtifactProvenance> {
+    let summary = raw_summary?;
+    let mut roadmap_ids = extract_roadmap_items(summary);
+    roadmap_ids.extend(extract_roadmap_items(&manifest.description));
+    roadmap_ids.sort();
+    roadmap_ids.dedup();
+
+    let mut files = extract_file_paths(summary);
+    files.sort();
+    files.dedup();
+
+    let mut verification = Vec::new();
+    let lowered = summary.to_ascii_lowercase();
+    for (needle, label) in [
+        ("tested", "tested"),
+        ("committed", "committed"),
+        ("pushed", "pushed"),
+        ("merged", "merged"),
+    ] {
+        if lowered.contains(needle) {
+            verification.push(label.to_string());
+        }
+    }
+
+    let commit_sha = extract_commit_sha(summary);
+    let diff_stat = extract_diff_stat(summary);
+    let source_lanes = vec![manifest.name.clone()];
+
+    if roadmap_ids.is_empty()
+        && files.is_empty()
+        && verification.is_empty()
+        && commit_sha.is_none()
+        && diff_stat.is_none()
+    {
+        return None;
+    }
+
+    Some(ArtifactProvenance {
+        source_lanes,
+        roadmap_ids,
+        files,
+        diff_stat,
+        verification,
+        commit_sha,
+    })
+}
+
+fn extract_file_paths(summary: &str) -> Vec<String> {
+    summary
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '(' | ')' | '[' | ']'))
+        .map(|token| {
+            token
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_end_matches('.')
+        })
+        .filter(|token| {
+            token.contains('.')
+                && !token.starts_with("http")
+                && !token
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == '+' || ch == '-')
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn extract_diff_stat(summary: &str) -> Option<String> {
+    summary
+        .split('\n')
+        .map(str::trim)
+        .find_map(|line| {
+            line.find("Diff stat:")
+                .map(|index| normalize_diff_stat(&line[(index + "Diff stat:".len())..]))
+                .or_else(|| {
+                    line.find("Diff:")
+                        .map(|index| normalize_diff_stat(&line[(index + "Diff:".len())..]))
+                })
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_diff_stat(value: &str) -> String {
+    let trimmed = value.trim();
+    for marker in [" Tested", " Committed", " committed", " pushed", " merged"] {
+        if let Some((prefix, _)) = trimmed.split_once(marker) {
+            return prefix.trim().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn derive_agent_state(
@@ -7762,6 +7878,71 @@ mod tests {
         assert_eq!(
             selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["rationale"],
             "#65 is the next repo-local lane-finished metadata task."
+        );
+
+        let artifact = execute_agent_with_spawn(
+            AgentInput {
+                description: "Land ROADMAP #64 provenance hardening".to_string(),
+                prompt: "Ship structured artifact provenance".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("artifact-lane".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some(
+                        "Completed ROADMAP #64. Files: rust/crates/tools/src/lib.rs ROADMAP.md. Diff stat: 2 files, +12/-1. Tested, committed, pushed as commit deadbee.",
+                    ),
+                    None,
+                )
+            },
+        )
+        .expect("artifact agent should succeed");
+
+        let artifact_manifest = std::fs::read_to_string(&artifact.manifest_file)
+            .expect("artifact manifest should exist");
+        let artifact_manifest_json: serde_json::Value =
+            serde_json::from_str(&artifact_manifest).expect("artifact manifest json");
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["sourceLanes"][0],
+            "artifact-lane"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["roadmapIds"][0],
+            "ROADMAP #64"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["files"][0],
+            "ROADMAP.md"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["files"][1],
+            "rust/crates/tools/src/lib.rs"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["diffStat"],
+            "2 files, +12/-1."
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["verification"]
+                [0],
+            "tested"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["verification"]
+                [1],
+            "committed"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["verification"]
+                [2],
+            "pushed"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["commitSha"],
+            "deadbee"
         );
 
         let spawn_error = execute_agent_with_spawn(
