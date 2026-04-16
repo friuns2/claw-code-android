@@ -801,7 +801,7 @@ fn strip_routing_prefix(model: &str) -> &str {
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
         // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen") {
+        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
             &model[pos + 1..]
         } else {
             model
@@ -2198,5 +2198,13 @@ mod tests {
         assert_eq!(OpenAiCompatConfig::dashscope().max_request_body_bytes, 6_291_456); // 6MB
         assert_eq!(OpenAiCompatConfig::openai().max_request_body_bytes, 104_857_600); // 100MB
         assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800); // 50MB
+    }
+
+    #[test]
+    fn strip_routing_prefix_strips_kimi_provider_prefix() {
+        // US-023: kimi prefix should be stripped for wire format
+        assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
+        assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
+        assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
     }
 }

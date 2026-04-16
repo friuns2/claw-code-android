@@ -315,13 +315,27 @@
       ],
       "passes": true,
       "priority": "P1"
+    },
+    {
+      "id": "US-023",
+      "title": "Add automatic routing for kimi models to DashScope",
+      "description": "Based on dogfood findings with kimi-k2.5 testing, users must manually prefix with dashscope/kimi-k2.5 instead of just using kimi-k2.5. Add automatic routing for kimi/ and kimi- prefixed models to DashScope (similar to qwen models), and add a 'kimi' alias to the model registry.",
+      "acceptanceCriteria": [
+        "kimi/ and kimi- prefix routing to DashScope in metadata_for_model()",
+        "'kimi' alias in MODEL_REGISTRY that resolves to 'kimi-k2.5'",
+        "resolve_model_alias() handles the kimi alias correctly",
+        "Unit tests for kimi routing (similar to qwen routing tests)",
+        "All tests pass and clippy is clean"
+      ],
+      "passes": true,
+      "priority": "P1"
     }
   ],
   "metadata": {
     "lastUpdated": "2026-04-16",
-    "completedStories": ["US-001", "US-002", "US-003", "US-004", "US-005", "US-006", "US-007", "US-008", "US-009", "US-010", "US-011", "US-012", "US-013", "US-014", "US-015", "US-016", "US-017", "US-018", "US-019", "US-020", "US-021", "US-022"],
+    "completedStories": ["US-001", "US-002", "US-003", "US-004", "US-005", "US-006", "US-007", "US-008", "US-009", "US-010", "US-011", "US-012", "US-013", "US-014", "US-015", "US-016", "US-017", "US-018", "US-019", "US-020", "US-021", "US-022", "US-023"],
     "inProgressStories": [],
-    "totalStories": 22,
-    "status": "in_progress"
+    "totalStories": 23,
+    "status": "completed"
   }
 }
