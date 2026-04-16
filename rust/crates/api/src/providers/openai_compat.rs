@@ -31,11 +31,21 @@ pub struct OpenAiCompatConfig {
     pub api_key_env: &'static str,
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
+    /// Maximum request body size in bytes. Provider-specific limits:
+    /// - DashScope: 6MB (6_291_456 bytes) - observed in dogfood testing
+    /// - OpenAI: 100MB (104_857_600 bytes)
+    /// - xAI: 50MB (52_428_800 bytes)
+    pub max_request_body_bytes: usize,
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+
+// Provider-specific request body size limits in bytes
+const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
+const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
+const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -45,6 +55,7 @@ impl OpenAiCompatConfig {
             api_key_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: DEFAULT_XAI_BASE_URL,
+            max_request_body_bytes: XAI_MAX_REQUEST_BODY_BYTES,
         }
     }
 
@@ -55,6 +66,7 @@ impl OpenAiCompatConfig {
             api_key_env: "OPENAI_API_KEY",
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: DEFAULT_OPENAI_BASE_URL,
+            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
         }
     }
 
@@ -69,6 +81,7 @@ impl OpenAiCompatConfig {
             api_key_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
+            max_request_body_bytes: DASHSCOPE_MAX_REQUEST_BODY_BYTES,
         }
     }
 
@@ -249,6 +262,9 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        // Pre-flight check: verify request body size against provider limits
+        check_request_body_size(request, self.config())?;
+
         let request_url = chat_completions_endpoint(&self.base_url);
         self.http
             .post(&request_url)
@@ -791,9 +807,41 @@ fn strip_routing_prefix(model: &str) -> &str {
     }
 }
 
+/// Estimate the serialized JSON size of a request payload in bytes.
+/// This is a pre-flight check to avoid hitting provider-specific size limits.
+pub fn estimate_request_body_size(request: &MessageRequest, config: OpenAiCompatConfig) -> usize {
+    let payload = build_chat_completion_request(request, config);
+    // serde_json::to_vec gives us the exact byte size of the serialized JSON
+    serde_json::to_vec(&payload).map_or(0, |v| v.len())
+}
+
+/// Pre-flight check for request body size against provider limits.
+/// Returns Ok(()) if the request is within limits, or an error with
+/// a clear message about the size limit being exceeded.
+pub fn check_request_body_size(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+) -> Result<(), ApiError> {
+    let estimated_bytes = estimate_request_body_size(request, config);
+    let max_bytes = config.max_request_body_bytes;
+
+    if estimated_bytes > max_bytes {
+        Err(ApiError::RequestBodySizeExceeded {
+            estimated_bytes,
+            max_bytes,
+            provider: config.provider_name,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// Builds a chat completion request payload from a `MessageRequest`.
 /// Public for benchmarking purposes.
-pub fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+pub fn build_chat_completion_request(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -2030,5 +2078,103 @@ mod tests {
         assert_eq!(tool_msg_kimi["tool_call_id"], json!("call_1"));
         assert_eq!(tool_msg_gpt["content"], json!("file contents"));
         assert_eq!(tool_msg_kimi["content"], json!("file contents"));
+    }
+
+    // ============================================================================
+    // US-021: Request body size pre-flight check tests
+    // ============================================================================
+
+    #[test]
+    fn estimate_request_body_size_returns_reasonable_estimate() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage::user_text("Hello world".to_string())],
+            stream: false,
+            ..Default::default()
+        };
+
+        let size = super::estimate_request_body_size(&request, OpenAiCompatConfig::openai());
+        // Should be non-zero and reasonable for a small request
+        assert!(size > 0, "estimated size should be positive");
+        assert!(size < 10_000, "small request should be under 10KB");
+    }
+
+    #[test]
+    fn check_request_body_size_passes_for_small_requests() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage::user_text("Hello".to_string())],
+            stream: false,
+            ..Default::default()
+        };
+
+        // Should pass for all providers with a small request
+        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::openai()).is_ok());
+        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::xai()).is_ok());
+        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::dashscope()).is_ok());
+    }
+
+    #[test]
+    fn check_request_body_size_fails_for_dashscope_when_exceeds_6mb() {
+        // Create a request that exceeds DashScope's 6MB limit
+        let large_content = "x".repeat(7_000_000); // 7MB of content
+        let request = MessageRequest {
+            model: "qwen-plus".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage::user_text(large_content)],
+            stream: false,
+            ..Default::default()
+        };
+
+        let result = super::check_request_body_size(&request, OpenAiCompatConfig::dashscope());
+        assert!(result.is_err(), "should fail for 7MB request to DashScope");
+
+        let err = result.unwrap_err();
+        match err {
+            crate::error::ApiError::RequestBodySizeExceeded {
+                estimated_bytes,
+                max_bytes,
+                provider,
+            } => {
+                assert_eq!(provider, "DashScope");
+                assert_eq!(max_bytes, 6_291_456); // 6MB limit
+                assert!(estimated_bytes > max_bytes);
+            }
+            _ => panic!("expected RequestBodySizeExceeded error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn check_request_body_size_allows_large_requests_for_openai() {
+        // Create a request that exceeds DashScope's limit but is under OpenAI's 100MB limit
+        let large_content = "x".repeat(10_000_000); // 10MB of content
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage::user_text(large_content)],
+            stream: false,
+            ..Default::default()
+        };
+
+        // Should pass for OpenAI (100MB limit)
+        assert!(
+            super::check_request_body_size(&request, OpenAiCompatConfig::openai()).is_ok(),
+            "10MB request should pass for OpenAI's 100MB limit"
+        );
+
+        // Should fail for DashScope (6MB limit)
+        assert!(
+            super::check_request_body_size(&request, OpenAiCompatConfig::dashscope()).is_err(),
+            "10MB request should fail for DashScope's 6MB limit"
+        );
+    }
+
+    #[test]
+    fn provider_specific_size_limits_are_correct() {
+        assert_eq!(OpenAiCompatConfig::dashscope().max_request_body_bytes, 6_291_456); // 6MB
+        assert_eq!(OpenAiCompatConfig::openai().max_request_body_bytes, 104_857_600); // 100MB
+        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800); // 50MB
     }
 }

@@ -63,6 +63,11 @@ pub enum ApiError {
         attempt: u32,
         base_delay: Duration,
     },
+    RequestBodySizeExceeded {
+        estimated_bytes: usize,
+        max_bytes: usize,
+        provider: &'static str,
+    },
 }
 
 impl ApiError {
@@ -129,7 +134,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => false,
         }
     }
 
@@ -147,7 +153,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => None,
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => None,
         }
     }
 
@@ -172,6 +179,7 @@ impl ApiError {
                 "provider_transport"
             }
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
+            Self::RequestBodySizeExceeded { .. } => "request_size",
         }
     }
 
@@ -194,7 +202,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => false,
         }
     }
 
@@ -223,7 +232,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => false,
         }
     }
 }
@@ -323,6 +333,16 @@ impl Display for ApiError {
             } => write!(
                 f,
                 "retry backoff overflowed on attempt {attempt} with base delay {base_delay:?}"
+            ),
+            Self::RequestBodySizeExceeded {
+                estimated_bytes,
+                max_bytes,
+                provider,
+            } => write!(
+                f,
+                "request body size ({} bytes) exceeds {provider} limit ({} bytes); reduce prompt length or context before retrying",
+                estimated_bytes,
+                max_bytes
             ),
         }
     }
