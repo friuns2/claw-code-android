@@ -56,6 +56,7 @@ pub enum WorkerFailureKind {
     PromptDelivery,
     Protocol,
     Provider,
+    StartupNoEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +79,7 @@ pub enum WorkerEventKind {
     Restarted,
     Finished,
     Failed,
+    StartupNoEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +96,46 @@ pub enum WorkerPromptTarget {
     WrongTarget,
     WrongTask,
     Unknown,
+}
+
+/// Classification of startup failure when no evidence is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupFailureClassification {
+    /// Trust prompt is required but not detected/resolved
+    TrustRequired,
+    /// Prompt was delivered to wrong target (shell misdelivery)
+    PromptMisdelivery,
+    /// Prompt was sent but acceptance timed out
+    PromptAcceptanceTimeout,
+    /// Transport layer is dead/unresponsive
+    TransportDead,
+    /// Worker process crashed during startup
+    WorkerCrashed,
+    /// Cannot determine specific cause
+    Unknown,
+}
+
+/// Evidence bundle collected when worker startup times out without clear evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartupEvidenceBundle {
+    /// Last known worker lifecycle state before timeout
+    pub last_lifecycle_state: WorkerStatus,
+    /// The pane/command that was being executed
+    pub pane_command: String,
+    /// Timestamp when prompt was sent (if any), unix epoch seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_sent_at: Option<u64>,
+    /// Whether prompt acceptance was detected
+    pub prompt_acceptance_state: bool,
+    /// Result of trust prompt detection at timeout
+    pub trust_prompt_detected: bool,
+    /// Transport health summary (true = healthy/responsive)
+    pub transport_healthy: bool,
+    /// MCP health summary (true = all servers healthy)
+    pub mcp_healthy: bool,
+    /// Seconds since worker creation
+    pub elapsed_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +156,10 @@ pub enum WorkerEventPayload {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_receipt: Option<WorkerTaskReceipt>,
         recovery_armed: bool,
+    },
+    StartupNoEvidence {
+        evidence: StartupEvidenceBundle,
+        classification: StartupFailureClassification,
     },
 }
 
@@ -560,6 +606,117 @@ impl WorkerRegistry {
 
         Ok(worker.clone())
     }
+
+    /// Handle startup timeout by emitting typed `worker.startup_no_evidence` event with evidence bundle.
+    /// Classifier attempts to down-rank the vague bucket into a specific failure classification.
+    pub fn observe_startup_timeout(
+        &self,
+        worker_id: &str,
+        pane_command: &str,
+        transport_healthy: bool,
+        mcp_healthy: bool,
+    ) -> Result<Worker, String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+
+        let now = now_secs();
+        let elapsed = now.saturating_sub(worker.created_at);
+
+        // Build evidence bundle
+        let evidence = StartupEvidenceBundle {
+            last_lifecycle_state: worker.status,
+            pane_command: pane_command.to_string(),
+            prompt_sent_at: if worker.prompt_delivery_attempts > 0 {
+                Some(worker.updated_at)
+            } else {
+                None
+            },
+            prompt_acceptance_state: worker.status == WorkerStatus::Running
+                && !worker.prompt_in_flight,
+            trust_prompt_detected: worker
+                .events
+                .iter()
+                .any(|e| e.kind == WorkerEventKind::TrustRequired),
+            transport_healthy,
+            mcp_healthy,
+            elapsed_seconds: elapsed,
+        };
+
+        // Classify the failure
+        let classification = classify_startup_failure(&evidence);
+
+        // Emit failure with evidence
+        worker.last_error = Some(WorkerFailure {
+            kind: WorkerFailureKind::StartupNoEvidence,
+            message: format!(
+                "worker startup stalled after {elapsed}s — classified as {classification:?}"
+            ),
+            created_at: now,
+        });
+        worker.status = WorkerStatus::Failed;
+        worker.prompt_in_flight = false;
+
+        push_event(
+            worker,
+            WorkerEventKind::StartupNoEvidence,
+            WorkerStatus::Failed,
+            Some(format!(
+                "startup timeout with evidence: last_state={:?}, trust_detected={}, prompt_accepted={}",
+                evidence.last_lifecycle_state,
+                evidence.trust_prompt_detected,
+                evidence.prompt_acceptance_state
+            )),
+            Some(WorkerEventPayload::StartupNoEvidence {
+                evidence,
+                classification,
+            }),
+        );
+
+        Ok(worker.clone())
+    }
+}
+
+/// Classify startup failure based on evidence bundle.
+/// Attempts to down-rank the vague `startup-no-evidence` bucket into a specific failure class.
+fn classify_startup_failure(evidence: &StartupEvidenceBundle) -> StartupFailureClassification {
+    // Check for transport death first
+    if !evidence.transport_healthy {
+        return StartupFailureClassification::TransportDead;
+    }
+
+    // Check for trust prompt that wasn't resolved
+    if evidence.trust_prompt_detected
+        && evidence.last_lifecycle_state == WorkerStatus::TrustRequired
+    {
+        return StartupFailureClassification::TrustRequired;
+    }
+
+    // Check for prompt acceptance timeout
+    if evidence.prompt_sent_at.is_some()
+        && !evidence.prompt_acceptance_state
+        && evidence.last_lifecycle_state == WorkerStatus::Running
+    {
+        return StartupFailureClassification::PromptAcceptanceTimeout;
+    }
+
+    // Check for misdelivery when prompt was sent but not accepted
+    if evidence.prompt_sent_at.is_some()
+        && !evidence.prompt_acceptance_state
+        && evidence.elapsed_seconds > 30
+    {
+        return StartupFailureClassification::PromptMisdelivery;
+    }
+
+    // If MCP is unhealthy but transport is fine, worker may have crashed
+    if !evidence.mcp_healthy && evidence.transport_healthy {
+        return StartupFailureClassification::WorkerCrashed;
+    }
+
+    // Default to unknown if no stronger classification exists
+    StartupFailureClassification::Unknown
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1336,5 +1493,216 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == WorkerEventKind::Finished));
+    }
+
+    #[test]
+    fn startup_timeout_emits_evidence_bundle_with_classification() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-timeout", &[], true);
+
+        // Simulate startup timeout with transport dead
+        let timed_out = registry
+            .observe_startup_timeout(&worker.worker_id, "cargo test", false, true)
+            .expect("startup timeout observe should succeed");
+
+        assert_eq!(timed_out.status, WorkerStatus::Failed);
+        let error = timed_out
+            .last_error
+            .expect("startup timeout error should exist");
+        assert_eq!(error.kind, WorkerFailureKind::StartupNoEvidence);
+        // Check for "TransportDead" (the Debug representation of the enum variant)
+        assert!(
+            error.message.contains("TransportDead"),
+            "expected TransportDead in: {}",
+            error.message
+        );
+
+        let event = timed_out
+            .events
+            .iter()
+            .find(|e| e.kind == WorkerEventKind::StartupNoEvidence)
+            .expect("startup no evidence event should exist");
+
+        match event.payload.as_ref() {
+            Some(WorkerEventPayload::StartupNoEvidence {
+                evidence,
+                classification,
+            }) => {
+                assert_eq!(
+                    evidence.last_lifecycle_state,
+                    WorkerStatus::Spawning,
+                    "last state should be spawning"
+                );
+                assert_eq!(evidence.pane_command, "cargo test");
+                assert!(!evidence.transport_healthy);
+                assert!(evidence.mcp_healthy);
+                assert_eq!(*classification, StartupFailureClassification::TransportDead);
+            }
+            _ => panic!(
+                "expected StartupNoEvidence payload, got {:?}",
+                event.payload
+            ),
+        }
+    }
+
+    #[test]
+    fn startup_timeout_classifies_trust_required_when_prompt_blocked() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-trust", &[], false);
+
+        // Simulate trust prompt detected but not resolved
+        registry
+            .observe(
+                &worker.worker_id,
+                "Do you trust the files in this folder?\n1. Yes, proceed\n2. No",
+            )
+            .expect("trust observe should succeed");
+
+        // Now simulate startup timeout
+        let timed_out = registry
+            .observe_startup_timeout(&worker.worker_id, "claw prompt", true, true)
+            .expect("startup timeout observe should succeed");
+
+        let event = timed_out
+            .events
+            .iter()
+            .find(|e| e.kind == WorkerEventKind::StartupNoEvidence)
+            .expect("startup no evidence event should exist");
+
+        match event.payload.as_ref() {
+            Some(WorkerEventPayload::StartupNoEvidence { classification, .. }) => {
+                assert_eq!(
+                    *classification,
+                    StartupFailureClassification::TrustRequired,
+                    "should classify as trust_required when trust prompt detected"
+                );
+            }
+            _ => panic!("expected StartupNoEvidence payload"),
+        }
+    }
+
+    #[test]
+    fn startup_timeout_classifies_prompt_acceptance_timeout() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-accept", &[], true);
+
+        // Get worker to ReadyForPrompt
+        registry
+            .observe(&worker.worker_id, "Ready for your input\n>")
+            .expect("ready observe should succeed");
+
+        // Send prompt but don't get acceptance
+        registry
+            .send_prompt(&worker.worker_id, Some("Run tests"), None)
+            .expect("prompt send should succeed");
+
+        // Simulate startup timeout while prompt is still in flight
+        let timed_out = registry
+            .observe_startup_timeout(&worker.worker_id, "claw prompt", true, true)
+            .expect("startup timeout observe should succeed");
+
+        let event = timed_out
+            .events
+            .iter()
+            .find(|e| e.kind == WorkerEventKind::StartupNoEvidence)
+            .expect("startup no evidence event should exist");
+
+        match event.payload.as_ref() {
+            Some(WorkerEventPayload::StartupNoEvidence {
+                evidence,
+                classification,
+            }) => {
+                assert!(
+                    evidence.prompt_sent_at.is_some(),
+                    "should have prompt_sent_at"
+                );
+                assert!(!evidence.prompt_acceptance_state, "prompt not yet accepted");
+                assert_eq!(
+                    *classification,
+                    StartupFailureClassification::PromptAcceptanceTimeout
+                );
+            }
+            _ => panic!("expected StartupNoEvidence payload"),
+        }
+    }
+
+    #[test]
+    fn startup_evidence_bundle_serializes_correctly() {
+        let bundle = StartupEvidenceBundle {
+            last_lifecycle_state: WorkerStatus::Running,
+            pane_command: "test command".to_string(),
+            prompt_sent_at: Some(1_234_567_890),
+            prompt_acceptance_state: false,
+            trust_prompt_detected: true,
+            transport_healthy: true,
+            mcp_healthy: false,
+            elapsed_seconds: 60,
+        };
+
+        let json = serde_json::to_string(&bundle).expect("should serialize");
+        assert!(json.contains("\"last_lifecycle_state\""));
+        assert!(json.contains("\"pane_command\""));
+        assert!(json.contains("\"prompt_sent_at\":1234567890"));
+        assert!(json.contains("\"trust_prompt_detected\":true"));
+        assert!(json.contains("\"transport_healthy\":true"));
+        assert!(json.contains("\"mcp_healthy\":false"));
+
+        let deserialized: StartupEvidenceBundle =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(deserialized.last_lifecycle_state, WorkerStatus::Running);
+        assert_eq!(deserialized.prompt_sent_at, Some(1_234_567_890));
+    }
+
+    #[test]
+    fn classify_startup_failure_detects_transport_dead() {
+        let evidence = StartupEvidenceBundle {
+            last_lifecycle_state: WorkerStatus::Spawning,
+            pane_command: "test".to_string(),
+            prompt_sent_at: None,
+            prompt_acceptance_state: false,
+            trust_prompt_detected: false,
+            transport_healthy: false,
+            mcp_healthy: true,
+            elapsed_seconds: 30,
+        };
+
+        let classification = classify_startup_failure(&evidence);
+        assert_eq!(classification, StartupFailureClassification::TransportDead);
+    }
+
+    #[test]
+    fn classify_startup_failure_defaults_to_unknown() {
+        let evidence = StartupEvidenceBundle {
+            last_lifecycle_state: WorkerStatus::Spawning,
+            pane_command: "test".to_string(),
+            prompt_sent_at: None,
+            prompt_acceptance_state: false,
+            trust_prompt_detected: false,
+            transport_healthy: true,
+            mcp_healthy: true,
+            elapsed_seconds: 10,
+        };
+
+        let classification = classify_startup_failure(&evidence);
+        assert_eq!(classification, StartupFailureClassification::Unknown);
+    }
+
+    #[test]
+    fn classify_startup_failure_detects_worker_crashed() {
+        // Worker crashed scenario: transport healthy but MCP unhealthy
+        // Don't have prompt in flight (no prompt_sent_at) to avoid matching PromptAcceptanceTimeout
+        let evidence = StartupEvidenceBundle {
+            last_lifecycle_state: WorkerStatus::Spawning,
+            pane_command: "test".to_string(),
+            prompt_sent_at: None, // No prompt sent yet
+            prompt_acceptance_state: false,
+            trust_prompt_detected: false,
+            transport_healthy: true,
+            mcp_healthy: false, // MCP unhealthy but transport healthy suggests crash
+            elapsed_seconds: 45,
+        };
+
+        let classification = classify_startup_failure(&evidence);
+        assert_eq!(classification, StartupFailureClassification::WorkerCrashed);
     }
 }
