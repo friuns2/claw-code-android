@@ -88,6 +88,25 @@ Acceptance:
 - trust prompt state is detectable and emitted
 - shell misdelivery becomes detectable as a first-class failure state
 
+### 1.5. First-prompt acceptance SLA
+After `ready_for_prompt`, expose whether the first task was actually accepted within a bounded window instead of leaving claws in a silent limbo.
+
+Emit typed signals for:
+- `prompt.sent`
+- `prompt.accepted`
+- `prompt.acceptance_delayed`
+- `prompt.acceptance_timeout`
+
+Track at least:
+- time from `ready_for_prompt` -> first prompt send
+- time from first prompt send -> `prompt_accepted`
+- whether acceptance required retry or recovery
+
+Acceptance:
+- clawhip can distinguish `worker is ready but idle` from `prompt was sent but not actually accepted`
+- long silent gaps between ready-state and first-task execution become machine-visible
+- recovery can trigger on acceptance timeout before humans start scraping panes
+
 ### 2. Trust prompt resolver
 Add allowlisted auto-trust behavior for known repos/worktrees.
 
@@ -108,6 +127,23 @@ Provide machine control above tmux:
 
 Acceptance:
 - a claw can operate a coding worker without raw send-keys as the primary control plane
+
+### 3.5. Boot preflight / doctor contract
+Before spawning or prompting a worker, run a machine-readable preflight that reports whether the lane is actually safe to start.
+
+Preflight should check and emit typed results for:
+- repo/worktree existence and expected branch
+- branch freshness vs base branch
+- trust-gate likelihood / allowlist status
+- required binaries and control sockets
+- plugin discovery / allowlist / startup eligibility
+- MCP config presence and server reachability expectations
+- last-known failed boot reason, if any
+
+Acceptance:
+- claws can fail fast before launching a doomed worker
+- a blocked start returns a short structured diagnosis instead of forcing pane-scrape triage
+- clawhip can summarize `why this lane did not even start` without inferring from terminal noise
 
 ## Phase 2 — Event-Native Clawhip Integration
 
@@ -130,6 +166,551 @@ Acceptance:
 - clawhip consumes typed lane events
 - Discord summaries are rendered from structured events instead of pane scraping alone
 
+### 4.5. Session event ordering + terminal-state reconciliation
+When the same session emits contradictory lifecycle events (`idle`, `error`, `completed`, transport/server-down) in close succession, claw-code must expose a deterministic final truth instead of making downstream claws guess.
+
+Required behavior:
+- attach monotonic sequence / causal ordering metadata to session lifecycle events
+- classify which events are terminal vs advisory
+- reconcile duplicate or out-of-order terminal events into one canonical lane outcome
+- distinguish `session terminal state unknown because transport died` from a real `completed`
+
+Acceptance:
+- clawhip can survive `completed -> idle -> error -> completed` noise without double-reporting or trusting the wrong final state
+- server-down after a session event burst surfaces as a typed uncertainty state rather than silently rewriting history
+- downstream automation has one canonical terminal outcome per lane/session
+
+### 4.6. Event provenance / environment labeling
+Every emitted event should say whether it came from a live lane, synthetic test, healthcheck, replay, or system transport layer so claws do not mistake test noise for production truth.
+
+Required fields:
+- event source kind (`live_lane`, `test`, `healthcheck`, `replay`, `transport`)
+- environment / channel label
+- emitter identity
+- confidence / trust level for downstream automation
+
+Acceptance:
+- clawhip can ignore or down-rank test pings without heuristic text matching
+- synthetic/system events do not contaminate lane status or trigger false follow-up automation
+- event streams remain machine-trustworthy even when test traffic shares the same channel
+
+### 4.7. Session identity completeness at creation time
+A newly created session should not surface as `(untitled)` or `(unknown)` for fields that orchestrators need immediately.
+
+Required behavior:
+- emit stable title, workspace/worktree path, and lane/session purpose at creation time
+- if any field is not yet known, emit an explicit typed placeholder reason rather than a bare unknown string
+- reconcile later-enriched metadata back onto the same session identity without creating ambiguity
+
+Acceptance:
+- clawhip can route/triage a brand-new session without waiting for follow-up chatter
+- `(untitled)` / `(unknown)` creation events no longer force humans or bots to guess scope
+- session creation events are immediately actionable for monitoring and ownership decisions
+
+### 4.8. Duplicate terminal-event suppression
+When the same session emits repeated `completed`, `failed`, or other terminal notifications, claw-code should collapse duplicates before they trigger repeated downstream reactions.
+
+Required behavior:
+- attach a canonical terminal-event fingerprint per lane/session outcome
+- suppress or coalesce repeated terminal notifications within a reconciliation window
+- preserve raw event history for audit while exposing only one actionable terminal outcome downstream
+- surface when a later duplicate materially differs from the original terminal payload
+
+Acceptance:
+- clawhip does not double-report or double-close based on repeated terminal notifications
+- duplicate `completed` bursts become one actionable finish event, not repeated noise
+- downstream automation stays idempotent even when the upstream emitter is chatty
+
+### 4.9. Lane ownership / scope binding
+Each session and lane event should declare who owns it and what workflow scope it belongs to, so unrelated external/system work does not pollute claw-code follow-up loops.
+
+Required behavior:
+- attach owner/assignee identity when known
+- attach workflow scope (e.g. `claw-code-dogfood`, `external-git-maintenance`, `infra-health`, `manual-operator`)
+- mark whether the current watcher is expected to act, observe only, or ignore
+- preserve scope through session restarts, resumes, and late terminal events
+
+Acceptance:
+- clawhip can say `out-of-scope external session` without humans adding a prose disclaimer
+- unrelated session churn does not trigger false claw-code follow-up or blocker reporting
+- monitoring views can filter to `actionable for this claw` instead of mixing every session on the host
+
+### 4.10. Nudge acknowledgment / dedupe contract
+Periodic clawhip nudges should carry enough state for claws to know whether the current prompt is new work, a retry, or an already-acknowledged heartbeat.
+
+Required behavior:
+- attach nudge id / cycle id and delivery timestamp
+- expose whether the current claw has already acknowledged or responded for that cycle
+- distinguish `new nudge`, `retry nudge`, and `stale duplicate`
+- allow downstream summaries to bind a reported pinpoint back to the triggering nudge id
+
+Acceptance:
+- claws do not keep manufacturing fresh follow-ups just because the same periodic nudge reappeared
+- clawhip can tell whether silence means `not yet handled` or `already acknowledged in this cycle`
+- recurring dogfood prompts become idempotent and auditable across retries
+
+### 4.11. Stable roadmap-id assignment for newly filed pinpoints
+When a claw records a new pinpoint/follow-up, the roadmap surface should assign or expose a stable tracking id immediately instead of leaving the item as anonymous prose.
+
+Required behavior:
+- assign a canonical roadmap id at filing time
+- expose that id in the structured event/report payload
+- preserve the same id across later edits, reorderings, and summary compression
+- distinguish `new roadmap filing` from `update to existing roadmap item`
+
+Acceptance:
+- channel updates can reference a newly filed pinpoint by stable id in the same turn
+- downstream claws do not need heuristic text matching to figure out whether a follow-up is new or already tracked
+- roadmap-driven dogfood loops stay auditable even as the document is edited repeatedly
+
+### 4.12. Roadmap item lifecycle state contract
+Each roadmap pinpoint should carry a machine-readable lifecycle state so claws do not keep rediscovering or re-reporting items that are already active, resolved, or superseded.
+
+Required behavior:
+- expose lifecycle state (`filed`, `acknowledged`, `in_progress`, `blocked`, `done`, `superseded`)
+- attach last state-change timestamp
+- allow a new report to declare whether it is a first filing, status update, or closure
+- preserve lineage when one pinpoint supersedes or merges into another
+
+Acceptance:
+- clawhip can tell `new gap` from `existing gap still active` without prose interpretation
+- completed or superseded items stop reappearing as if they were fresh discoveries
+- roadmap-driven follow-up loops become stateful instead of repeatedly stateless
+
+### 4.13. Multi-message report atomicity
+A single dogfood/lane update should be representable as one structured report payload, even if the chat surface ends up rendering it across multiple messages.
+
+Required behavior:
+- assign one report id for the whole update
+- bind `active_sessions`, `exact_pinpoint`, `concrete_delta`, and `blocker` fields to that same report id
+- expose message-part ordering when the chat transport splits the report
+- allow downstream consumers to reconstruct one canonical update without scraping adjacent chat messages heuristically
+
+Acceptance:
+- clawhip and other claws can parse one logical update even when Discord delivery fragments it into several posts
+- partial/misordered message bursts do not scramble `pinpoint` vs `delta` vs `blocker`
+- dogfood reports become machine-reliable summaries instead of fragile chat archaeology
+
+### 4.14. Cross-claw pinpoint dedupe / merge contract
+When multiple claws file near-identical pinpoints from the same underlying failure, the roadmap surface should merge or relate them instead of letting duplicate follow-ups accumulate as separate discoveries.
+
+Required behavior:
+- compute or expose a similarity/dedupe key for newly filed pinpoints
+- allow a new filing to link to an existing roadmap item as `same_root_cause`, `related`, or `supersedes`
+- preserve reporter-specific evidence while collapsing the canonical tracked issue
+- surface when a later filing is genuinely distinct despite similar wording
+
+Acceptance:
+- two claws reporting the same gap do not automatically create two independent roadmap items
+- roadmap growth reflects real new findings instead of duplicate observer churn
+- downstream monitoring can see both the canonical item and the supporting duplicate evidence without losing auditability
+
+### 4.15. Pinpoint evidence attachment contract
+Each filed pinpoint should carry structured supporting evidence so later implementers do not have to reconstruct why the gap was believed to exist.
+
+Required behavior:
+- attach evidence references such as session ids, message ids, commits, logs, stack traces, or file paths
+- label each attachment by evidence role (`repro`, `symptom`, `root_cause_hint`, `verification`)
+- preserve bounded previews for human scanning while keeping a canonical reference for machines
+- allow evidence to be added after filing without changing the pinpoint identity
+
+Acceptance:
+- roadmap items stay actionable after chat scrollback or session context is gone
+- implementation lanes can start from structured evidence instead of rediscovering the original failure
+- prioritization can weigh pinpoints by evidence quality, not just prose confidence
+
+### 4.16. Pinpoint priority / severity contract
+Each filed pinpoint should expose a machine-readable urgency/severity signal so claws can separate immediate execution blockers from lower-priority clawability hardening.
+
+Required behavior:
+- attach priority/severity fields (for example `p0`/`p1`/`p2` or `critical`/`high`/`medium`/`low`)
+- distinguish user-facing breakage, operator-only friction, observability debt, and long-tail hardening
+- allow priority to change as new evidence lands without changing the pinpoint identity
+- surface why the priority was assigned (blast radius, reproducibility, automation breakage, merge risk)
+
+Acceptance:
+- clawhip can rank fresh pinpoints without relying on prose urgency vibes
+- implementation queues can pull true blockers ahead of reporting-only niceties
+- roadmap dogfood stays focused on the most damaging clawability gaps first
+
+### 4.17. Pinpoint-to-implementation handoff contract
+A filed pinpoint should be able to turn into an execution lane without a human re-translating the same context by hand.
+
+Required behavior:
+- expose a structured handoff packet containing objective, suspected scope, evidence refs, priority, and suggested verification
+- mark whether the pinpoint is `implementation_ready`, `needs_repro`, or `needs_triage`
+- preserve the link between the roadmap item and any spawned execution lane/worktree/PR
+- allow later execution results to update the original pinpoint state instead of forking separate unlinked narratives
+
+Acceptance:
+- a claw can pick up a filed pinpoint and start implementation with minimal re-interpretation
+- roadmap items stop being dead prose and become executable handoff units
+- follow-up loops can see which pinpoints have already turned into real execution lanes
+
+### 4.18. Report backpressure / repetitive-summary collapse
+Periodic dogfood reporting should avoid re-broadcasting the full known gap inventory every cycle when only a small delta changed.
+
+Required behavior:
+- distinguish `new since last report` from `still active but unchanged`
+- emit compact delta-first summaries with an optional expandable full state
+- track per-channel/reporting cursor so repeated unchanged items collapse automatically
+- preserve one canonical full snapshot elsewhere for audit/debug without flooding the live channel
+
+Acceptance:
+- new signal does not get buried under the same repeated backlog list every cycle
+- claws and humans can scan the latest update for actual change instead of re-reading the whole inventory
+- recurring dogfood loops become low-noise without losing auditability
+
+### 4.19. No-change / no-op acknowledgment contract
+When a dogfood cycle produces no new pinpoint, no new delta, and no new blocker, claws should be able to acknowledge that cycle explicitly without pretending a fresh finding exists.
+
+Required behavior:
+- expose a structured `no_change` / `noop` outcome for a reporting cycle
+- bind that outcome to the triggering nudge/report id
+- distinguish `checked and unchanged` from `not yet checked`
+- preserve the last meaningful pinpoint/delta reference without re-filing it as new work
+
+Acceptance:
+- recurring nudges do not force synthetic novelty when the real answer is `nothing changed`
+- clawhip can tell `handled, no delta` apart from silence or missed handling
+- dogfood loops become honest and low-noise when the system is stable
+
+### 4.20. Observation freshness / staleness-age contract
+Every reported status, pinpoint, or blocker should carry an explicit observation timestamp/age so downstream claws can tell fresh state from stale carry-forward.
+
+Required behavior:
+- attach observed-at timestamp and derived age to active-session state, pinpoints, and blockers
+- distinguish freshly observed facts from carried-forward prior-cycle state
+- allow freshness TTLs so old observations degrade from `current` to `stale` automatically
+- surface when a report contains mixed freshness windows across its fields
+
+Acceptance:
+- claws do not mistake a 2-hour-old observation for current truth just because it reappeared in the latest report
+- stale carried-forward state is visible and can be down-ranked or revalidated
+- dogfood summaries remain trustworthy even when some fields are unchanged across many cycles
+
+### 4.21. Fact / hypothesis / confidence labeling
+Dogfood reports should distinguish confirmed observations from inferred root-cause guesses so downstream claws do not treat speculation as settled truth.
+
+Required behavior:
+- label each reported claim as `observed_fact`, `inference`, `hypothesis`, or `recommendation`
+- attach a confidence score or confidence bucket to non-fact claims
+- preserve which evidence supports each claim
+- allow a later report to promote a hypothesis into confirmed fact without changing the underlying pinpoint identity
+
+Acceptance:
+- claws can tell `we saw X happen` from `we think Y caused it`
+- speculative root-cause text does not get mistaken for machine-trustworthy state
+- dogfood summaries stay honest about uncertainty while remaining actionable
+
+### 4.22. Negative-evidence / searched-and-not-found contract
+When a dogfood cycle reports that something was not found (no active sessions, no new delta, no repro, no blocker), the report should also say what was checked so absence is machine-meaningful rather than empty prose.
+
+Required behavior:
+- attach the checked surfaces/sources for negative findings (sessions, logs, roadmap, state file, channel window, etc.)
+- distinguish `not observed in checked scope` from `unknown / not checked`
+- preserve the query/window used for the negative observation when relevant
+- allow later reports to invalidate an earlier negative finding if the search scope was incomplete
+
+Acceptance:
+- `no blocker` and `no new delta` become auditable conclusions rather than unverifiable vibes
+- downstream claws can tell whether absence means `looked and clean` or `did not inspect`
+- stable dogfood periods stay trustworthy without overclaiming certainty
+
+### 4.23. Field-level delta attribution
+Even in delta-first reporting, claws still need to know exactly which structured fields changed between cycles instead of inferring change from prose.
+
+Required behavior:
+- emit field-level change markers for core report fields (`active_sessions`, `pinpoint`, `delta`, `blocker`, lifecycle state, priority, freshness)
+- distinguish `changed`, `unchanged`, `cleared`, and `carried_forward`
+- preserve previous value references or hashes when useful for machine comparison
+- allow one report to contain both changed and unchanged fields without losing per-field status
+
+Acceptance:
+- downstream claws can tell precisely what changed this cycle without diffing entire message bodies
+- delta-first summaries remain compact while still being machine-comparable
+- recurring reports stop forcing text-level reparse just to answer `what actually changed?`
+
+### 4.24. Report schema versioning / compatibility contract
+As structured dogfood reports evolve, the reporting surface needs explicit schema versioning so downstream claws can parse new fields safely without silent breakage.
+
+Required behavior:
+- attach schema version to each structured report payload
+- define additive vs breaking field changes
+- expose compatibility guidance for consumers that only understand older schemas
+- preserve a minimal stable core so basic parsing survives partial upgrades
+
+Acceptance:
+- downstream claws can reject, warn on, or gracefully degrade unknown schema versions instead of misparsing silently
+- adding new reporting fields does not randomly break existing automation
+- dogfood reporting can evolve quickly without losing machine trust
+
+### 4.25. Consumer capability negotiation for structured reports
+Schema versioning alone is not enough if different claws consume different subsets of the reporting surface. The producer should know what the consumer can actually understand.
+
+Required behavior:
+- let downstream consumers advertise supported schema versions and optional field families/capabilities
+- allow producers to emit a reduced-compatible payload when a consumer cannot handle richer report fields
+- surface when a report was downgraded for compatibility vs emitted in full fidelity
+- preserve one canonical full-fidelity representation for audit/debug even when a downgraded view is delivered
+
+Acceptance:
+- claws with older parsers can still consume useful reports without silent field loss being mistaken for absence
+- richer report evolution does not force every consumer to upgrade in lockstep
+- reporting remains machine-trustworthy across mixed-version claw fleets
+
+### 4.26. Self-describing report schema surface
+Even with versioning and capability negotiation, downstream claws still need a machine-readable way to discover what fields and semantics a report version actually contains.
+
+Required behavior:
+- expose a machine-readable schema/field registry for structured report payloads
+- document field meanings, enums, optionality, and deprecation status in a consumable format
+- let consumers fetch the schema for a referenced report version/capability set
+- preserve stable identifiers for fields so docs, code, and live payloads point at the same schema truth
+
+Acceptance:
+- new consumers can integrate without reverse-engineering example payloads from chat logs
+- schema drift becomes detectable against a declared source of truth
+- structured report evolution stays fast without turning every integration into brittle archaeology
+
+### 4.27. Audience-specific report projection
+The same canonical dogfood report should be projectable into different consumer views (clawhip, Jobdori, human operator) without each consumer re-summarizing the full payload from scratch.
+
+Required behavior:
+- preserve one canonical structured report payload
+- support consumer-specific projections/views (for example `delta_brief`, `ops_audit`, `human_readable`, `roadmap_sync`)
+- let consumers declare preferred projection shape and verbosity
+- make the projection lineage explicit so a terse view still points back to the canonical report
+
+Acceptance:
+- Jobdori/Clawhip/humans do not keep rebroadcasting the same full inventory in slightly different prose
+- each consumer gets the right level of detail without inventing its own lossy summary layer
+- reporting noise drops while the underlying truth stays shared and auditable
+
+### 4.28. Canonical report identity / content-hash anchor
+Once multiple projections and summaries exist, the system needs a stable identity anchor proving they all came from the same underlying report state.
+
+Required behavior:
+- assign a canonical report id plus content hash/fingerprint to the full structured payload
+- include projection-specific metadata without changing the canonical identity of unchanged underlying content
+- surface when two projections differ because the source report changed vs because only the rendering changed
+- allow downstream consumers to detect accidental duplicate sends of the exact same report payload
+
+Acceptance:
+- claws can verify that different audience views refer to the same underlying report truth
+- duplicate projections of identical content do not look like new state changes
+- report lineage remains auditable even as the same canonical payload is rendered many ways
+
+### 4.29. Projection invalidation / stale-view cache contract
+If the canonical report changes, previously emitted audience-specific projections must be identifiable as stale so downstream claws do not keep acting on an old rendered view.
+
+Required behavior:
+- bind each projection to the canonical report id + content hash/version it was derived from
+- mark projections as superseded when the underlying canonical payload changes
+- expose whether a consumer is viewing the latest compatible projection or a stale cached one
+- allow cheap regeneration of projections without minting fake new report identities
+
+Acceptance:
+- claws do not mistake an old `delta_brief` view for current truth after the canonical report was updated
+- projection caching reduces noise/compute without increasing stale-action risk
+- audience-specific views stay safely linked to the freshness of the underlying report
+
+### 4.30. Projection-time redaction / sensitivity labeling
+As canonical reports accumulate richer evidence, projections need an explicit policy for what can be shown to which audience without losing machine trust.
+
+Required behavior:
+- label report fields/evidence with sensitivity classes (for example `public`, `internal`, `operator_only`, `secret`)
+- let projections redact, summarize, or hash sensitive fields according to audience policy while preserving the canonical report intact
+- expose when a projection omitted or transformed data for sensitivity reasons
+- preserve enough stable identity/provenance that redacted projections can still be correlated with the canonical report
+
+Acceptance:
+- richer canonical reports do not force all audience views to leak the same detail level
+- consumers can tell `field absent because redacted` from `field absent because nonexistent`
+- audience-specific projections stay safe without turning into unverifiable black boxes
+
+### 4.31. Redaction provenance / policy traceability
+When a projection redacts or transforms data, downstream consumers should be able to tell which policy/rule caused it rather than treating redaction as unexplained disappearance.
+
+Required behavior:
+- attach redaction reason/policy id to transformed or omitted fields
+- distinguish policy-based redaction from size truncation, compatibility downgrade, and source absence
+- preserve auditable linkage from the projection back to the canonical field classification
+- allow operators to review which projection policy version produced the visible output
+
+Acceptance:
+- claws can tell *why* a field was hidden, not just that it vanished
+- redacted projections remain operationally debuggable instead of opaque
+- sensitivity controls stay auditable as reporting/projection policy evolves
+
+### 4.32. Deterministic projection / redaction reproducibility
+Given the same canonical report, schema version, consumer capability set, and projection policy, the emitted projection should be reproducible byte-for-byte (or canonically equivalent) so audits and diffing do not drift on re-render.
+
+Required behavior:
+- make projection/redaction output deterministic for the same inputs
+- surface which inputs participate in projection identity (schema version, capability set, policy version, canonical content hash)
+- distinguish content changes from nondeterministic rendering noise
+- allow canonical equivalence checks even when transport formatting differs
+
+Acceptance:
+- re-rendering the same report for the same audience does not create fake deltas
+- audit/debug workflows can reproduce why a prior projection looked the way it did
+- projection pipelines stay machine-trustworthy under repeated regeneration
+
+### 4.33. Projection golden-fixture / regression lock
+Once structured projections become deterministic, claw-code still needs regression fixtures that lock expected outputs so report rendering changes cannot slip in unnoticed.
+
+Required behavior:
+- maintain canonical fixture inputs covering core report shapes, redaction classes, and capability downgrades
+- snapshot or equivalence-test expected projections for supported audience views
+- make intentional rendering/schema changes update fixtures explicitly rather than drifting silently
+- surface which fixture set/version validated a projection pipeline change
+
+Acceptance:
+- projection regressions get caught before downstream claws notice broken or drifting output
+- deterministic rendering claims stay continuously verified, not assumed
+- report/projection evolution remains fast without sacrificing machine-trustworthy stability
+
+### 4.34. Downstream consumer conformance test contract
+Producer-side fixture coverage is not enough if real downstream claws still parse or interpret the reporting contract incorrectly. The ecosystem needs a way to verify consumer behavior against the declared report schema/projection rules.
+
+Required behavior:
+- define conformance cases for consumers across schema versions, capability downgrades, redaction states, and no-op cycles
+- provide a machine-runnable consumer test kit or fixture bundle
+- distinguish parse success from semantic correctness (for example: correctly handling `redacted` vs `missing`, `stale` vs `current`)
+- surface which consumer/version last passed the conformance suite
+
+Acceptance:
+- report-contract drift is caught at the producer/consumer boundary, not only inside the producer
+- downstream claws can prove they understand the structured reporting surface they claim to support
+- mixed claw fleets stay interoperable without relying on optimism or manual spot checks
+
+### 4.35. Provisional-status dedupe / in-flight acknowledgment suppression
+When a claw emits temporary status such as `working on it`, `please wait`, or `adding a roadmap gap`, repeated provisional notices should not flood the channel unless something materially changed.
+
+Required behavior:
+- fingerprint provisional/in-flight status updates separately from terminal or delta-bearing reports
+- suppress repeated provisional messages with unchanged meaning inside a short reconciliation window
+- allow a new provisional update through only when progress state, owner, blocker, or ETA meaningfully changes
+- preserve raw repeats for audit/debug without exposing each one as a fresh channel event
+
+Acceptance:
+- monitoring feeds do not churn on duplicate `please wait` / `working on it` messages
+- consumers can tell the difference between `still in progress, unchanged` and `new actionable update`
+- in-flight acknowledgments remain useful without drowning out real state transitions
+
+### 4.36. Provisional-status escalation timeout
+If a provisional/in-flight status remains unchanged for too long, the system should stop treating it as harmless noise and promote it back into an actionable stale signal.
+
+Required behavior:
+- attach timeout/TTL policy to provisional states
+- escalate prolonged unchanged provisional status into a typed stale/blocker signal
+- distinguish `deduped because still fresh` from `deduped too long and now suspicious`
+- surface which timeout policy triggered the escalation
+
+Acceptance:
+- `working on it` does not suppress visibility forever when real progress stalled
+- consumers can trust provisional dedupe without losing long-stuck work
+- low-noise monitoring still resurfaces stale in-flight states at the right time
+
+### 4.37. Policy-blocked action handoff
+When a requested action is disallowed by branch/merge/release policy (for example direct `main` push), the system should expose a structured refusal plus the next safe execution path instead of leaving only freeform prose.
+
+Required behavior:
+- classify policy-blocked requests with a typed reason (`main_push_forbidden`, `release_requires_owner`, etc.)
+- attach the governing policy source and actor scope when available
+- emit a safe fallback path (`create branch`, `open PR`, `request owner approval`, etc.)
+- allow downstream claws/operators to distinguish `blocked by policy` from `blocked by technical failure`
+
+Acceptance:
+- policy refusals become machine-actionable instead of dead-end chat text
+- claws can pivot directly to the safe alternative workflow without re-triaging the same request
+- monitoring/reporting can separate governance blocks from actual product/runtime defects
+
+### 4.38. Policy exception / owner-approval token contract
+For actions that are normally blocked by policy but can be allowed with explicit owner approval, the approval path should be machine-readable instead of relying on ambiguous prose interpretation.
+
+Required behavior:
+- represent policy exceptions as typed approval grants or tokens scoped to action/repo/branch/time window
+- bind the approval to the approving actor identity and policy being overridden
+- distinguish `no approval`, `approval pending`, `approval granted`, and `approval expired/revoked`
+- let downstream claws verify an approval artifact before executing the otherwise-blocked action
+
+Acceptance:
+- exceptional approvals stop depending on fuzzy chat interpretation
+- claws can safely execute policy-exception flows without confusing them with ordinary blocked requests
+- governance stays auditable even when owner-authorized exceptions occur
+
+### 4.39. Approval-token replay / one-time-use enforcement
+If policy-exception approvals become machine-readable tokens, they also need replay protection so one explicit exception cannot be silently reused beyond its intended scope.
+
+Required behavior:
+- support one-time-use or bounded-use approval grants where appropriate
+- record token consumption against the exact action/repo/branch/commit scope it authorized
+- reject replay, scope expansion, or post-expiry reuse with typed policy errors
+- surface whether an approval was unused, consumed, partially consumed, expired, or revoked
+
+Acceptance:
+- one owner-approved exception cannot quietly authorize repeated or broader dangerous actions
+- claws can distinguish `valid approval present` from `approval already spent`
+- governance exceptions remain auditable and non-replayable under automation
+
+### 4.40. Approval-token delegation / execution chain traceability
+If one actor approves an exception and another claw/bot/session executes it, the system should preserve the delegation chain so policy exceptions remain attributable end-to-end.
+
+Required behavior:
+- record approver identity, requesting actor, executing actor, and any intermediate relay/orchestrator hop
+- preserve the delegation chain on approval verification and token consumption events
+- distinguish direct self-use from delegated execution
+- surface when execution occurs through an unexpected or unauthorized delegate
+
+Acceptance:
+- policy-exception execution stays attributable even across bot/session hops
+- audits can answer `who approved`, `who requested`, and `who actually used it`
+- delegated exception flows remain governable instead of collapsing into generic bot activity
+
+### 4.41. Token-optimization / repo-scope guidance contract
+New users hit token burn and context bloat immediately, but the product surface does not clearly explain how repo scope, ignored paths, and working-directory choice affect clawability.
+
+Required behavior:
+- explicitly document whether `.clawignore` / `.claudeignore` / `.gitignore` are honored, and how
+- surface a simple recommendation to start from the smallest useful subdirectory instead of the whole monorepo when possible
+- provide first-run guidance for excluding heavy/generated directories (`node_modules`, `dist`, `build`, `.next`, coverage, logs, dumps, generated reports`)
+- make token-saving repo-scope guidance visible in onboarding/help rather than buried in external chat advice
+
+Acceptance:
+- new users can answer `how do I stop dragging junk into context?` from product docs/help alone
+- first-run confusion about ignore files and repo scope drops sharply
+- clawability improves before users burn tokens on obviously-avoidable junk
+
+### 4.42. Workspace-scope weight preview / token-risk preflight
+Before a user starts a session in a repo, claw-code should surface a lightweight estimate of how heavy the current workspace is and why it may be costly.
+
+Required behavior:
+- inspect the current working tree for high-risk token sinks (huge directories, generated artifacts, vendored deps, logs, dumps)
+- summarize likely context-bloat sources before deep indexing or first large prompt flow
+- recommend safer scope choices (e.g. narrower subdirectory, ignore patterns, cleanup targets)
+- distinguish `workspace looks clean` from `workspace is likely to burn tokens fast`
+
+Acceptance:
+- users get an early warning before accidentally dogfooding the entire junkyard
+- token-saving guidance becomes situational and concrete, not just generic docs
+- onboarding catches avoidable repo-scope mistakes before they turn into cost/perf complaints
+
+### 4.43. Safer-scope quick-apply action
+After warning that the current workspace is too heavy, claw-code should offer a direct way to adopt the safer scope instead of leaving the user to manually reinterpret the advice.
+
+Required behavior:
+- turn scope recommendations into actionable choices (e.g. switch to subdirectory, generate ignore stub, exclude detected heavy paths)
+- preview what would be included/excluded before applying the change
+- preserve an easy path back to the original broader scope
+- distinguish advisory suggestions from user-confirmed scope changes
+
+Acceptance:
+- users can go from `this workspace is too heavy` to `use this safer scope` in one step
+- token-risk preflight becomes operational guidance, not just warning text
+- first-run users stop getting stuck between diagnosis and manual cleanup
+
 ### 5. Failure taxonomy
 Normalize failure classes:
 - `prompt_delivery`
@@ -148,6 +729,20 @@ Acceptance:
 - blockers are machine-classified
 - dashboards and retry policies can branch on failure type
 
+### 5.5. Transport outage vs lane failure boundary
+When the control server or transport goes down, claw-code should distinguish host-level outage from lane-local failure instead of letting all active lanes look broken in the same vague way.
+
+Required behavior:
+- emit typed transport outage events separate from lane failure events
+- annotate impacted lanes with dependency status (`blocked_by_transport`) rather than rewriting them as ordinary lane errors
+- preserve the last known good lane state before transport loss
+- surface outage scope (`single session`, `single worker host`, `shared control server`)
+
+Acceptance:
+- clawhip can say `server down blocked 3 lanes` instead of pretending 3 independent lane failures happened
+- recovery policies can restart transport separately from lane-local recovery recipes
+- postmortems can separate infra blast radius from actual code-lane defects
+
 ### 6. Actionable summary compression
 Collapse noisy event streams into:
 - current phase
@@ -158,6 +753,23 @@ Collapse noisy event streams into:
 Acceptance:
 - channel status updates stay short and machine-grounded
 - claws stop inferring state from raw build spam
+
+### 6.5. Blocked-state subphase contract
+When a lane is `blocked`, also expose the exact subphase where progress stopped, rather than forcing claws to infer from logs.
+
+Subphases should include at least:
+- `blocked.trust_prompt`
+- `blocked.prompt_delivery`
+- `blocked.plugin_init`
+- `blocked.mcp_handshake`
+- `blocked.branch_freshness`
+- `blocked.test_hang`
+- `blocked.report_pending`
+
+Acceptance:
+- `lane.blocked` carries a stable subphase enum + short human summary
+- clawhip can say "blocked at MCP handshake" or "blocked waiting for trust clear" without pane scraping
+- retries can target the correct recovery recipe instead of treating all blocked states the same
 
 ## Phase 3 — Branch/Test Awareness and Auto-Recovery
 
@@ -181,6 +793,22 @@ Encode known automatic recoveries for:
 Acceptance:
 - one automatic recovery attempt occurs before escalation
 - the attempted recovery is itself emitted as structured event data
+
+### 8.5. Recovery attempt ledger
+Expose machine-readable recovery progress so claws can see what automatic recovery has already tried, what is still running, and why escalation happened.
+
+Ledger should include at least:
+- recovery recipe id
+- attempt count
+- current recovery state (`queued`, `running`, `succeeded`, `failed`, `exhausted`)
+- started/finished timestamps
+- last failure summary
+- escalation reason when retries stop
+
+Acceptance:
+- clawhip can report `auto-recover tried prompt replay twice, then escalated` without log archaeology
+- operators can distinguish `no recovery attempted` from `recovery already exhausted`
+- repeated silent retry loops become visible and auditable
 
 ### 9. Green-ness contract
 Workers should distinguish:
@@ -248,6 +876,21 @@ Expose a machine-readable board of:
 Acceptance:
 - claws can query status directly
 - human-facing views become a rendering layer, not the source of truth
+
+### 12.5. Running-state liveness heartbeat
+When a lane is marked `working` or otherwise in-progress, emit a lightweight liveness heartbeat so claws can tell quiet progress from silent stall.
+
+Heartbeat should include at least:
+- current phase/subphase
+- seconds since last meaningful progress
+- seconds since last heartbeat
+- current active step label
+- whether background work is expected
+
+Acceptance:
+- clawhip can distinguish `quiet but alive` from `working state went stale`
+- stale detection stops depending on raw pane churn alone
+- long-running compile/test/background steps stay machine-visible without log scraping
 
 ## Phase 5 — Plugin and MCP Lifecycle Maturity
 
@@ -428,6 +1071,8 @@ Model name prefix now wins unconditionally over env-var presence. Regression tes
 
 32. **OpenAI-compatible provider/model-id passthrough is not fully literal** — **verified no-bug on 2026-04-09**: `resolve_model_alias()` only matches bare shorthand aliases (`opus`/`sonnet`/`haiku`) and passes everything else through unchanged, so `openai/gpt-4` reaches the dispatch layer unmodified. `strip_routing_prefix()` at `openai_compat.rs:732` then strips only recognised routing prefixes (`openai`, `xai`, `grok`, `qwen`) so the wire model is the bare backend id. No fix needed. **Original filing below.**
 
+42. **Hook JSON failure opacity: invalid hook output does not surface the offending payload/context** — dogfooding on 2026-04-13 in the live `clawcode-human` lane repeatedly hit `PreToolUse/PostToolUse/Stop hook returned invalid ... JSON output` while the operator had no immediate visibility into which hook emitted malformed JSON, what raw stdout/stderr came back, or whether the failure was hook-formatting breakage vs prompt-misdelivery fallout. This turns a recoverable hook/schema bug into generic lane fog. **Impact.** Lanes look blocked/noisy, but the event surface is too lossy to classify whether the next action is fix the hook serializer, retry prompt delivery, or ignore a harmless hook-side warning. **Concrete delta landed now.** Recorded as an Immediate Backlog item so the failure is tracked explicitly instead of disappearing into channel scrollback. **Recommended fix shape:** when hook JSON parse fails, emit a typed hook failure event carrying hook phase/name, command/path, exit status, and a redacted raw stdout/stderr preview (bounded + safe), plus a machine class like `hook_invalid_json`. Add regression coverage for malformed-but-nonempty hook output so the surfaced error includes the preview instead of only `invalid ... JSON output`.
+
 32. **OpenAI-compatible provider/model-id passthrough is not fully literal** — dogfooded 2026-04-08 via live user in #claw-code who confirmed the exact backend model id works outside claw but fails through claw for an OpenAI-compatible endpoint. The gap: `openai/` prefix is correctly used for **transport selection** (pick the OpenAI-compat client) but the **wire model id** — the string placed in `"model": "..."` in the JSON request body — may not be the literal backend model string the user supplied. Two candidate failure modes: **(a)** `resolve_model_alias()` is called on the model string before it reaches the wire — alias expansion designed for Anthropic/known models corrupts a user-supplied backend-specific id; **(b)** the `openai/` routing prefix may not be stripped before `build_chat_completion_request` packages the body, so backends receive `openai/gpt-4` instead of `gpt-4`. **Fix shape:** cleanly separate transport selection from wire model id. Transport selection uses the prefix; wire model id is the user-supplied string minus only the routing prefix — no alias expansion, no prefix leakage. **Trace path for next session:** (1) find where `resolve_model_alias()` is called relative to the OpenAI-compat dispatch path; (2) inspect what `build_chat_completion_request` puts in `"model"` for an `openai/some-backend-id` input. **Source:** live user in #claw-code 2026-04-08, confirmed exact model id works outside claw, fails through claw for OpenAI-compat backend.
 
 33. **OpenAI `/responses` endpoint rejects claw's tool schema: `object schema missing properties` / `invalid_function_parameters`** — **done at `e7e0fd2` on 2026-04-09**. Added `normalize_object_schema()` in `openai_compat.rs` which recursively walks JSON Schema trees and injects `"properties": {}` and `"additionalProperties": false` on every object-type node (without overwriting existing values). Called from `openai_tool_definition()` so both `/chat/completions` and `/responses` receive strict-validator-safe schemas. 3 unit tests added. All api tests pass. **Original filing below.**
@@ -499,6 +1144,8 @@ Model name prefix now wins unconditionally over env-var presence. Regression tes
 **Scope note (verified 2026-04-12):** ROADMAP #31, #43, and #63 currently appear to describe acpx/droid or upstream OMX/server orchestration behavior, not claw-code source already present in this repository. Repo-local searches for `acpx`, `use-droid`, `run-acpx`, `commit-wrapper`, `ultraclaw`, `/hooks/health`, and `/hooks/status` found no implementation hits outside `ROADMAP.md`, and the earlier state-surface note already records that the HTTP server is not owned by claw-code. With #45, #64-#69, and #75 now fixed, the remaining unresolved items in this section still look like external tracking notes rather than confirmed repo-local backlog; re-check if new repo-local evidence appears.
 
 63. **Droid session completion semantics broken: code arrives after "status: completed"** — dogfooded 2026-04-12. Ultraclaw droid sessions (use-droid via acpx) report `session.status: completed` before file writes are fully flushed/synced to the working tree. Discovered +410 lines of "late-arriving" droid output that appeared after I had already assessed 8 sessions as "no code produced." This creates false-negative assessments and duplicate work. **Fix shape:** (a) droid agent should only report completion after explicit file-write confirmation (fsync or existence check); (b) or, claw-code should expose a `pending_writes` status that indicates "agent responded, disk flush pending"; (c) lane orchestrators should poll for file changes for N seconds after completion before final assessment. **Blocker:** none. Source: Jobdori ultraclaw dogfood 2026-04-12.
+
+64. **ACP/Zed editor integration entrypoint is too implicit** — dogfooded 2026-04-13 from a user request for a `-acp` parameter to support ACP protocol integration in editor-first workflows such as Zed. The gap is not generic "please add another integration" churn; it is a **discoverability and launch-contract problem**. Right now the product surface does not make it obvious whether ACP is already supported, how an editor should invoke claw-code, or whether a dedicated flag/mode exists at all. That forces evaluators into repo archaeology instead of giving them a crisp editor-facing invocation contract. **Fix shape:** either (a) add an explicit ACP/editor entrypoint such as `--acp` / `acp serve` with help text that states the contract, or (b) if the protocol path already exists, surface it prominently in CLI help/README with a concrete Zed/editor integration example so users do not have to guess. **Acceptance bar:** an editor-first user can answer "how do I launch claw-code for ACP/Zed?" from `claw --help` or the first screen of docs without reading source. **Blocker:** none; currently recorded as a roadmap follow-up because the repo-local entrypoint was not obvious during dogfood.
 
 64. **Artifact provenance is post-hoc narration, not structured events** — **done (verified 2026-04-12):** completed lane persistence in `rust/crates/tools/src/lib.rs` now attaches structured `artifactProvenance` metadata to `lane.finished`, including `sourceLanes`, `roadmapIds`, `files`, `diffStat`, `verification`, and `commitSha`, while keeping the existing `lane.commit.created` provenance event intact. Regression coverage locks a successful completion payload that carries roadmap ids, file paths, diff stat, verification states, and commit sha without relying on prose re-parsing. **Original filing below.**
 
