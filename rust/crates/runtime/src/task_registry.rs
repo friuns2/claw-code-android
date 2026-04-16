@@ -85,11 +85,12 @@ impl TaskRegistry {
         packet: TaskPacket,
     ) -> Result<Task, TaskPacketValidationError> {
         let packet = validate_packet(packet)?.into_inner();
-        Ok(self.create_task(
-            packet.objective.clone(),
-            Some(packet.scope.clone()),
-            Some(packet),
-        ))
+        // Use scope_path as description if available, otherwise use scope as string
+        let description = packet
+            .scope_path
+            .clone()
+            .or_else(|| Some(packet.scope.to_string()));
+        Ok(self.create_task(packet.objective.clone(), description, Some(packet)))
     }
 
     fn create_task(
@@ -249,10 +250,13 @@ mod tests {
 
     #[test]
     fn creates_task_from_packet() {
+        use crate::task_packet::TaskScope;
         let registry = TaskRegistry::new();
         let packet = TaskPacket {
             objective: "Ship task packet support".to_string(),
-            scope: "runtime/task system".to_string(),
+            scope: TaskScope::Module,
+            scope_path: Some("runtime/task system".to_string()),
+            worktree: Some("/tmp/wt-task".to_string()),
             repo: "claw-code-parity".to_string(),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec!["cargo test --workspace".to_string()],

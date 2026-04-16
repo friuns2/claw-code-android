@@ -9554,9 +9554,12 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn run_task_packet_creates_packet_backed_task() {
+        use runtime::task_packet::TaskScope;
         let result = run_task_packet(TaskPacket {
             objective: "Ship packetized runtime task".to_string(),
-            scope: "runtime/task system".to_string(),
+            scope: TaskScope::Module,
+            scope_path: Some("runtime/task system".to_string()),
+            worktree: Some("/tmp/wt-packet".to_string()),
             repo: "claw-code-parity".to_string(),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec![

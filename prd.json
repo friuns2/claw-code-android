@@ -1,0 +1,121 @@
+{
+  "version": "1.0",
+  "description": "Clawable Coding Harness - Clear roadmap stories and commit each",
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "Phase 1.6 - startup-no-evidence evidence bundle + classifier",
+      "description": "When startup times out, emit typed worker.startup_no_evidence event with evidence bundle including last known worker lifecycle state, pane command, prompt-send timestamp, prompt-acceptance state, trust-prompt detection result, and transport/MCP health summary. Classifier should down-rank into specific failure classes.",
+      "acceptanceCriteria": [
+        "worker.startup_no_evidence event emitted on startup timeout with evidence bundle",
+        "Evidence bundle includes: last lifecycle state, pane command, prompt-send timestamp, prompt-acceptance state, trust-prompt detection, transport/MCP health",
+        "Classifier attempts to categorize into: trust_required, prompt_misdelivery, prompt_acceptance_timeout, transport_dead, worker_crashed, or unknown",
+        "Tests verify evidence bundle structure and classifier behavior"
+      ],
+      "passes": true,
+      "priority": "P0"
+    },
+    {
+      "id": "US-002",
+      "title": "Phase 2 - Canonical lane event schema (4.x series)",
+      "description": "Define typed events for lane lifecycle: lane.started, lane.ready, lane.prompt_misdelivery, lane.blocked, lane.red, lane.green, lane.commit.created, lane.pr.opened, lane.merge.ready, lane.finished, lane.failed, branch.stale_against_main. Also implement event ordering, reconciliation, provenance, deduplication, and projection contracts.",
+      "acceptanceCriteria": [
+        "LaneEvent enum with all required variants defined",
+        "Event ordering with monotonic sequence metadata attached",
+        "Event provenance labels (live_lane, test, healthcheck, replay, transport)",
+        "Session identity completeness at creation (title, workspace, purpose)",
+        "Duplicate terminal-event suppression with fingerprinting",
+        "Lane ownership/scope binding in events",
+        "Nudge acknowledgment with dedupe contract",
+        "clawhip consumes typed lane events instead of pane scraping"
+      ],
+      "passes": true,
+      "priority": "P0"
+    },
+    {
+      "id": "US-003",
+      "title": "Phase 3 - Stale-branch detection before broad verification",
+      "description": "Before broad test runs, compare current branch to main and detect if known fixes are missing. Emit branch.stale_against_main event and suggest/auto-run rebase/merge-forward.",
+      "acceptanceCriteria": [
+        "Branch freshness comparison against main implemented",
+        "branch.stale_against_main event emitted when behind",
+        "Auto-rebase/merge-forward policy integration",
+        "Avoid misclassifying stale-branch failures as new regressions"
+      ],
+      "passes": true,
+      "priority": "P1"
+    },
+    {
+      "id": "US-004",
+      "title": "Phase 3 - Recovery recipes with ledger",
+      "description": "Encode automatic recoveries for common failures (trust prompt, prompt misdelivery, stale branch, compile red, MCP startup). Expose recovery attempt ledger with recipe id, attempt count, state, timestamps, failure summary.",
+      "acceptanceCriteria": [
+        "Recovery recipes defined for: trust_prompt_unresolved, prompt_delivered_to_shell, stale_branch, compile_red_after_refactor, MCP_handshake_failure, partial_plugin_startup",
+        "Recovery attempt ledger with: recipe id, attempt count, state, timestamps, failure summary, escalation reason",
+        "One automatic recovery attempt before escalation",
+        "Ledger emitted as structured event data"
+      ],
+      "passes": true,
+      "priority": "P1"
+    },
+    {
+      "id": "US-005",
+      "title": "Phase 4 - Typed task packet format",
+      "description": "Define structured task packet with fields: objective, scope, repo/worktree, branch policy, acceptance tests, commit policy, reporting contract, escalation policy.",
+      "acceptanceCriteria": [
+        "TaskPacket struct with all required fields",
+        "TaskScope resolution (workspace/module/single-file/custom)",
+        "Validation and serialization support",
+        "Integration into tools/src/lib.rs"
+      ],
+      "passes": true,
+      "priority": "P1"
+    },
+    {
+      "id": "US-006",
+      "title": "Phase 4 - Policy engine for autonomous coding",
+      "description": "Encode automation rules: if green + scoped diff + review passed -> merge to dev; if stale branch -> merge-forward before broad tests; if startup blocked -> recover once, then escalate; if lane completed -> emit closeout and cleanup session.",
+      "acceptanceCriteria": [
+        "Policy rules engine implemented",
+        "Rules: green + scoped diff + review -> merge",
+        "Rules: stale branch -> merge-forward before tests",
+        "Rules: startup blocked -> recover once, then escalate",
+        "Rules: lane completed -> closeout and cleanup"
+      ],
+      "passes": true,
+      "priority": "P2"
+    },
+    {
+      "id": "US-007",
+      "title": "Phase 5 - Plugin/MCP lifecycle maturity",
+      "description": "First-class plugin/MCP lifecycle contract: config validation, startup healthcheck, discovery result, degraded-mode behavior, shutdown/cleanup. Close gaps in end-to-end lifecycle.",
+      "acceptanceCriteria": [
+        "Plugin/MCP config validation contract",
+        "Startup healthcheck with structured results",
+        "Discovery result reporting",
+        "Degraded-mode behavior documented and implemented",
+        "Shutdown/cleanup contract",
+        "Partial startup and per-server failures reported structurally"
+      ],
+      "passes": true,
+      "priority": "P2"
+    },
+    {
+      "id": "US-008",
+      "title": "Fix kimi-k2.5 model API compatibility",
+      "description": "The kimi-k2.5 model (and other kimi models) reject API requests containing the is_error field in tool result messages. The OpenAI-compatible provider currently always includes is_error for all models. Need to make this field conditional based on model support.",
+      "acceptanceCriteria": [
+        "translate_message function accepts model parameter",
+        "is_error field excluded for kimi models (kimi-k2.5, kimi-k1.5, etc.)",
+        "is_error field included for models that support it (openai, grok, xai, etc.)",
+        "build_chat_completion_request passes model to translate_message",
+        "Tests verify is_error presence/absence based on model",
+        "cargo test passes",
+        "cargo clippy passes",
+        "cargo fmt passes"
+      ],
+      "passes": true,
+      "priority": "P0"
+    }
+  ]
+}

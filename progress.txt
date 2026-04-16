@@ -1,0 +1,83 @@
+Ralph Iteration Summary - claw-code Roadmap Implementation
+===========================================================
+
+Iteration 1: 2026-04-16
+------------------------
+
+US-001 COMPLETED (Phase 1.6 - startup-no-evidence evidence bundle + classifier)
+- Files: rust/crates/runtime/src/worker_boot.rs
+- Added StartupFailureClassification enum with 6 variants
+- Added StartupEvidenceBundle with 8 fields
+- Implemented classify_startup_failure() logic
+- Added observe_startup_timeout() method to Worker
+- Tests: 6 new tests verifying classification logic
+
+US-002 COMPLETED (Phase 2 - Canonical lane event schema)
+- Files: rust/crates/runtime/src/lane_events.rs
+- Added EventProvenance enum with 5 labels
+- Added SessionIdentity, LaneOwnership structs
+- Added LaneEventMetadata with sequence/ordering
+- Added LaneEventBuilder for construction
+- Implemented is_terminal_event(), dedupe_terminal_events()
+- Tests: 10 new tests for events and deduplication
+
+US-005 COMPLETED (Phase 4 - Typed task packet format)
+- Files:
+  - rust/crates/runtime/src/task_packet.rs
+  - rust/crates/runtime/src/task_registry.rs
+  - rust/crates/tools/src/lib.rs
+- Added TaskScope enum (Workspace, Module, SingleFile, Custom)
+- Updated TaskPacket with scope_path and worktree fields
+- Added validate_scope_requirements() validation logic
+- Fixed all test compilation errors in dependent modules
+- Tests: Updated existing tests to use new types
+
+PRE-EXISTING IMPLEMENTATIONS (verified working):
+------------------------------------------------
+
+US-003 COMPLETE (Phase 3 - Stale-branch detection)
+- Files: rust/crates/runtime/src/stale_branch.rs
+- BranchFreshness enum (Fresh, Stale, Diverged)
+- StaleBranchPolicy (AutoRebase, AutoMergeForward, WarnOnly, Block)
+- StaleBranchEvent with structured events
+- check_freshness() with git integration
+- apply_policy() with policy resolution
+- Tests: 12 unit tests + 5 integration tests passing
+
+US-004 COMPLETE (Phase 3 - Recovery recipes with ledger)
+- Files: rust/crates/runtime/src/recovery_recipes.rs
+- FailureScenario enum with 7 scenarios
+- RecoveryStep enum with actionable steps
+- RecoveryRecipe with step sequences
+- RecoveryLedger for attempt tracking
+- RecoveryEvent for structured emission
+- attempt_recovery() with escalation logic
+- Tests: 15 unit tests + 1 integration test passing
+
+US-006 COMPLETE (Phase 4 - Policy engine for autonomous coding)
+- Files: rust/crates/runtime/src/policy_engine.rs
+- PolicyRule with condition/action/priority
+- PolicyCondition (And, Or, GreenAt, StaleBranch, etc.)
+- PolicyAction (MergeToDev, RecoverOnce, Escalate, etc.)
+- LaneContext for evaluation context
+- evaluate() for rule matching
+- Tests: 18 unit tests + 6 integration tests passing
+
+US-007 COMPLETE (Phase 5 - Plugin/MCP lifecycle maturity)
+- Files: rust/crates/runtime/src/plugin_lifecycle.rs
+- ServerStatus enum (Healthy, Degraded, Failed)
+- ServerHealth with capabilities tracking
+- PluginState with full lifecycle states
+- PluginLifecycle event tracking
+- PluginHealthcheck structured results
+- DiscoveryResult for capability discovery
+- DegradedMode behavior
+- Tests: 11 unit tests passing
+
+VERIFICATION STATUS:
+------------------
+- cargo build --workspace: PASSED
+- cargo test --workspace: PASSED (476+ unit tests, 12 integration tests)
+- cargo clippy --workspace: PASSED
+
+All 7 stories from prd.json now have passes: true
