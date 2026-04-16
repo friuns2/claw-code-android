@@ -47,6 +47,24 @@ fn status_and_sandbox_emit_json_when_requested() {
 }
 
 #[test]
+fn acp_guidance_emits_json_when_requested() {
+    let root = unique_temp_dir("acp-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let acp = assert_json_command(&root, &["--output-format", "json", "acp"]);
+    assert_eq!(acp["kind"], "acp");
+    assert_eq!(acp["status"], "discoverability_only");
+    assert_eq!(acp["supported"], false);
+    assert_eq!(acp["serve_alias_only"], true);
+    assert_eq!(acp["discoverability_tracking"], "ROADMAP #64a");
+    assert_eq!(acp["tracking"], "ROADMAP #76");
+    assert!(acp["message"]
+        .as_str()
+        .expect("acp message")
+        .contains("discoverability alias"));
+}
+
+#[test]
 fn inventory_commands_emit_structured_json_when_requested() {
     let root = unique_temp_dir("inventory-json");
     fs::create_dir_all(&root).expect("temp dir should exist");

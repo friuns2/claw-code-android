@@ -95,6 +95,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--allowedTools",
     "--allowed-tools",
     "--resume",
+    "--acp",
+    "-acp",
     "--print",
     "--compact",
     "--base-commit",
@@ -248,6 +250,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
+        CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Export {
@@ -337,6 +340,9 @@ enum CliAction {
     Doctor {
         output_format: CliOutputFormat,
     },
+    Acp {
+        output_format: CliOutputFormat,
+    },
     State {
         output_format: CliOutputFormat,
     },
@@ -368,6 +374,7 @@ enum LocalHelpTopic {
     Status,
     Sandbox,
     Doctor,
+    Acp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,6 +554,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 rest.push(flag[9..].to_string());
                 index += 1;
             }
+            "--acp" | "-acp" => {
+                rest.push("acp".to_string());
+                index += 1;
+            }
             "--allowedTools" | "--allowed-tools" => {
                 let value = args
                     .get(index + 1)
@@ -661,6 +672,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
+        "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
@@ -715,6 +727,7 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "status" => LocalHelpTopic::Status,
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
+        "acp" => LocalHelpTopic::Acp,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -783,6 +796,16 @@ fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
         "`claw {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
     )
+}
+
+fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    match args {
+        [] => Ok(CliAction::Acp { output_format }),
+        [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
+        _ => Err(String::from(
+            "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
+        )),
+    }
 }
 
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
@@ -5175,11 +5198,51 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Output           local-only health report; no provider request or session resume required
   Related          /doctor · claw --resume latest /doctor"
             .to_string(),
+        LocalHelpTopic::Acp => "ACP / Zed
+  Usage            claw acp [serve]
+  Aliases          claw --acp · claw -acp
+  Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
+  Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
+  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
+            .to_string(),
     }
 }
 
 fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
+}
+
+fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let message = "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
+    match output_format {
+        CliOutputFormat::Text => {
+            println!(
+                "ACP / Zed\n  Status           discoverability only\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76\n  Message          {message}"
+            );
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "acp",
+                    "status": "discoverability_only",
+                    "supported": false,
+                    "serve_alias_only": true,
+                    "message": message,
+                    "launch_command": serde_json::Value::Null,
+                    "aliases": ["acp", "--acp", "-acp"],
+                    "discoverability_tracking": "ROADMAP #64a",
+                    "tracking": "ROADMAP #76",
+                    "recommended_workflows": [
+                        "claw prompt TEXT",
+                        "claw",
+                        "claw doctor"
+                    ],
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -8148,6 +8211,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "  claw acp [serve]")?;
+    writeln!(
+        out,
+        "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
+    )?;
     writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
     writeln!(
         out,
@@ -9201,6 +9269,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_acp_command_surfaces() {
+        assert_eq!(
+            parse_args(&["acp".to_string()]).expect("acp should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["acp".to_string(), "serve".to_string()]).expect("acp serve should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["--acp".to_string()]).expect("--acp should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["-acp".to_string()]).expect("-acp should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
     fn local_command_help_flags_stay_on_the_local_parser_path() {
         assert_eq!(
             parse_args(&["status".to_string(), "--help".to_string()])
@@ -9216,6 +9312,10 @@ mod tests {
             parse_args(&["doctor".to_string(), "--help".to_string()])
                 .expect("doctor help should parse"),
             CliAction::HelpTopic(LocalHelpTopic::Doctor)
+        );
+        assert_eq!(
+            parse_args(&["acp".to_string(), "--help".to_string()]).expect("acp help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Acp)
         );
     }
 
@@ -10125,6 +10225,7 @@ mod tests {
         assert!(help.contains("claw status"));
         assert!(help.contains("claw sandbox"));
         assert!(help.contains("claw init"));
+        assert!(help.contains("claw acp [serve]"));
         assert!(help.contains("claw agents"));
         assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));

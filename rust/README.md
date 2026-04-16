@@ -135,6 +135,7 @@ Top-level commands:
   version
   status
   sandbox
+  acp [serve]
   dump-manifests
   bootstrap-plan
   agents
@@ -143,6 +144,8 @@ Top-level commands:
   system-prompt
   init
 ```
+
+`claw acp` is a local discoverability surface for editor-first users: it reports the current ACP/Zed status without starting the runtime. As of April 16, 2026, claw-code does **not** ship an ACP/Zed daemon entrypoint yet, and `claw acp serve` is only a status alias until the real protocol surface lands.
 
 The command surface is moving quickly. For the canonical live help text, run:
 
