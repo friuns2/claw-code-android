@@ -53,6 +53,8 @@ pub enum ApiError {
         request_id: Option<String>,
         body: String,
         retryable: bool,
+        /// Suggested user action based on error type (e.g., "Reduce prompt size" for 413)
+        suggested_action: Option<String>,
     },
     RetriesExhausted {
         attempts: u32,
@@ -239,6 +241,7 @@ impl ApiError {
 }
 
 impl Display for ApiError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingCredentials {
@@ -340,9 +343,7 @@ impl Display for ApiError {
                 provider,
             } => write!(
                 f,
-                "request body size ({} bytes) exceeds {provider} limit ({} bytes); reduce prompt length or context before retrying",
-                estimated_bytes,
-                max_bytes
+                "request body size ({estimated_bytes} bytes) exceeds {provider} limit ({max_bytes} bytes); reduce prompt length or context before retrying"
             ),
         }
     }
@@ -489,6 +490,7 @@ mod tests {
             request_id: Some("req_jobdori_123".to_string()),
             body: String::new(),
             retryable: true,
+            suggested_action: None,
         };
 
         assert!(error.is_generic_fatal_wrapper());
@@ -511,6 +513,7 @@ mod tests {
                 request_id: Some("req_nested_456".to_string()),
                 body: String::new(),
                 retryable: true,
+                suggested_action: None,
             }),
         };
 
@@ -531,6 +534,7 @@ mod tests {
             request_id: Some("req_ctx_123".to_string()),
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         assert!(error.is_context_window_failure());

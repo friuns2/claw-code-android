@@ -32,9 +32,9 @@ pub struct OpenAiCompatConfig {
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
     /// Maximum request body size in bytes. Provider-specific limits:
-    /// - DashScope: 6MB (6_291_456 bytes) - observed in dogfood testing
-    /// - OpenAI: 100MB (104_857_600 bytes)
-    /// - xAI: 50MB (52_428_800 bytes)
+    /// - `DashScope`: 6MB (`6_291_456` bytes) - observed in dogfood testing
+    /// - `OpenAI`: 100MB (`104_857_600` bytes)
+    /// - `xAI`: 50MB (`52_428_800` bytes)
     pub max_request_body_bytes: usize,
 }
 
@@ -196,6 +196,10 @@ impl OpenAiCompatClient {
                     request_id,
                     body,
                     retryable: false,
+                    suggested_action: suggested_action_for_status(
+                        reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                            .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                    ),
                 });
             }
         }
@@ -1289,6 +1293,7 @@ fn parse_sse_frame(
                 request_id: None,
                 body: payload.clone(),
                 retryable: false,
+                suggested_action: suggested_action_for_status(status),
             });
         }
     }
@@ -1346,6 +1351,8 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
 
+    let suggested_action = suggested_action_for_status(status);
+
     Err(ApiError::Api {
         status,
         error_type: parsed_error
@@ -1357,11 +1364,26 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         request_id,
         body,
         retryable,
+        suggested_action,
     })
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Generate a suggested user action based on the HTTP status code and error context.
+/// This provides actionable guidance when API requests fail.
+fn suggested_action_for_status(status: reqwest::StatusCode) -> Option<String> {
+    match status.as_u16() {
+        401 => Some("Check API key is set correctly and has not expired".to_string()),
+        403 => Some("Verify API key has required permissions for this operation".to_string()),
+        413 => Some("Reduce prompt size or context window before retrying".to_string()),
+        429 => Some("Wait a moment before retrying; consider reducing request rate".to_string()),
+        500 => Some("Provider server error - retry after a brief wait".to_string()),
+        502..=504 => Some("Provider gateway error - retry after a brief wait".to_string()),
+        _ => None,
+    }
 }
 
 fn normalize_finish_reason(value: &str) -> String {
@@ -2142,7 +2164,7 @@ mod tests {
                 assert_eq!(max_bytes, 6_291_456); // 6MB limit
                 assert!(estimated_bytes > max_bytes);
             }
-            _ => panic!("expected RequestBodySizeExceeded error, got {:?}", err),
+            _ => panic!("expected RequestBodySizeExceeded error, got {err:?}"),
         }
     }
 

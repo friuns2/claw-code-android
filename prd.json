@@ -160,6 +160,168 @@
       ],
       "passes": true,
       "priority": "P2"
+    },
+    {
+      "id": "US-012",
+      "title": "Trust prompt resolver with allowlist auto-trust",
+      "description": "Add allowlisted auto-trust behavior for known repos/worktrees. Trust prompts currently block TUI startup and require manual intervention. Implement automatic trust resolution for pre-approved repositories.",
+      "acceptanceCriteria": [
+        "TrustAllowlist config structure with repo patterns",
+        "Auto-trust behavior for allowlisted repos/worktrees",
+        "trust_required event emitted when trust prompt detected",
+        "trust_resolved event emitted when trust is granted",
+        "Non-allowlisted repos remain gated (manual trust required)",
+        "Integration with worker boot lifecycle",
+        "Tests for allowlist matching and event emission"
+      ],
+      "passes": true,
+      "priority": "P1"
+    },
+    {
+      "id": "US-013",
+      "title": "Phase 2 - Session event ordering + terminal-state reconciliation",
+      "description": "When the same session emits contradictory lifecycle events (idle, error, completed, transport/server-down) in close succession, expose deterministic final truth. Attach monotonic sequence/causal ordering metadata, classify terminal vs advisory events, reconcile duplicate/out-of-order terminal events into one canonical lane outcome.",
+      "acceptanceCriteria": [
+        "Monotonic sequence / causal ordering metadata attached to session lifecycle events",
+        "Terminal vs advisory event classification implemented",
+        "Reconcile duplicate or out-of-order terminal events into one canonical outcome",
+        "Distinguish 'session terminal state unknown because transport died' from real 'completed'",
+        "Tests verify reconciliation behavior with out-of-order event bursts"
+      ],
+      "passes": true,
+      "priority": "P1"
+    },
+    {
+      "id": "US-014",
+      "title": "Phase 2 - Event provenance / environment labeling",
+      "description": "Every emitted event should declare its source (live_lane, test, healthcheck, replay, transport) so claws do not mistake test noise for production truth. Include environment/channel label, emitter identity, and confidence/trust level.",
+      "acceptanceCriteria": [
+        "EventProvenance enum with live_lane, test, healthcheck, replay, transport variants",
+        "Environment/channel label attached to all events",
+        "Emitter identity field on events",
+        "Confidence/trust level field for downstream automation",
+        "Tests verify provenance labeling and filtering"
+      ],
+      "passes": true,
+      "priority": "P1"
+    },
+    {
+      "id": "US-015",
+      "title": "Phase 2 - Session identity completeness at creation time",
+      "description": "A newly created session should emit stable title, workspace/worktree path, and lane/session purpose at creation time. If any field is not yet known, emit explicit typed placeholder reason rather than bare unknown string.",
+      "acceptanceCriteria": [
+        "Session creation emits stable title, workspace/worktree path, purpose immediately",
+        "Explicit typed placeholder when fields unknown (not bare 'unknown' strings)",
+        "Later-enriched metadata reconciles onto same session identity without ambiguity",
+        "Tests verify session identity completeness and placeholder handling"
+      ],
+      "passes": true,
+      "priority": "P1"
+    },
+    {
+      "id": "US-016",
+      "title": "Phase 2 - Duplicate terminal-event suppression",
+      "description": "When the same session emits repeated completed/failed/terminal notifications, collapse duplicates before they trigger repeated downstream reactions. Attach canonical terminal-event fingerprint per lane/session outcome.",
+      "acceptanceCriteria": [
+        "Canonical terminal-event fingerprint attached per lane/session outcome",
+        "Suppress/coalesce repeated terminal notifications within reconciliation window",
+        "Preserve raw event history for audit while exposing one actionable outcome downstream",
+        "Surface when later duplicate materially differs from original terminal payload",
+        "Tests verify deduplication and material difference detection"
+      ],
+      "passes": true,
+      "priority": "P2"
+    },
+    {
+      "id": "US-017",
+      "title": "Phase 2 - Lane ownership / scope binding",
+      "description": "Each session and lane event should declare who owns it and what workflow scope it belongs to. Attach owner/assignee identity, workflow scope (claw-code-dogfood, external-git-maintenance, infra-health, manual-operator), and mark whether watcher is expected to act, observe only, or ignore.",
+      "acceptanceCriteria": [
+        "Owner/assignee identity attached to sessions and lane events",
+        "Workflow scope field (claw-code-dogfood, external-git-maintenance, etc.)",
+        "Watcher action expectation field (act, observe-only, ignore)",
+        "Preserve scope through session restarts, resumes, and late terminal events",
+        "Tests verify ownership and scope binding"
+      ],
+      "passes": true,
+      "priority": "P2"
+    },
+    {
+      "id": "US-018",
+      "title": "Phase 2 - Nudge acknowledgment / dedupe contract",
+      "description": "Periodic clawhip nudges should carry nudge id/cycle id and delivery timestamp. Expose whether claw has already acknowledged or responded for that cycle. Distinguish new nudge, retry nudge, and stale duplicate.",
+      "acceptanceCriteria": [
+        "Nudge id / cycle id and delivery timestamp attached",
+        "Acknowledgment state exposed (already acknowledged or not)",
+        "Distinguish new nudge vs retry nudge vs stale duplicate",
+        "Allow downstream summaries to bind reported pinpoint back to triggering nudge id",
+        "Tests verify nudge deduplication and acknowledgment tracking"
+      ],
+      "passes": true,
+      "priority": "P2"
+    },
+    {
+      "id": "US-019",
+      "title": "Phase 2 - Stable roadmap-id assignment for newly filed pinpoints",
+      "description": "When a claw records a new pinpoint/follow-up, assign or expose a stable tracking id immediately. Expose that id in structured event/report payload and preserve across edits, reorderings, and summary compression.",
+      "acceptanceCriteria": [
+        "Canonical roadmap id assigned at filing time",
+        "Roadmap id exposed in structured event/report payload",
+        "Same id preserved across edits, reorderings, summary compression",
+        "Distinguish 'new roadmap filing' from 'update to existing roadmap item'",
+        "Tests verify stable id assignment and update detection"
+      ],
+      "passes": true,
+      "priority": "P2"
+    },
+    {
+      "id": "US-020",
+      "title": "Phase 2 - Roadmap item lifecycle state contract",
+      "description": "Each roadmap pinpoint should carry machine-readable lifecycle state (filed, acknowledged, in_progress, blocked, done, superseded). Attach last state-change timestamp and preserve lineage when one pinpoint supersedes or merges into another.",
+      "acceptanceCriteria": [
+        "Lifecycle state enum with filed, acknowledged, in_progress, blocked, done, superseded",
+        "Last state-change timestamp attached",
+        "New report can declare first filing, status update, or closure",
+        "Preserve lineage when one pinpoint supersedes or merges into another",
+        "Tests verify lifecycle state transitions"
+      ],
+      "passes": true,
+      "priority": "P2"
+    },
+    {
+      "id": "US-021",
+      "title": "Request body size pre-flight check for OpenAI-compatible provider",
+      "description": "Implement pre-flight request body size estimation to prevent 400 Bad Request errors from API gateways with size limits. Based on dogfood findings with kimi-k2.5 testing, DashScope API has a 6MB request body limit that was exceeded by large system prompts.",
+      "acceptanceCriteria": [
+        "Pre-flight size estimation before sending requests to OpenAI-compatible providers",
+        "Clear error message when request exceeds provider-specific size limit",
+        "Configuration for different provider limits (6MB DashScope, 100MB OpenAI, etc.)",
+        "Unit tests for size estimation and limit checking",
+        "Integration with existing error handling for actionable user messages"
+      ],
+      "passes": true,
+      "priority": "P1"
+    },
+    {
+      "id": "US-022",
+      "title": "Enhanced error context for API failures",
+      "description": "Add structured error context to API failures including request ID tracking across retries, provider-specific error code mapping, and suggested user actions based on error type (e.g., 'Reduce prompt size' for 413, 'Check API key' for 401).",
+      "acceptanceCriteria": [
+        "Request ID tracking across retries with full context in error messages",
+        "Provider-specific error code mapping with actionable suggestions",
+        "Suggested user actions for common error types (401, 403, 413, 429, 500, 502-504)",
+        "Unit tests for error context extraction",
+        "All existing tests pass and clippy is clean"
+      ],
+      "passes": true,
+      "priority": "P1"
     }
-  ]
+  ],
+  "metadata": {
+    "lastUpdated": "2026-04-16",
+    "completedStories": ["US-001", "US-002", "US-003", "US-004", "US-005", "US-006", "US-007", "US-008", "US-009", "US-010", "US-011", "US-012", "US-013", "US-014", "US-015", "US-016", "US-017", "US-018", "US-019", "US-020", "US-021", "US-022"],
+    "inProgressStories": [],
+    "totalStories": 22,
+    "status": "in_progress"
+  }
 }

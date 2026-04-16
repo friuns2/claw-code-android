@@ -885,6 +885,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         request_id,
         body,
         retryable,
+        suggested_action: None,
     })
 }
 
@@ -909,6 +910,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         request_id,
         body,
         retryable,
+        suggested_action,
     } = error
     else {
         return error;
@@ -921,6 +923,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             request_id,
             body,
             retryable,
+            suggested_action,
         };
     }
     let Some(bearer_token) = auth.bearer_token() else {
@@ -931,6 +934,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             request_id,
             body,
             retryable,
+            suggested_action,
         };
     };
     if !bearer_token.starts_with("sk-ant-") {
@@ -941,6 +945,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             request_id,
             body,
             retryable,
+            suggested_action,
         };
     }
     // Only append the hint when the AuthSource is pure BearerToken. If both
@@ -955,6 +960,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             request_id,
             body,
             retryable,
+            suggested_action,
         };
     }
     let enriched_message = match message {
@@ -968,6 +974,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         request_id,
         body,
         retryable,
+        suggested_action,
     }
 }
 
@@ -1555,6 +1562,7 @@ mod tests {
             request_id: Some("req_varleg_001".to_string()),
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         // when
@@ -1595,6 +1603,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: true,
+            suggested_action: None,
         };
 
         // when
@@ -1623,6 +1632,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         // when
@@ -1650,6 +1660,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         // when
@@ -1674,6 +1685,7 @@ mod tests {
             request_id: None,
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         // when
