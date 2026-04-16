@@ -116,6 +116,50 @@
       ],
       "passes": true,
       "priority": "P0"
+    },
+    {
+      "id": "US-009",
+      "title": "Add unit tests for kimi model compatibility fix",
+      "description": "During dogfooding we discovered the existing test coverage for model-specific is_error handling is insufficient. Need to add dedicated tests for model_rejects_is_error_field function and translate_message behavior with different models.",
+      "acceptanceCriteria": [
+        "Test model_rejects_is_error_field identifies kimi-k2.5, kimi-k1.5, dashscope/kimi-k2.5",
+        "Test translate_message includes is_error for gpt-4, grok-3, claude models",
+        "Test translate_message excludes is_error for kimi models",
+        "Test build_chat_completion_request produces correct payload for kimi vs non-kimi",
+        "All new tests pass",
+        "cargo test --package api passes"
+      ],
+      "passes": true,
+      "priority": "P1"
+    },
+    {
+      "id": "US-010",
+      "title": "Add model compatibility documentation",
+      "description": "Document which models require special handling (is_error exclusion, reasoning model tuning param stripping, etc.) in a MODEL_COMPATIBILITY.md file for operators and contributors.",
+      "acceptanceCriteria": [
+        "MODEL_COMPATIBILITY.md created in docs/ or repo root",
+        "Document kimi models is_error exclusion",
+        "Document reasoning models (o1, o3, grok-3-mini) tuning param stripping",
+        "Document gpt-5 max_completion_tokens requirement",
+        "Document qwen model routing through dashscope",
+        "Cross-reference with existing code comments"
+      ],
+      "passes": true,
+      "priority": "P2"
+    },
+    {
+      "id": "US-011",
+      "title": "Performance optimization: reduce API request serialization overhead",
+      "description": "The translate_message function creates intermediate JSON Value objects that could be optimized. Profile and optimize the hot path for API request building, especially for conversations with many tool results.",
+      "acceptanceCriteria": [
+        "Profile current request building with criterion or similar",
+        "Identify bottlenecks in translate_message and build_chat_completion_request",
+        "Implement optimizations (Vec pre-allocation, reduced cloning, etc.)",
+        "Benchmark before/after showing improvement",
+        "No functional changes or API breakage"
+      ],
+      "passes": true,
+      "priority": "P2"
     }
   ]
 }

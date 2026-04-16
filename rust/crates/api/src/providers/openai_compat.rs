@@ -752,7 +752,12 @@ struct ErrorBody {
 /// Returns true for models known to reject tuning parameters like temperature,
 /// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
 /// reasoning/chain-of-thought models with fixed sampling.
-fn is_reasoning_model(model: &str) -> bool {
+/// Returns true for models known to reject tuning parameters like temperature,
+/// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
+/// reasoning/chain-of-thought models with fixed sampling.
+/// Public for benchmarking and testing purposes.
+#[must_use]
+pub fn is_reasoning_model(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
     // Strip any provider/ prefix for the check (e.g. qwen/qwen-qwq -> qwen-qwq)
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
@@ -786,7 +791,9 @@ fn strip_routing_prefix(model: &str) -> &str {
     }
 }
 
-fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+/// Builds a chat completion request payload from a `MessageRequest`.
+/// Public for benchmarking purposes.
+pub fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -794,8 +801,10 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             "content": system,
         }));
     }
+    // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
+    let wire_model = strip_routing_prefix(&request.model);
     for message in &request.messages {
-        messages.extend(translate_message(message));
+        messages.extend(translate_message(message, wire_model));
     }
     // Sanitize: drop any `role:"tool"` message that does not have a valid
     // paired `role:"assistant"` with a `tool_calls` entry carrying the same
@@ -805,9 +814,6 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     // editing, resume, etc.). We drop rather than error so the request can
     // still proceed with the remaining history intact.
     messages = sanitize_tool_message_pairing(messages);
-
-    // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
-    let wire_model = strip_routing_prefix(&request.model);
 
     // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
     // We send the correct field based on the wire model name so gpt-5.x requests
@@ -868,7 +874,25 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     payload
 }
 
-fn translate_message(message: &InputMessage) -> Vec<Value> {
+/// Returns true for models that do NOT support the `is_error` field in tool results.
+/// kimi models (via Moonshot AI/Dashscope) reject this field with 400 Bad Request.
+/// Returns true for models that do NOT support the `is_error` field in tool results.
+/// kimi models (via Moonshot AI/Dashscope) reject this field with 400 Bad Request.
+/// Public for benchmarking and testing purposes.
+#[must_use]
+pub fn model_rejects_is_error_field(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    // Strip any provider/ prefix for the check
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    // kimi models (kimi-k2.5, kimi-k1.5, kimi-moonshot, etc.)
+    canonical.starts_with("kimi")
+}
+
+/// Translates an `InputMessage` into OpenAI-compatible message format.
+/// Public for benchmarking purposes.
+#[must_use]
+pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
+    let supports_is_error = !model_rejects_is_error_field(model);
     match message.role.as_str() {
         "assistant" => {
             let mut text = String::new();
@@ -914,12 +938,19 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
-                } => Some(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_use_id,
-                    "content": flatten_tool_result_content(content),
-                    "is_error": is_error,
-                })),
+                } => {
+                    let mut msg = json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": flatten_tool_result_content(content),
+                    });
+                    // Only include is_error for models that support it.
+                    // kimi models reject this field with 400 Bad Request.
+                    if supports_is_error {
+                        msg["is_error"] = json!(is_error);
+                    }
+                    Some(msg)
+                }
                 InputContentBlock::ToolUse { .. } => None,
             })
             .collect(),
@@ -938,7 +969,10 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
 /// `tool_calls` array containing an entry whose `id` matches the tool
 /// message's `tool_call_id`, the pair is valid and both are kept. Otherwise
 /// the tool message is dropped.
-fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
+/// Remove `role:"tool"` messages from `messages` that have no valid paired
+/// `role:"assistant"` message with a matching `tool_calls[].id` immediately
+/// preceding them. Public for benchmarking purposes.
+pub fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
     // Collect indices of tool messages that are orphaned.
     let mut drop_indices = std::collections::HashSet::new();
     for (i, msg) in messages.iter().enumerate() {
@@ -994,15 +1028,36 @@ fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
-    content
+/// Flattens tool result content blocks into a single string.
+/// Optimized to pre-allocate capacity and avoid intermediate `Vec` construction.
+#[must_use]
+pub fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
+    // Pre-calculate total capacity needed to avoid reallocations
+    let total_len: usize = content
         .iter()
         .map(|block| match block {
-            ToolResultContentBlock::Text { text } => text.clone(),
-            ToolResultContentBlock::Json { value } => value.to_string(),
+            ToolResultContentBlock::Text { text } => text.len(),
+            ToolResultContentBlock::Json { value } => value.to_string().len(),
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .sum();
+
+    // Add capacity for newlines between blocks
+    let capacity = total_len + content.len().saturating_sub(1);
+
+    let mut result = String::with_capacity(capacity);
+    for (i, block) in content.iter().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        match block {
+            ToolResultContentBlock::Text { text } => result.push_str(text),
+            ToolResultContentBlock::Json { value } => {
+                // Use write! to append without creating intermediate String
+                result.push_str(&value.to_string());
+            }
+        }
+    }
+    result
 }
 
 /// Recursively ensure every object-type node in a JSON Schema has
@@ -1793,5 +1848,187 @@ mod tests {
             payload.get("max_completion_tokens").is_none(),
             "gpt-4o must not emit max_completion_tokens"
         );
+    }
+
+    // ============================================================================
+    // US-009: kimi model compatibility tests
+    // ============================================================================
+
+    #[test]
+    fn model_rejects_is_error_field_detects_kimi_models() {
+        // kimi models (various formats) should be detected
+        assert!(super::model_rejects_is_error_field("kimi-k2.5"));
+        assert!(super::model_rejects_is_error_field("kimi-k1.5"));
+        assert!(super::model_rejects_is_error_field("kimi-moonshot"));
+        assert!(super::model_rejects_is_error_field("KIMI-K2.5")); // case insensitive
+        assert!(super::model_rejects_is_error_field("dashscope/kimi-k2.5")); // with prefix
+        assert!(super::model_rejects_is_error_field("moonshot/kimi-k2.5")); // different prefix
+
+        // Non-kimi models should NOT be detected
+        assert!(!super::model_rejects_is_error_field("gpt-4o"));
+        assert!(!super::model_rejects_is_error_field("gpt-4"));
+        assert!(!super::model_rejects_is_error_field("claude-sonnet-4-6"));
+        assert!(!super::model_rejects_is_error_field("grok-3"));
+        assert!(!super::model_rejects_is_error_field("grok-3-mini"));
+        assert!(!super::model_rejects_is_error_field("xai/grok-3"));
+        assert!(!super::model_rejects_is_error_field("qwen/qwen-plus"));
+        assert!(!super::model_rejects_is_error_field("o1-mini"));
+    }
+
+    #[test]
+    fn translate_message_includes_is_error_for_non_kimi_models() {
+        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        // Test with gpt-4o (should include is_error)
+        let message = InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Error occurred".to_string(),
+                }],
+                is_error: true,
+            }],
+        };
+
+        let translated = super::translate_message(&message, "gpt-4o");
+        assert_eq!(translated.len(), 1);
+        let tool_msg = &translated[0];
+        assert_eq!(tool_msg["role"], json!("tool"));
+        assert_eq!(tool_msg["tool_call_id"], json!("call_1"));
+        assert_eq!(tool_msg["content"], json!("Error occurred"));
+        assert!(
+            tool_msg.get("is_error").is_some(),
+            "gpt-4o should include is_error field"
+        );
+        assert_eq!(tool_msg["is_error"], json!(true));
+
+        // Test with grok-3 (should include is_error)
+        let message2 = InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::ToolResult {
+                tool_use_id: "call_2".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Success".to_string(),
+                }],
+                is_error: false,
+            }],
+        };
+
+        let translated2 = super::translate_message(&message2, "grok-3");
+        assert!(
+            translated2[0].get("is_error").is_some(),
+            "grok-3 should include is_error field"
+        );
+        assert_eq!(translated2[0]["is_error"], json!(false));
+
+        // Test with claude model (should include is_error)
+        let translated3 = super::translate_message(&message, "claude-sonnet-4-6");
+        assert!(
+            translated3[0].get("is_error").is_some(),
+            "claude should include is_error field"
+        );
+    }
+
+    #[test]
+    fn translate_message_excludes_is_error_for_kimi_models() {
+        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        // Test with kimi-k2.5 (should EXCLUDE is_error)
+        let message = InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Error occurred".to_string(),
+                }],
+                is_error: true,
+            }],
+        };
+
+        let translated = super::translate_message(&message, "kimi-k2.5");
+        assert_eq!(translated.len(), 1);
+        let tool_msg = &translated[0];
+        assert_eq!(tool_msg["role"], json!("tool"));
+        assert_eq!(tool_msg["tool_call_id"], json!("call_1"));
+        assert_eq!(tool_msg["content"], json!("Error occurred"));
+        assert!(
+            tool_msg.get("is_error").is_none(),
+            "kimi-k2.5 must NOT include is_error field (would cause 400 Bad Request)"
+        );
+
+        // Test with kimi-k1.5
+        let translated2 = super::translate_message(&message, "kimi-k1.5");
+        assert!(
+            translated2[0].get("is_error").is_none(),
+            "kimi-k1.5 must NOT include is_error field"
+        );
+
+        // Test with dashscope/kimi-k2.5 (with provider prefix)
+        let translated3 = super::translate_message(&message, "dashscope/kimi-k2.5");
+        assert!(
+            translated3[0].get("is_error").is_none(),
+            "dashscope/kimi-k2.5 must NOT include is_error field"
+        );
+    }
+
+    #[test]
+    fn build_chat_completion_request_kimi_vs_non_kimi_tool_results() {
+        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        // Helper to create a request with a tool result
+        let make_request = |model: &str| MessageRequest {
+            model: model.to_string(),
+            max_tokens: 100,
+            messages: vec![
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "/tmp/test"}),
+                    }],
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: "file contents".to_string(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+            ],
+            stream: false,
+            ..Default::default()
+        };
+
+        // Non-kimi model: should have is_error field
+        let request_gpt = make_request("gpt-4o");
+        let payload_gpt = build_chat_completion_request(&request_gpt, OpenAiCompatConfig::openai());
+        let messages_gpt = payload_gpt["messages"].as_array().unwrap();
+        let tool_msg_gpt = messages_gpt.iter().find(|m| m["role"] == "tool").unwrap();
+        assert!(
+            tool_msg_gpt.get("is_error").is_some(),
+            "gpt-4o request should include is_error in tool result"
+        );
+
+        // kimi model: should NOT have is_error field
+        let request_kimi = make_request("kimi-k2.5");
+        let payload_kimi =
+            build_chat_completion_request(&request_kimi, OpenAiCompatConfig::dashscope());
+        let messages_kimi = payload_kimi["messages"].as_array().unwrap();
+        let tool_msg_kimi = messages_kimi.iter().find(|m| m["role"] == "tool").unwrap();
+        assert!(
+            tool_msg_kimi.get("is_error").is_none(),
+            "kimi-k2.5 request must NOT include is_error in tool result (would cause 400)"
+        );
+
+        // Verify both have the essential fields
+        assert_eq!(tool_msg_gpt["tool_call_id"], json!("call_1"));
+        assert_eq!(tool_msg_kimi["tool_call_id"], json!("call_1"));
+        assert_eq!(tool_msg_gpt["content"], json!("file contents"));
+        assert_eq!(tool_msg_kimi["content"], json!("file contents"));
     }
 }

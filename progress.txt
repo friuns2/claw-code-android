@@ -81,3 +81,53 @@ VERIFICATION STATUS:
 - cargo clippy --workspace: PASSED
 
 All 7 stories from prd.json now have passes: true
+
+Iteration 2: 2026-04-16
+------------------------
+
+US-009 COMPLETED (Add unit tests for kimi model compatibility fix)
+- Files: rust/crates/api/src/providers/openai_compat.rs
+- Added 4 comprehensive unit tests:
+  1. model_rejects_is_error_field_detects_kimi_models - verifies detection of kimi-k2.5, kimi-k1.5, dashscope/kimi-k2.5, case insensitivity
+  2. translate_message_includes_is_error_for_non_kimi_models - verifies gpt-4o, grok-3, claude include is_error
+  3. translate_message_excludes_is_error_for_kimi_models - verifies kimi models exclude is_error (prevents 400 Bad Request)
+  4. build_chat_completion_request_kimi_vs_non_kimi_tool_results - full integration test for request building
+- Tests: 4 new tests, 119 unit tests total in api crate (+4), all passing
+- Integration tests: 29 passing (no regressions)
+
+US-010 COMPLETED (Add model compatibility documentation)
+- Files: docs/MODEL_COMPATIBILITY.md
+- Created comprehensive documentation covering:
+  1. Kimi Models (is_error Exclusion) - documents the 400 Bad Request issue and solution
+  2. Reasoning Models (Tuning Parameter Stripping) - covers o1, o3, o4, grok-3-mini, qwen-qwq, qwen3-thinking
+  3. GPT-5 (max_completion_tokens) - documents max_tokens vs max_completion_tokens requirement
+  4. Qwen Models (DashScope Routing) - explains routing and authentication
+- Added implementation details section with key functions
+- Added "Adding New Models" guide for future contributors
+- Added testing section with example commands
+- Cross-referenced with existing code comments in openai_compat.rs
+- cargo clippy passes
+
+US-011 COMPLETED (Performance optimization: reduce API request serialization overhead)
+- Files:
+  - rust/crates/api/Cargo.toml (added criterion dev-dependency and bench config)
+  - rust/crates/api/benches/request_building.rs (new benchmark suite)
+  - rust/crates/api/src/providers/openai_compat.rs (optimizations)
+  - rust/crates/api/src/lib.rs (public exports for benchmarks)
+- Optimizations implemented:
+  1. flatten_tool_result_content: Pre-allocate String capacity and avoid intermediate Vec
+     - Before: collected to Vec<String> then joined
+     - After: single String with pre-calculated capacity, push directly
+  2. Made key functions public for benchmarking: translate_message, build_chat_completion_request,
+     flatten_tool_result_content, is_reasoning_model, model_rejects_is_error_field
+- Benchmark results:
+  - flatten_tool_result_content/single_text: ~17ns
+  - flatten_tool_result_content/multi_text (10 blocks): ~46ns
+  - flatten_tool_result_content/large_content (50 blocks): ~11.7µs
+  - translate_message/text_only: ~200ns
+  - translate_message/tool_result: ~348ns
+  - build_chat_completion_request/10 messages: ~16.4µs
+  - build_chat_completion_request/100 messages: ~209µs
+  - is_reasoning_model detection: ~26-42ns depending on model
+- All tests pass (119 unit tests + 29 integration tests)
+- cargo clippy passes
