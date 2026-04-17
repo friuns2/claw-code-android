@@ -329,13 +329,28 @@
       ],
       "passes": true,
       "priority": "P1"
+    },
+    {
+      "id": "US-024",
+      "title": "Add token limit metadata for kimi models",
+      "description": "The model_token_limit() function has no entries for kimi-k2.5 or kimi-k1.5, causing preflight context window validation to skip these models. Add token limit metadata to enable preflight checks and accurate max token defaults. Per Moonshot AI documentation, kimi-k2.5 supports 256K context window and 16K max output tokens.",
+      "acceptanceCriteria": [
+        "model_token_limit('kimi-k2.5') returns Some(ModelTokenLimit { max_output_tokens: 16384, context_window_tokens: 256000 })",
+        "model_token_limit('kimi-k1.5') returns appropriate limits",
+        "model_token_limit('kimi') follows alias chain (kimi → kimi-k2.5) and returns k2.5 limits",
+        "preflight_message_request() validates context window for kimi models (via generic preflight, no provider-specific code needed)",
+        "Unit tests verify limits and preflight behavior for kimi models",
+        "All tests pass and clippy is clean"
+      ],
+      "passes": true,
+      "priority": "P1"
     }
   ],
   "metadata": {
-    "lastUpdated": "2026-04-16",
-    "completedStories": ["US-001", "US-002", "US-003", "US-004", "US-005", "US-006", "US-007", "US-008", "US-009", "US-010", "US-011", "US-012", "US-013", "US-014", "US-015", "US-016", "US-017", "US-018", "US-019", "US-020", "US-021", "US-022", "US-023"],
+    "lastUpdated": "2026-04-17",
+    "completedStories": ["US-001", "US-002", "US-003", "US-004", "US-005", "US-006", "US-007", "US-008", "US-009", "US-010", "US-011", "US-012", "US-013", "US-014", "US-015", "US-016", "US-017", "US-018", "US-019", "US-020", "US-021", "US-022", "US-023", "US-024"],
     "inProgressStories": [],
-    "totalStories": 23,
+    "totalStories": 24,
     "status": "completed"
   }
 }
