@@ -3882,3 +3882,102 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** Product decision: is the 3-way collapse intentional (one command, three synonyms) or accidental (three commands, one implementation)? Help docs suggest the latter. Either path is fine, as long as behavior matches documentation.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdTT` on main HEAD `b9331ae` in response to Clawhip pinpoint nudge at `1494940571385593958`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117) as 13th member — more severe than #111 (3-way collapse vs 2-way). Joins **Truth-audit / diagnostic-integrity** on the help-vs-implementation-mismatch axis. Cross-cluster with **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117) on the "multiple surfaces with distinct-advertised-but-identical-implemented behavior" axis. Natural bundle: **#111 + #118** — dispatch-collapse pair: `/providers` → `Doctor` (2-way) + `/stats`+`/tokens`+`/cache` → `Stats` (3-way). Complete parser-dispatch audit shape. Also **#108 + #111 + #118** — parser-level trust gaps: typo fallthrough (#108) + 2-way collapse (#111) + 3-way collapse (#118). Session tally: ROADMAP #118.
+
+119. **The "this is a slash command, use `--resume`" helpful-error path only triggers for EXACTLY-bare slash verbs (`claw hooks`, `claw plan`) — any argument after the verb (`claw hooks --help`, `claw plan list`, `claw theme dark`, `claw tokens --json`, `claw providers --output-format json`) silently falls through to Prompt dispatch and burns billable tokens on a nonsensical "hooks --help" user-prompt. The helpful-error function at `main.rs:765` (`bare_slash_command_guidance`) is gated by `if rest.len() != 1 { return None; }` at `main.rs:746`. Nine known slash-only verbs (`hooks`, `plan`, `theme`, `tasks`, `subagent`, `agent`, `providers`, `tokens`, `cache`) ALL exhibit this: bare → clean error; +any-arg → billable LLM call. Users discovering `claw hooks` by pattern-following from `claw status --help` get silently charged** — dogfooded 2026-04-18 on main HEAD `3848ea6` from `/tmp/cdUU`.
+
+     **Concrete repro.**
+     ```
+     # BARE invocation — clean error:
+     $ claw --output-format json hooks
+     {"type":"error","error":"`claw hooks` is a slash command. Use `claw --resume SESSION.jsonl /hooks` or start `claw` and run `/hooks`."}
+
+     # Same command + --help — PROMPT FALLTHROUGH:
+     $ claw --output-format json hooks --help
+     {"type":"error","error":"missing Anthropic credentials; ..."}
+     # The CLI tried to send "hooks --help" to the LLM as a user prompt.
+
+     # Same for all 9 known slash-only verbs:
+     $ claw --output-format json plan on
+     {"error":"missing Anthropic credentials; ..."}   # should be: /plan is slash-only
+
+     $ claw --output-format json theme dark
+     {"error":"missing Anthropic credentials; ..."}   # should be: /theme is slash-only
+
+     $ claw --output-format json tasks list
+     {"error":"missing Anthropic credentials; ..."}   # should be: /tasks is slash-only
+
+     $ claw --output-format json subagent list
+     {"error":"missing Anthropic credentials; ..."}   # should be: /subagent is slash-only
+
+     $ claw --output-format json tokens --json
+     {"error":"missing Anthropic credentials; ..."}   # should be: /tokens is slash-only
+
+     # With real credentials: each of these is a billed LLM call with prompts like
+     # "hooks --help", "plan on", "theme dark" — the LLM interprets them as user requests.
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:745-763` — the bare-slash-guidance entry point:
+       ```rust
+       ) -> Option<Result<CliAction, String>> {
+           if rest.len() != 1 {
+               return None;  // <-- THE BUG
+           }
+           match rest[0].as_str() {
+               "help" => ...,
+               "version" => ...,
+               // etc.
+               other => bare_slash_command_guidance(other).map(Err),
+           }
+       }
+       ```
+       The `rest.len() != 1` gate means any invocation with more than one positional arg is skipped. If the first arg IS a known slash-verb but there's ANY second arg, the guidance never fires.
+     - `rust/crates/rusty-claude-cli/src/main.rs:765-793` — `bare_slash_command_guidance` implementation. Looks up the command in `slash_command_specs()`, returns a helpful error string. Works correctly — but only gets called from the gated path.
+     - Downstream dispatch: if guidance doesn't match, args fall through to the Prompt action, which sends them to the LLM (billed).
+     - Compare #108 (subcommand typos fall through to Prompt): typo'd verb + any args → Prompt. **#119 is the known-verb analog**: KNOWN slash-only verb + any arg → same Prompt fall-through. Both bugs share the same underlying dispatch shape; #119 is particularly insidious because users are following a valid pattern.
+     - Claude Code convention: `claude hooks --help`, `claude hooks list`, `claude plan on` all print usage or structured output. Users migrating expect parity.
+
+     **Why this is specifically a clawability gap.**
+     1. *User pattern from other subcommands is "verb + --help" → usage info.* `claw status --help` prints usage. `claw doctor --help` prints usage. `claw mcp --help` prints usage. A user who learns `claw hooks` exists and types `claw hooks --help` to see what args it takes... burns tokens on a prompt "hooks --help".
+     2. *--help short-circuit is universal CLI convention.* Every modern CLI guarantees `--help` shows help, period. `argparse`, `clap`, `click`, etc. all implement this. claw-code's per-subcommand inconsistency (some subcommands accept --help, some fall through to Prompt, some explicitly reject) breaks the convention.
+     3. *Billable-token silent-burn.* Same problem as #108 and #117, but triggered by a discovery pattern rather than a typo. Users who don't know a verb is slash-only burn tokens learning.
+     4. *Joins truth-audit.* `claw hooks` says "this is a slash command, use --resume." Adding --help changes the error to "missing credentials" — the tool is LYING about what's happening. No indication that the user prompt was absorbed.
+     5. *Pairs with #108 and #117.* Three-way bug shape: #108 (typo'd verb + args → Prompt), #117 (`-p "prompt" --arg` → Prompt with swallowed args), **#119 (known slash-only verb + any arg → Prompt)**. All three are silent-billable-token-burn surface errors where parser gates don't cover the realistic user-pattern space.
+     6. *Joins Claude Code migration parity.* Users coming from Claude Code assume `claude hooks --help` semantics. claw-code silently charges them.
+     7. *Also inconsistent with subcommands that have --help support.* `status/doctor/mcp/agents/skills/init/export/prompt` all handle --help gracefully. `hooks/plan/theme/tasks/subagent/agent/providers/tokens/cache` don't. No documentation of the distinction.
+
+     **Fix shape — widen the guidance check to cover slash-verb + any args.**
+     1. *Remove the `rest.len() != 1` gate, or widen it to handle the slash-verb-first case.* ~10 lines:
+        ```rust
+        ) -> Option<Result<CliAction, String>> {
+            if rest.is_empty() {
+                return None;
+            }
+
+            let first = rest[0].as_str();
+
+            // Bare slash verb with no args — existing behavior:
+            if rest.len() == 1 {
+                match first {
+                    "help" => return Some(Ok(CliAction::Help { output_format })),
+                    // ... other bare-allowed verbs ...
+                    other => return bare_slash_command_guidance(other).map(Err),
+                }
+            }
+
+            // Slash verb with args — emit guidance if the verb is slash-only:
+            if let Some(guidance) = bare_slash_command_guidance(first) {
+                return Some(Err(format!("{} The extra argument `{}` was not recognized.", guidance, rest[1..].join(" "))));
+            }
+            None  // fall through for truly unknown commands
+        }
+        ```
+     2. *Widen the allow-list at `:767-777`.* Some subcommands (`mcp`, `agents`, `skills`, `system-prompt`, etc.) legitimately take positional args. Leave those excluded from the guidance. Add a explicit list of slash-only verbs that should always trigger guidance regardless of arg count: `hooks`, `plan`, `theme`, `tasks`, `subagent`, `agent`, `providers`, `tokens`, `cache`. ~5 lines.
+     3. *Subcommand --help support.* For every subcommand that the parser recognizes, catch `--help` / `-h` explicitly and print the registered `SlashCommandSpec.description`. Or: route all slash-verb `--help` invocations to a shared "slash-command help" handler that prints the spec description + resume-safety annotation. ~20 lines.
+     4. *Regression tests per verb.* For each of the 9 verbs, assert that `claw <verb> --help` produces help output (not "missing credentials"), and `claw <verb> any arg` produces the slash-only guidance (not fallthrough).
+
+     **Acceptance.** `claw hooks --help`, `claw plan list`, `claw theme dark`, `claw tokens --json`, `claw providers --output-format json` all produce the structured slash-only guidance error with recognition of the provided args. No billable LLM call for any invocation of a known slash-only verb, regardless of positional/flag args. `claw <verb> --help` specifically prints the subcommand's documented purpose and usage hint.
+
+     **Blocker.** None. The fix is a localized parser change (`main.rs:745-763`). Downstream tests are additive.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdUU` on main HEAD `3848ea6` in response to Clawhip pinpoint nudge at `1494948121099243550`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118) as 14th member — the fall-through to Prompt is silent. Joins **Claude Code migration parity** (#103, #109, #116, #117) as 5th member — users coming from Claude Code muscle-memory for `claude <verb> --help` get silently billed. Joins **Truth-audit / diagnostic-integrity** — the CLI claims "missing credentials" but the true cause is "your CLI invocation was interpreted as a chat prompt." Cross-cluster with **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117) — another entry point (slash-verb + args) that differs from the same verb bare. Natural bundle: **#108 + #117 + #119** — billable-token silent-burn triangle: typo fallthrough (#108) + flag swallow (#117) + known-slash-verb-with-args fallthrough (#119). All three are silent-money-burn failure modes with the same underlying cause: too-narrow parser detection + greedy Prompt dispatch. Also **#108 + #111 + #118 + #119** — parser-level trust gap quartet: typo fallthrough (#108) + 2-way slash collapse (#111) + 3-way slash collapse (#118) + known-slash-verb fallthrough (#119). Session tally: ROADMAP #119.
