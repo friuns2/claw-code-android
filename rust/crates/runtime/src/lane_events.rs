@@ -38,6 +38,15 @@ pub enum LaneEventName {
     BranchStaleAgainstMain,
     #[serde(rename = "branch.workspace_mismatch")]
     BranchWorkspaceMismatch,
+    /// Ship/provenance events — §4.44.5
+    #[serde(rename = "ship.prepared")]
+    ShipPrepared,
+    #[serde(rename = "ship.commits_selected")]
+    ShipCommitsSelected,
+    #[serde(rename = "ship.merged")]
+    ShipMerged,
+    #[serde(rename = "ship.pushed_main")]
+    ShipPushedMain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,10 +393,30 @@ pub fn dedupe_terminal_events(events: &[LaneEvent]) -> Vec<LaneEvent> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockedSubphase {
+    #[serde(rename = "blocked.trust_prompt")]
+    TrustPrompt { gate_repo: String },
+    #[serde(rename = "blocked.prompt_delivery")]
+    PromptDelivery { attempt: u32 },
+    #[serde(rename = "blocked.plugin_init")]
+    PluginInit { plugin_name: String },
+    #[serde(rename = "blocked.mcp_handshake")]
+    McpHandshake { server_name: String, attempt: u32 },
+    #[serde(rename = "blocked.branch_freshness")]
+    BranchFreshness { behind_main: u32 },
+    #[serde(rename = "blocked.test_hang")]
+    TestHang { elapsed_secs: u32, test_name: Option<String> },
+    #[serde(rename = "blocked.report_pending")]
+    ReportPending { since_secs: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneEventBlocker {
     #[serde(rename = "failureClass")]
     pub failure_class: LaneFailureClass,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subphase: Option<BlockedSubphase>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,6 +431,29 @@ pub struct LaneCommitProvenance {
     pub superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lineage: Vec<String>,
+}
+
+/// Ship/provenance metadata — §4.44.5
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShipProvenance {
+    pub source_branch: String,
+    pub base_commit: String,
+    pub commit_count: u32,
+    pub commit_range: String,
+    pub merge_method: ShipMergeMethod,
+    pub actor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShipMergeMethod {
+    DirectPush,
+    FastForward,
+    MergeCommit,
+    SquashMerge,
+    RebaseMerge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,16 +539,56 @@ impl LaneEvent {
 
     #[must_use]
     pub fn blocked(emitted_at: impl Into<String>, blocker: &LaneEventBlocker) -> Self {
-        Self::new(LaneEventName::Blocked, LaneEventStatus::Blocked, emitted_at)
+        let mut event = Self::new(LaneEventName::Blocked, LaneEventStatus::Blocked, emitted_at)
             .with_failure_class(blocker.failure_class)
-            .with_detail(blocker.detail.clone())
+            .with_detail(blocker.detail.clone());
+        if let Some(ref subphase) = blocker.subphase {
+            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+        }
+        event
     }
 
     #[must_use]
     pub fn failed(emitted_at: impl Into<String>, blocker: &LaneEventBlocker) -> Self {
-        Self::new(LaneEventName::Failed, LaneEventStatus::Failed, emitted_at)
+        let mut event = Self::new(LaneEventName::Failed, LaneEventStatus::Failed, emitted_at)
             .with_failure_class(blocker.failure_class)
-            .with_detail(blocker.detail.clone())
+            .with_detail(blocker.detail.clone());
+        if let Some(ref subphase) = blocker.subphase {
+            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+        }
+        event
+    }
+
+    /// Ship prepared — §4.44.5
+    #[must_use]
+    pub fn ship_prepared(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
+        Self::new(LaneEventName::ShipPrepared, LaneEventStatus::Ready, emitted_at)
+            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+    }
+
+    /// Ship commits selected — §4.44.5
+    #[must_use]
+    pub fn ship_commits_selected(
+        emitted_at: impl Into<String>,
+        commit_count: u32,
+        commit_range: impl Into<String>,
+    ) -> Self {
+        Self::new(LaneEventName::ShipCommitsSelected, LaneEventStatus::Ready, emitted_at)
+            .with_detail(format!("{} commits: {}", commit_count, commit_range.into()))
+    }
+
+    /// Ship merged — §4.44.5
+    #[must_use]
+    pub fn ship_merged(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
+        Self::new(LaneEventName::ShipMerged, LaneEventStatus::Completed, emitted_at)
+            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+    }
+
+    /// Ship pushed to main — §4.44.5
+    #[must_use]
+    pub fn ship_pushed_main(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
+        Self::new(LaneEventName::ShipPushedMain, LaneEventStatus::Completed, emitted_at)
+            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
     #[must_use]
@@ -570,9 +662,10 @@ mod tests {
 
     use super::{
         compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
-        is_terminal_event, EventProvenance, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-        LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus, LaneFailureClass,
-        LaneOwnership, SessionIdentity, WatcherAction,
+        is_terminal_event, BlockedSubphase, EventProvenance, LaneCommitProvenance, LaneEvent,
+        LaneEventBlocker, LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus,
+        LaneFailureClass, LaneOwnership, SessionIdentity, ShipMergeMethod, ShipProvenance,
+        WatcherAction,
     };
 
     #[test]
@@ -601,6 +694,10 @@ mod tests {
                 LaneEventName::BranchWorkspaceMismatch,
                 "branch.workspace_mismatch",
             ),
+            (LaneEventName::ShipPrepared, "ship.prepared"),
+            (LaneEventName::ShipCommitsSelected, "ship.commits_selected"),
+            (LaneEventName::ShipMerged, "ship.merged"),
+            (LaneEventName::ShipPushedMain, "ship.pushed_main"),
         ];
 
         for (event, expected) in cases {
@@ -641,6 +738,10 @@ mod tests {
         let blocker = LaneEventBlocker {
             failure_class: LaneFailureClass::McpStartup,
             detail: "broken server".to_string(),
+            subphase: Some(BlockedSubphase::McpHandshake {
+                server_name: "test-server".to_string(),
+                attempt: 1,
+            }),
         };
 
         let blocked = LaneEvent::blocked("2026-04-04T00:00:00Z", &blocker);
@@ -684,6 +785,34 @@ mod tests {
             round_trip.failure_class,
             Some(LaneFailureClass::WorkspaceMismatch)
         );
+    }
+
+    #[test]
+    fn ship_provenance_events_serialize_to_expected_wire_values() {
+        let provenance = ShipProvenance {
+            source_branch: "feature/provenance".to_string(),
+            base_commit: "dd73962".to_string(),
+            commit_count: 6,
+            commit_range: "dd73962..c956f78".to_string(),
+            merge_method: ShipMergeMethod::DirectPush,
+            actor: "Jobdori".to_string(),
+            pr_number: None,
+        };
+
+        let prepared = LaneEvent::ship_prepared("2026-04-20T14:30:00Z", &provenance);
+        let prepared_json = serde_json::to_value(&prepared).expect("ship event should serialize");
+        assert_eq!(prepared_json["event"], "ship.prepared");
+        assert_eq!(prepared_json["data"]["commit_count"], 6);
+        assert_eq!(prepared_json["data"]["source_branch"], "feature/provenance");
+
+        let pushed = LaneEvent::ship_pushed_main("2026-04-20T14:35:00Z", &provenance);
+        let pushed_json = serde_json::to_value(&pushed).expect("ship event should serialize");
+        assert_eq!(pushed_json["event"], "ship.pushed_main");
+        assert_eq!(pushed_json["data"]["merge_method"], "direct_push");
+
+        let round_trip: LaneEvent =
+            serde_json::from_value(pushed_json).expect("ship event should deserialize");
+        assert_eq!(round_trip.event, LaneEventName::ShipPushedMain);
     }
 
     #[test]
