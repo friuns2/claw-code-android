@@ -5240,28 +5240,32 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
 fn render_help_topic(topic: LocalHelpTopic) -> String {
     match topic {
         LocalHelpTopic::Status => "Status
-  Usage            claw status
+  Usage            claw status [--output-format <format>]
   Purpose          show the local workspace snapshot without entering the REPL
   Output           model, permissions, git state, config files, and sandbox status
+  Formats          text (default), json
   Related          /status · claw --resume latest /status"
             .to_string(),
         LocalHelpTopic::Sandbox => "Sandbox
-  Usage            claw sandbox
+  Usage            claw sandbox [--output-format <format>]
   Purpose          inspect the resolved sandbox and isolation state for the current directory
   Output           namespace, network, filesystem, and fallback details
+  Formats          text (default), json
   Related          /sandbox · claw status"
             .to_string(),
         LocalHelpTopic::Doctor => "Doctor
-  Usage            claw doctor
+  Usage            claw doctor [--output-format <format>]
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
+  Formats          text (default), json
   Related          /doctor · claw --resume latest /doctor"
             .to_string(),
         LocalHelpTopic::Acp => "ACP / Zed
-  Usage            claw acp [serve]
+  Usage            claw acp [serve] [--output-format <format>]
   Aliases          claw --acp · claw -acp
   Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
   Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
+  Formats          text (default), json
   Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
             .to_string(),
     }
