@@ -830,6 +830,25 @@ Acceptance:
 - channel status updates stay short and machine-grounded
 - claws stop inferring state from raw build spam
 
+### 137. Model-alias shorthand regression in test suite — bare alias parsing broken on `feat/134-135-session-identity` branch
+
+**Filed:** 2026-04-21 from dogfood cycle — `cargo test --workspace` on `feat/134-135-session-identity` HEAD (`91ba54d`) shows 3 failing tests.
+
+**Problem:** `tests::parses_bare_prompt_and_json_output_flag`, `tests::multi_word_prompt_still_uses_shorthand_prompt_mode`, and `tests::env_permission_mode_overrides_project_config_default` all panic with:
+```
+args should parse: "invalid model syntax: 'claude-opus'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)"
+```
+The #134/#135 session-identity work tightened model-syntax validation but the test fixtures still pass bare `claude-opus` style strings that the new validator rejects. 162 tests pass; only the three tests using legacy bare-alias model names fail.
+
+**Fix shape:**
+- Update the three failing test fixtures to use either a valid alias (`opus`, `sonnet`, `haiku`) or a fully-qualified model id (`anthropic/claude-opus-4-6`)
+- Alternatively, if `claude-opus` is an intended supported alias, add it to the alias registry
+- Verify `cargo test --workspace` returns 0 failures before merging the feat branch to `main`
+
+**Acceptance:**
+- `cargo test --workspace` passes with 0 failures on the `feat/134-135-session-identity` branch
+- No regression on the 162 tests currently passing
+
 ### 133. Blocked-state subphase contract (was §6.5)
 **Filed:** 2026-04-20 from dogfood cycle — previous cycle identified §4.44.5 provenance gap, this cycle targets §6.5 implementation.
 
@@ -5051,3 +5070,29 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
    **Blocker.** None. Requires a UUID/nanoid generated at session init and threaded through the event emitter.
 
    **Source.** Jobdori dogfood 2026-04-21 01:54 KST on main HEAD `50e3fa3` during recurring cron cycle. Joins **Session identity completeness at creation time** (ROADMAP §4.7) — §4.7 covers identity fields at creation time; #134 covers the stable correlation handle that ties those fields to downstream events. Joins **Event provenance / environment labeling** (§4.6) — provenance requires a stable anchor; without `session.id` the provenance chain is broken at the root. Natural bundle with **#241** (no startup run/correlation id, filed by gaebal-gajae 2026-04-20) — #241 approached from the startup cluster; #134 approaches from the event-stream observer side. Same root fix closes both. Session tally: ROADMAP #134.
+
+## Pinpoint #136. `--compact` flag output is not machine-readable — compact turn emits plain text instead of JSON when `--output-format json` is also passed
+
+**Gap.** `claw --compact <prompt>` runs a prompt turn with compacted output (tool-use suppressed, final assistant text only). But `run_with_output()` routes on `(output_format, compact)` with an explicit early-return match: `CliOutputFormat::Text if compact => run_prompt_compact(input)`. The `CliOutputFormat::Json` branch is never reached when `--compact` is set. Result: passing `--compact --output-format json` silently produces plain-text output — the compact flag wins and the format flag is silently ignored. No warning or error is emitted.
+
+**Trace path.**
+- `rust/crates/rusty-claude-cli/src/main.rs:3872-3879` — `run_with_output()` match:
+  ```
+  CliOutputFormat::Text if compact => self.run_prompt_compact(input),
+  CliOutputFormat::Text => self.run_turn(input),
+  CliOutputFormat::Json => self.run_prompt_json(input),
+  ```
+  The `Json` arm is unreachable when `compact = true` because the first arm matches first regardless of `output_format`.
+- `run_prompt_compact()` at line 3879 calls `println!("{final_text}")` — always plain text, no JSON envelope.
+- `run_prompt_json()` at line 3891 wraps output in a JSON object with `message`, `model`, `iterations`, `usage`, `tool_uses`, `tool_results`, etc.
+
+**Fix shape (~20 lines).**
+1. Add a `CliOutputFormat::Json if compact` arm (or merge compact flag into `run_prompt_json` as a parameter) that produces a JSON object with `message: <final_text>` and a `compact: true` marker. Tool-use fields remain present but empty arrays (consistent with compact semantics — tools ran but are not returned verbatim).
+2. Emit a warning or `error.kind: "flag_conflict"` if conflicting flags are passed in a way that silently wins (or document the precedence explicitly in `--help`).
+3. Regression tests: `claw --compact --output-format json <prompt>` must produce valid JSON with at minimum `{message: "...", compact: true}`.
+
+**Acceptance.** An orchestrator that requests compact output for token efficiency AND machine-readable JSON gets both. Silent flag override is never a correct behavior for a tool targeting machine consumers.
+
+**Blocker.** None. Additive change to existing match arms.
+
+**Source.** Jobdori dogfood 2026-04-21 12:25 KST on main HEAD `8b52e77` during recurring cron cycle. Joins **Output format completeness** cluster (#90/#91/#92/#127/#130) — all surfaces that produce inconsistent or plain-text fallbacks when JSON is requested. Also joins **CLI/REPL parity** (§7.1) — compact is available as both `--compact` flag and `/compact` REPL command; JSON output gap affects only the flag path. Session tally: ROADMAP #136.
