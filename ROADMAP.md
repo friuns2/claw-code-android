@@ -6014,3 +6014,32 @@ New users see these commands in the help output but have no explanation of:
 
 **Source.** Clayhip nudge 2026-04-21 23:18 — dogfood surface clean, Phase 1 proven solid, natural next step is symmetry across output formats.
 
+
+## Pinpoint #157. Structured remediation registry for error hints (Phase 3 of #77 / §4.44)
+
+**Gap.** #77 Phase 1 added machine-readable `kind` discriminants and #156 extended them to text-mode output. However, the `hint` field is still prose derived from splitting the existing error message text — not a stable, registry-backed remediation contract. Downstream claws inspecting the `hint` field still need to parse human wording to decide whether to retry, escalate, or terminate.
+
+**Impact.** A claw receiving `{"kind": "missing_credentials", "hint": "export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY..."}` cannot programmatically determine the remediation action (e.g., `retry_with_env`, `escalate_to_operator`, `terminate_session`) without regex or substring matching on the hint prose. The `kind` is structured but the `hint` is not — half the error contract is still unstructured.
+
+**Fix shape.**
+
+1. **Remediation registry:** A function `remediation_for(kind: &str, operation: &str) -> Remediation` that maps `(error_kind, operation_context)` pairs to stable remediation structs:
+   ```rust
+   struct Remediation {
+       action: RemediationAction,  // retry, escalate, terminate, configure
+       target: &'static str,       // "env:ANTHROPIC_API_KEY", "config:model", etc.
+       message: &'static str,      // stable human-readable hint
+   }
+   ```
+2. **Stable hint outputs per class:** Each `error_kind` maps to exactly one remediation shape. No more prose splitting.
+3. **Golden fixture tests:** Test each `(kind, operation)` pair against expected remediation output as golden fixtures instead of the current `split_error_hint()` string hacks.
+
+**Acceptance.**
+- `remediation_for("missing_credentials", "prompt")` returns a stable struct with `action: Configure`, `target: "env:ANTHROPIC_API_KEY"`.
+- JSON output includes `remediation.action` and `remediation.target` fields.
+- Golden fixture tests cover all 12+ known error kinds.
+- `split_error_hint()` is replaced or deprecated.
+
+**Blocker.** None. Natural Phase 3 progression from #77 P1 (JSON kind) → #156 (text kind) → #157 (structured remediation).
+
+**Source.** gaebal-gajae dogfood sweep 2026-04-22 05:30 KST — identified that `kind` is structured but `hint` remains prose-derived, leaving downstream claws with half an error contract.
