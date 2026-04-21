@@ -5171,3 +5171,55 @@ Nudge surface should report explicit state + timestamp: `"feat/134-135 state=pus
 - Means closure-state tracking must live inside the repo (ROADMAP) or in an external surface (Discord message edits, `.dogfood-closure.json`)
 
 **Filed:** 2026-04-21 15:05 KST as evidence for #138 by Jobdori dogfood loop.
+
+## Pinpoint #139. `claw state` error message refers to "worker" concept that is not discoverable via `--help` or any documented command — error is unactionable for claws and CI
+
+**Gap.** `claw state` (both text and JSON output modes) returns this error when no worker-state.json exists:
+```
+error: no worker state file found at /private/tmp/cd-16/.claw/worker-state.json — run a worker first
+```
+
+**The problem:** "worker" is a concept that has **zero discoverability path** from the CLI surface:
+1. `claw --help` has no mention of workers, `claw worker`, or worker state
+2. There is no `claw worker` subcommand (not listed in help, not in the 16 known subcommands)
+3. No hint in the error itself about what command triggers worker state creation
+4. A claw, CI pipeline, or first-time user hitting this error has no actionable next step
+
+**Verified on main HEAD `f3f6643` (2026-04-21 15:58 KST):**
+```
+$ claw state --output-format json
+{"error":"no worker state file found at /private/tmp/cd-16/.claw/worker-state.json — run a worker first","type":"error"}
+```
+
+**Trace path.**
+- `rust/crates/rusty-claude-cli/src/main.rs` — `handle_state()` or equivalent returns this error when `.claw/worker-state.json` is missing.
+- No internal documentation on what produces `worker-state.json` (likely background worker session, but not surfaced)
+- `claw bootstrap-plan` mentions phases like `DaemonWorkerFastPath` and `BackgroundSessionFastPath` — suggesting workers are part of daemon/background execution — but this is internal architecture jargon, not user-facing
+
+**Why this is a clawability gap.**
+1. **Error references concept that is not discoverable.** Product Principle violation: "Errors must be actionable." Current error is descriptive but unactionable.
+2. **Claws can't self-heal.** A claw orchestrator that gets this error cannot construct a follow-up command because the remediation is not in the error or in `--help`.
+3. **Dogfood blocker.** Automated test setups that include `claw state` as a health check will fail silently for users who haven't triggered the worker path.
+4. **Internal architecture leaks into user surface.** The `worker` / `daemon` / `background session` distinction is internal runtime nomenclature, not user-facing workflow.
+
+**Fix shape (~20-40 lines).**
+1. **Error message should include remediation.** Change error to:
+   ```json
+   {
+     "error": "no worker state file found at <path> — run `claw` (interactive REPL) or `claw prompt <text>` to produce worker state",
+     "type": "error",
+     "hint": "Worker state is created when claw executes a prompt (REPL or one-shot). If you have run claw but still see this, check that your session wrote to .claw/worker-state.json.",
+     "next_action": "claw prompt \"hello\""
+   }
+   ```
+2. **Add `claw --help` reference.** Document under `Flags` or `Subcommand overview` that `claw state` requires prior execution.
+3. **Consistency with typed-error envelope** (ROADMAP §4.44): include `operation: "state-read"`, `target: "<path>"`, `retryable: false` fields for machine consumers.
+
+**Acceptance.**
+- `claw state` error text explicitly names the command(s) that produce worker state
+- `--help` has at least one line documenting the state/worker relationship
+- A claw reading the JSON error gets a structured `next_action` field
+
+**Blocker.** None. Pure error-text + doc fix. ~30 lines.
+
+**Source.** Jobdori dogfood 2026-04-21 16:00 KST on main HEAD `f3f6643`. Joins **error-message-quality** cluster (related to §4.44 typed error taxonomy and §5 failure class enumeration). Joins **CLI discoverability** cluster (#108 did-you-mean for typos, #127 --json on diagnostic verbs). Session tally: ROADMAP #139.
