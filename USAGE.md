@@ -125,6 +125,60 @@ error: no worker state file found at .claw/worker-state.json
   Then rerun: claw state [--output-format json]
 ```
 
+## Advanced slash commands (Interactive REPL only)
+
+These commands are available inside the interactive REPL (`claw` with no args). They extend the assistant with workspace analysis, planning, and navigation features.
+
+### `/ultraplan` — Deep planning with multi-step reasoning
+
+**Purpose:** Break down a complex task into steps using extended reasoning.
+
+```bash
+# Start the REPL
+claw
+
+# Inside the REPL
+/ultraplan refactor the auth module to use async/await
+/ultraplan design a caching layer for database queries
+/ultraplan analyze this module for performance bottlenecks
+```
+
+Output: A structured plan with numbered steps, reasoning for each step, and expected outcomes. Use this when you want the assistant to think through a problem in detail before coding.
+
+### `/teleport` — Jump to a file or symbol
+
+**Purpose:** Quickly navigate to a file, function, class, or struct by name.
+
+```bash
+# Jump to a symbol
+/teleport UserService
+/teleport authenticate_user
+/teleport RequestHandler
+
+# Jump to a file
+/teleport src/auth.rs
+/teleport crates/runtime/lib.rs
+/teleport ./ARCHITECTURE.md
+```
+
+Output: The file content, with the requested symbol highlighted or the file fully loaded. Useful for exploring the codebase without manually navigating directories. If multiple matches exist, the assistant shows the top candidates.
+
+### `/bughunter` — Scan for likely bugs and issues
+
+**Purpose:** Analyze code for common pitfalls, anti-patterns, and potential bugs.
+
+```bash
+# Scan the entire workspace
+/bughunter
+
+# Scan a specific directory or file
+/bughunter src/handlers
+/bughunter rust/crates/runtime
+/bughunter src/auth.rs
+```
+
+Output: A list of suspicious patterns with explanations (e.g., "unchecked unwrap()", "potential race condition", "missing error handling"). Each finding includes the file, line number, and suggested fix. Use this as a first pass before a full code review.
+
 ## Model and permission controls
 
 ```bash

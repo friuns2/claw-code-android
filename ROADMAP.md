@@ -5885,3 +5885,117 @@ pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
 **Blocker.** None.
 
 **Source.** Q's ack on #150 surfaced the deeper gap: "#150 closed is real value" but the product function still has the brittleness. Session tally: ROADMAP #151.
+
+## Pinpoint #152. Diagnostic verb suffixes allow arbitrary positional args, emit double "error:" prefix
+
+**Gap.** Verbs like `claw doctor garbage` and `claw status foo bar` parse successfully instead of failing at parse time. The positional arguments fall through to the prompt-execution path, or in some cases the verb parser doesn't have a flag-only guard. Additionally, the error formatter doubles the "error:" prefix and doesn't hint at `--output-format json` for verbs that don't recognize `--json` as an alias.
+
+**Example failures:**
+- `claw doctor garbage` → silently treats "garbage" as a prompt instead of rejecting "doctor" as a verb with unexpected args
+- `claw system-prompt --json` → errors with "error: unknown option" but doesn't suggest `--output-format json`
+- Error messages show `error: error: <message>` (double prefix)
+
+**Fix shape (~30 lines).** Three improvements:
+1. Wire parse_verb_suffix to reject positional args after verbs (except multi-word prompts like "help me debug")
+2. Special-case `--json` in the verb-option error path to suggest `--output-format json`
+3. Remove the "error:" prefix from format_unknown_verb_option (already added by top-level handler)
+
+**Acceptance:** `claw doctor garbage` exits 1 with "unexpected positional argument"; `claw system-prompt --json` hints at `--output-format json`; error messages have single "error:" prefix.
+
+**Blocker.** None. Implementation exists on worktree `jobdori-127-verb-suffix` but needs rebase against main (conflicts with #141 which already shipped).
+
+**Source.** Clawhip nudge 2026-04-21 21:17 KST — "no excuses, always find something to ship" directive. Session tally: ROADMAP #152.
+
+## Pinpoint #153. README/USAGE missing "add binary to PATH" and "verify install" bridge
+
+**Gap.** After `cargo build --workspace`, new users don't know:
+1. Where the binary actually ends up (e.g., `rust/target/debug/claw` vs. expecting it in `/usr/local/bin`)
+2. How to verify the build succeeded (e.g., `claw --help`, `which claw`, `claw doctor`)
+3. How to add it to PATH for shell integration (optional but common follow-up)
+
+This creates a confusing gap: users build successfully but then get "command not found: claw" and assume the build failed, or they immediately ask "how do I install this properly?"
+
+**Real examples from #claw-code:**
+- "claw not found — did the build fail?"
+- "do I need to `cargo install` this?"
+- "why is the binary at `rust/target/debug/claw` and not just `claw`?"
+
+**Fix shape (~50 lines).** Add a new "Post-build verification and PATH" section in README (after Quick start) covering:
+1. **Where the binary lives:** `rust/target/debug/claw` (debug build) or `rust/target/release/claw` (release)
+2. **Verify it works:** Run `./rust/target/debug/claw --help` and `./rust/target/debug/claw doctor`
+3. **Optional: Add to PATH** — three approaches:
+   - symlink: `ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw`
+   - `cargo install --path ./rust` (builds and installs to `~/.cargo/bin/`)
+   - update shell profile to export PATH
+4. **Windows equivalent:** Point to `rust\target\debug\claw.exe` and `cargo install --path .\rust`
+
+**Acceptance:** New users can find the binary location, run it directly, and know their first verification step is `claw doctor`.
+
+**Blocker:** None. Pure documentation.
+
+**Source:** Clawhip nudge 2026-04-21 21:27 KST — onboarding gap from #claw-code observations earlier this month.
+
+## Pinpoint #154. Model syntax error doesn't hint at env var when multiple credentials present
+
+**Gap.** When a user types `claw --model gpt-4` but only has `ANTHROPIC_API_KEY` set (no `OPENAI_API_KEY`), the error is:
+```
+error: invalid model syntax: 'gpt-4'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)
+```
+
+But USAGE.md documents that "The error message now includes a hint that names the detected env var" — **this hint is not actually emitted.** The user gets a generic syntax error and has to re-read USAGE.md to discover they should type `openai/gpt-4` instead.
+
+**Expected behavior (from USAGE.md):** When the user has multiple providers' env vars set, or when a model name looks like it belongs to a different provider (e.g., `gpt-4` looks like OpenAI), the error should hint:
+- "Did you mean `openai/gpt-4`? (but `OPENAI_API_KEY` is not set)"
+- or "You have `ANTHROPIC_API_KEY` set but `gpt-4` looks like an OpenAI model. Try `openai/gpt-4` with `OPENAI_API_KEY` exported"
+
+**Current behavior:** Generic syntax error, user has to infer the fix from USAGE.md or guess.
+
+**Fix shape (~20 lines).** Enhance `FormatError::InvalidModelSyntax` or the model-parsing validation to:
+1. Detect if the model name looks like it belongs to a known provider (prefix `gpt-`, `openai/`, `qwen`, etc.)
+2. If it does, check if that provider's env var is missing
+3. Append a hint: "Did you mean \`{inferred_prefix}/{model}\`? (requires `{PROVIDER_KEY}` env var)"
+
+**Acceptance:** `claw --model gpt-4` produces a hint about OpenAI prefix and missing `OPENAI_API_KEY`. Same for `qwen-plus` → hint about `DASHSCOPE_API_KEY`, etc.
+
+**Blocker:** None. Pure error-message UX improvement.
+
+**Source:** Clawhip nudge 2026-04-21 21:37 KST — discovered during dogfood probing of model validation.
+
+## Pinpoint #155. USAGE.md missing docs for `/ultraplan`, `/teleport`, `/bughunter` commands
+
+**Gap.** The `claw --help` output lists three interactive slash commands that are not documented in USAGE.md:
+- `/ultraplan [task]` — Run a deep planning prompt with multi-step reasoning
+- `/teleport <symbol-or-path>` — Jump to a file or symbol by searching the workspace
+- `/bughunter [scope]` — Inspect the codebase for likely bugs
+
+New users see these commands in the help output but have no explanation of:
+1. What each does
+2. How to use it
+3. What kind of input it expects
+4. When to use it (vs. other commands)
+5. Any limitations or prerequisites
+
+**Impact.** Users run `/ultraplan` or `/teleport` out of curiosity, or they skip these commands because they don't understand them. Documentation should lower the barrier to discovery.
+
+**Fix shape (~100 lines).** Add a new section to USAGE.md after "Interactive slash commands" covering:
+1. **Planning & Reasoning** — `/ultraplan [task]`
+   - Purpose: extended multi-step reasoning over a task
+   - Input: a task description or problem statement
+   - Output: a structured plan with steps and reasoning
+   - Example: `/ultraplan refactor this module to use async/await`
+2. **Navigation** — `/teleport <symbol-or-path>`
+   - Purpose: quickly jump to a file or function by name
+   - Input: a symbol name (function, class, struct) or file path
+   - Output: the file content with that symbol highlighted
+   - Example: `/teleport UserService`, `/teleport src/auth.rs`
+3. **Code Analysis** — `/bughunter [scope]`
+   - Purpose: scan the codebase for likely bugs or issues
+   - Input: optional scope (e.g., "src/handlers", "lib.rs")
+   - Output: list of suspicious patterns with explanations
+   - Example: `/bughunter src`, `/bughunter` (entire workspace)
+
+**Acceptance:** Each command has a one-line description, a practical example, and expected behavior documented.
+
+**Blocker:** None. Pure documentation.
+
+**Source:** Clawhip nudge 2026-04-21 21:47 KST — discovered discrepancy between `claw --help` and USAGE.md coverage.

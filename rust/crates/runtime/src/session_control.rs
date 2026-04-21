@@ -112,7 +112,7 @@ impl SessionStore {
             candidate
         } else if looks_like_path {
             return Err(SessionControlError::Format(
-                format_missing_session_reference(reference),
+                format_missing_session_reference(reference, &self.sessions_root),
             ));
         } else {
             self.resolve_managed_path(reference)?
@@ -143,7 +143,7 @@ impl SessionStore {
             }
         }
         Err(SessionControlError::Format(
-            format_missing_session_reference(session_id),
+            format_missing_session_reference(session_id, &self.sessions_root),
         ))
     }
 
@@ -161,7 +161,7 @@ impl SessionStore {
         self.list_sessions()?
             .into_iter()
             .next()
-            .ok_or_else(|| SessionControlError::Format(format_no_managed_sessions()))
+            .ok_or_else(|| SessionControlError::Format(format_no_managed_sessions(&self.sessions_root)))
     }
 
     pub fn load_session(
@@ -522,15 +522,25 @@ fn session_id_from_path(path: &Path) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn format_missing_session_reference(reference: &str) -> String {
+fn format_missing_session_reference(reference: &str, sessions_root: &Path) -> String {
+    // #80: show the actual workspace-fingerprint directory instead of lying about .claw/sessions/
+    let fingerprint_dir = sessions_root
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("<unknown>");
     format!(
-        "session not found: {reference}\nHint: managed sessions live in .claw/sessions/. Try `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
+        "session not found: {reference}\nHint: managed sessions live in .claw/sessions/{fingerprint_dir}/ (workspace-specific partition).\nTry `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
     )
 }
 
-fn format_no_managed_sessions() -> String {
+fn format_no_managed_sessions(sessions_root: &Path) -> String {
+    // #80: show the actual workspace-fingerprint directory instead of lying about .claw/sessions/
+    let fingerprint_dir = sessions_root
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("<unknown>");
     format!(
-        "no managed sessions found in .claw/sessions/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
+        "no managed sessions found in .claw/sessions/{fingerprint_dir}/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`.\nNote: claw partitions sessions per workspace fingerprint; sessions from other CWDs are invisible."
     )
 }
 
