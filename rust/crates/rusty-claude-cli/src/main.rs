@@ -223,14 +223,21 @@ fn main() {
                     "hint": hint,
                 })
             );
-        } else if message.contains("`claw --help`") {
-            eprintln!("error: {message}");
         } else {
-            eprintln!(
-                "error: {message}
+            // #156: Add machine-readable error kind to text output so stderr observers
+            // don't need to regex-scrape the prose.
+            let kind = classify_error_kind(&message);
+            if message.contains("`claw --help`") {
+                eprintln!("[error-kind: {kind}]
+error: {message}");
+            } else {
+                eprintln!(
+                    "[error-kind: {kind}]
+error: {message}
 
 Run `claw --help` for usage."
-            );
+                );
+            }
         }
         std::process::exit(1);
     }
