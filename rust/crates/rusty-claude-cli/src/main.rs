@@ -253,6 +253,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        // #146: dispatch pure-local introspection. Text mode uses existing
+        // render_config_report/render_diff_report; JSON mode uses the
+        // corresponding _json helpers already exposed for resume sessions.
+        CliAction::Config {
+            section,
+            output_format,
+        } => {
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("{}", render_config_report(section.as_deref())?);
+                }
+                CliOutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
+                    );
+                }
+            }
+        }
+        CliAction::Diff { output_format } => match output_format {
+            CliOutputFormat::Text => {
+                println!("{}", render_diff_report()?);
+            }
+            CliOutputFormat::Json => {
+                let cwd = env::current_dir()?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&render_diff_json_for(&cwd)?)?
+                );
+            }
+        },
         CliAction::Export {
             session_reference,
             output_path,
@@ -347,6 +378,15 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Init {
+        output_format: CliOutputFormat,
+    },
+    // #146: `claw config` and `claw diff` are pure-local read-only
+    // introspection commands; wire them as standalone CLI subcommands.
+    Config {
+        section: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    Diff {
         output_format: CliOutputFormat,
     },
     Export {
@@ -661,6 +701,62 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
+        // #145: `plugins` was routed through the prompt fallback because no
+        // top-level parser arm produced CliAction::Plugins. That made `claw
+        // plugins` (and `claw plugins --help`, `claw plugins list`, ...)
+        // attempt an Anthropic network call, surfacing the misleading error
+        // `missing Anthropic credentials` even though the command is purely
+        // local introspection. Mirror `agents`/`mcp`/`skills`: action is the
+        // first positional arg, target is the second.
+        "plugins" => {
+            let tail = &rest[1..];
+            let action = tail.first().cloned();
+            let target = tail.get(1).cloned();
+            if tail.len() > 2 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw plugins {}`: {}",
+                    tail[..2].join(" "),
+                    tail[2..].join(" ")
+                ));
+            }
+            Ok(CliAction::Plugins {
+                action,
+                target,
+                output_format,
+            })
+        }
+        // #146: `config` is pure-local read-only introspection (merges
+        // `.claw.json` + `.claw/settings.json` from disk, no network, no
+        // state mutation). Previously callers had to spin up a session with
+        // `claw --resume SESSION.jsonl /config` to see their own config,
+        // which is synthetic friction. Accepts an optional section name
+        // (env|hooks|model|plugins) matching the slash command shape.
+        "config" => {
+            let tail = &rest[1..];
+            let section = tail.first().cloned();
+            if tail.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw config {}`: {}",
+                    tail[0],
+                    tail[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::Config {
+                section,
+                output_format,
+            })
+        }
+        // #146: `diff` is pure-local (shells out to `git diff --cached` +
+        // `git diff`). No session needed to inspect the working tree.
+        "diff" => {
+            if rest.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw diff`: {}",
+                    rest[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::Diff { output_format })
+        }
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -819,6 +915,11 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
+        // #146: let `config` and `diff` fall through to parse_subcommand
+        // where they are wired as pure-local introspection, instead of
+        // producing the "is a slash command" guidance. Zero-arg cases
+        // reach parse_subcommand too via this None.
+        "config" | "diff" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -9547,6 +9648,99 @@ mod tests {
             CliAction::Agents {
                 args: Some("--help".to_string()),
                 output_format: CliOutputFormat::Text,
+            }
+        );
+        // #145: `plugins` must parse as CliAction::Plugins (not fall through
+        // to the prompt path, which would hit the Anthropic API for a purely
+        // local introspection command).
+        assert_eq!(
+            parse_args(&["plugins".to_string()]).expect("plugins should parse"),
+            CliAction::Plugins {
+                action: None,
+                target: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["plugins".to_string(), "list".to_string()])
+                .expect("plugins list should parse"),
+            CliAction::Plugins {
+                action: Some("list".to_string()),
+                target: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "plugins".to_string(),
+                "enable".to_string(),
+                "example-bundled".to_string(),
+            ])
+            .expect("plugins enable <target> should parse"),
+            CliAction::Plugins {
+                action: Some("enable".to_string()),
+                target: Some("example-bundled".to_string()),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "plugins".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .expect("plugins --output-format json should parse"),
+            CliAction::Plugins {
+                action: None,
+                target: None,
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        // #146: `config` and `diff` must parse as standalone CLI actions,
+        // not fall through to the "is a slash command" error. Both are
+        // pure-local read-only introspection.
+        assert_eq!(
+            parse_args(&["config".to_string()]).expect("config should parse"),
+            CliAction::Config {
+                section: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["config".to_string(), "env".to_string()])
+                .expect("config env should parse"),
+            CliAction::Config {
+                section: Some("env".to_string()),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "config".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .expect("config --output-format json should parse"),
+            CliAction::Config {
+                section: None,
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&["diff".to_string()]).expect("diff should parse"),
+            CliAction::Diff {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "diff".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .expect("diff --output-format json should parse"),
+            CliAction::Diff {
+                output_format: CliOutputFormat::Json,
             }
         );
     }

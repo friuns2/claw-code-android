@@ -5520,3 +5520,102 @@ Exit 0. Full envelope with error surfaced.
 **Future phase (joins #143 Phase 2).** When typed-error taxonomy lands (§4.44), promote `config_load_error` from string to typed object across `doctor`, `status`, and `mcp` in one pass.
 
 **Source.** Jobdori dogfood 2026-04-21 18:59 KST on main HEAD `e2a43fc`. Joins **partial-success** cluster (#143, Principle #5) and **surface consistency** cluster. Session tally: ROADMAP #144.
+
+## Pinpoint #145. `claw plugins` subcommand not wired to CLI parser — word gets treated as a prompt, hits Anthropic API
+
+**Gap.** `claw plugins` (and `claw plugins list`, `claw plugins --help`, `claw plugins info <name>`, etc.) fall through the top-level subcommand match and get routed into the prompt-execution path. Result: a purely local introspection command triggers an Anthropic API call and surfaces `missing Anthropic credentials` to the user. With valid credentials, it would actually send the string `"plugins"` as a prompt to Claude, burning tokens for a local query.
+
+**Verified on main HEAD `faeaa1d` (2026-04-21 19:32 KST):**
+
+```
+$ claw plugins
+error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Anthropic API
+
+$ claw plugins --output-format json
+{"error":"missing Anthropic credentials; ...","type":"error"}
+
+$ claw plugins --help
+error: missing Anthropic credentials; ...
+
+$ claw plugins list
+error: missing Anthropic credentials; ...
+
+$ ANTHROPIC_API_KEY=dummy claw plugins
+⠋ 🦀 Thinking...
+✘ ❌ Request failed
+error: api returned 401 Unauthorized (authentication_error)
+```
+
+Compare `agents`, `mcp`, `skills` — all recognized, all local, all exit 0:
+
+```
+$ claw agents
+No agents found.
+$ claw mcp
+MCP
+  Working directory ...
+  Configured servers 0
+```
+
+**Root cause.** In `rusty-claude-cli/src/main.rs`, the top-level `match rest[0].as_str()` parser has arms for `agents`, `mcp`, `skills`, `status`, `doctor`, `init`, `export`, `prompt`, etc., but **no arm for `plugins`**. The `CliAction::Plugins` variant exists, has a dispatcher (`print_plugins`), and is produced by `SlashCommand::Plugins` inside the REPL — but the top-level CLI path was never wired. Result: `plugins` matches neither a known subcommand nor a slash path, so it falls through to the default "run as prompt" behavior.
+
+**Why this is a clawability gap.**
+1. **Prompt misdelivery (explicit Clawhip category)**: the command string is sent to the LLM instead of dispatched locally. Real risk: without the credentials guard, `claw plugins` would send `"plugins"` as a user prompt to Claude, burning tokens.
+2. **Surface asymmetry**: `plugins` is the only diagnostic-adjacent command that isn't wired. Documentation, slash command, and dispatcher all exist; parser wiring was missed.
+3. **`--help` should never hit the network**. Anywhere.
+4. **Misleading error**: user running `claw plugins` sees an Anthropic credential error. No hint that `plugins` wasn't a recognized subcommand.
+
+**Fix shape (~20 lines).** Add a `"plugins"` arm to the top-level parser in `main.rs` that produces `CliAction::Plugins { action, target, output_format }`, following the same positional convention as `mcp` (`action` = first positional, `target` = second). The existing `CliAction::Plugins` handler (`LiveCli::print_plugins`) already covers text and JSON.
+
+**Acceptance.**
+- `claw plugins` exits 0 with plugins list (empty in a clean workspace, which is the honest state).
+- `claw plugins --output-format json` emits `{"kind":"plugin","action":"list",...}` with exit 0.
+- `claw plugins list` exits 0 and matches `claw plugins`.
+- `claw plugins info <name>` resolves through the existing handler.
+- No Anthropic network call occurs for any `plugins` invocation.
+- Regression test: parse `["claw", "plugins"]`, assert `CliAction::Plugins { action: None, target: None, .. }`.
+
+**Blocker.** None. `CliAction::Plugins` already exists with a working dispatcher.
+
+**Source.** Jobdori dogfood 2026-04-21 19:30 KST on main HEAD `faeaa1d` in response to Clawhip nudge. Joins **prompt misdelivery** cluster. Session tally: ROADMAP #145.
+
+## Pinpoint #146. `claw config` and `claw diff` are pure-local introspection commands but require `--resume SESSION.jsonl` wrapping
+
+**Gap.** Running `claw config` or `claw diff` directly exits with an error pointing to `claw --resume SESSION.jsonl /config` as the only path. Both commands are pure, read-only introspection: `config` reads files from disk and merges them; `diff` shells out to `git diff --cached` + `git diff`. Neither needs a session context to produce correct output.
+
+**Verified on main HEAD `7d63699` (2026-04-21 20:03 KST):**
+
+```
+$ claw config
+error: `claw config` is a slash command. Use `claw --resume SESSION.jsonl /config` or start `claw` and run `/config`.
+
+$ claw config --output-format json
+{"error":"`claw config` is a slash command. ...","type":"error"}
+
+$ claw diff
+error: `claw diff` is a slash command. Use `claw --resume SESSION.jsonl /diff` or start `claw` and run `/diff`.
+```
+
+Meanwhile `agents`, `mcp`, `skills`, `status`, `doctor`, `sandbox`, `plugins` (after #145) all work standalone.
+
+**Why this is a clawability gap.**
+1. **Synthetic friction**: requires a session file to inspect static disk state. A claw probing configuration has to spin up a session it doesn't need.
+2. **Surface asymmetry**: all other read-only diagnostics are standalone. `config` and `diff` are the remaining holdouts.
+3. **Pipeline-unfriendly**: `claw config --output-format json | jq` and `claw diff | less` are natural operator workflows; both are currently broken.
+4. **Both already have working JSON renderers** (`render_config_json`, `render_diff_json_for`) — infrastructure for top-level wiring exists.
+
+**Fix shape (~30 lines).** Add `"config"` and `"diff"` arms to the top-level parser in `main.rs` (mirroring #145's `plugins` wiring). Each dispatches to a new `CliAction` variant or to existing resume-supported renderers directly. Text mode uses `render_config_report` / `render_diff_report`; JSON mode uses `render_config_json` / `render_diff_json_for`. Remove `config` from `bare_slash_command_guidance`'s fallback allowlist only if explicitly gating (parser arm already short-circuits).
+
+**Acceptance.**
+- `claw config` exits 0 with discovered-file listing + merged-keys count.
+- `claw config --output-format json` emits typed envelope with discovered files and merged JSON.
+- `claw config env` / `claw config plugins` surface specific sections (matches `SlashCommand::Config { section }` semantics).
+- `claw diff` exits 0 with clean-tree message or staged/unstaged summary.
+- `claw diff --output-format json` emits typed envelope.
+- Regression tests: `parse_args(["config"])` → `CliAction::Config`; `parse_args(["diff"])` → `CliAction::Diff`.
+
+**Blocker.** None. Renderers exist and are resume-supported (proving they're pure-local).
+
+**Not applying to.** `hooks` (session-state-modifying, explicitly flagged "unsupported resumed slash command" in main.rs), `usage`, `context`, `tasks`, `theme`, `voice`, `rename`, `copy`, `color`, `effort`, `branch`, `rewind`, `ide`, `tag`, `output-style`, `add-dir` — all session-mutating or interactive-only.
+
+**Source.** Jobdori dogfood 2026-04-21 20:03 KST on main HEAD `7d63699` in response to Clawhip nudge. Joins **surface asymmetry** cluster (#145 sibling). Session tally: ROADMAP #146.
