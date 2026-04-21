@@ -375,6 +375,15 @@ enum LocalHelpTopic {
     Sandbox,
     Doctor,
     Acp,
+    // #141: extend the local-help pattern to every subcommand so
+    // `claw <subcommand> --help` has one consistent contract.
+    Init,
+    State,
+    Export,
+    Version,
+    SystemPrompt,
+    DumpManifests,
+    BootstrapPlan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,10 +430,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     && matches!(
                         rest[0].as_str(),
                         "prompt"
-                            | "version"
-                            | "state"
-                            | "init"
-                            | "export"
                             | "commit"
                             | "pr"
                             | "issue"
@@ -434,8 +439,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 // the arg to the API (e.g. `claw prompt --help`) should show
                 // top-level help instead. Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
-                // subcommands (status, sandbox, doctor) must NOT be intercepted
-                // here — they handle --help in their own dispatch paths.
+                // subcommands (status, sandbox, doctor, init, state, export,
+                // version, system-prompt, dump-manifests, bootstrap-plan) must
+                // NOT be intercepted here — they handle --help in their own
+                // dispatch paths via parse_local_help_action(). See #141.
                 wants_help = true;
                 index += 1;
             }
@@ -746,6 +753,17 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
         "acp" => LocalHelpTopic::Acp,
+        // #141: add the subcommands that were previously falling back
+        // to global help (init/state/export/version) or erroring out
+        // (system-prompt/dump-manifests) or printing their primary
+        // output instead of help text (bootstrap-plan).
+        "init" => LocalHelpTopic::Init,
+        "state" => LocalHelpTopic::State,
+        "export" => LocalHelpTopic::Export,
+        "version" => LocalHelpTopic::Version,
+        "system-prompt" => LocalHelpTopic::SystemPrompt,
+        "dump-manifests" => LocalHelpTopic::DumpManifests,
+        "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -1672,14 +1690,21 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     let cwd = env::current_dir()?;
     let state_path = cwd.join(".claw").join("worker-state.json");
     if !state_path.exists() {
-        // Emit a structured error, then return Err so the process exits 1.
-        // Callers (scripts, CI) need a non-zero exit to detect "no state" without
-        // parsing prose output.
-        // Let the error propagate to main() which will format it correctly
-        // (prose for text mode, JSON envelope for --output-format json).
+        // #139: this error used to say "run a worker first" without telling
+        // callers how to run one. "worker" is an internal concept (there is
+        // no `claw worker` subcommand), so claws/CI had no discoverable path
+        // from the error to a fix. Emit an actionable, structured error that
+        // names the two concrete commands that produce worker state.
+        //
+        // Format in both text and JSON modes is stable so scripts can match:
+        //   error: no worker state file found at <path>
+        //     Hint: worker state is written by the interactive REPL or a non-interactive prompt.
+        //     Run:   claw               # start the REPL (writes state on first turn)
+        //     Or:    claw prompt <text> # run one non-interactive turn
+        //     Then rerun: claw state [--output-format json]
         return Err(format!(
-            "no worker state file found at {} — run a worker first",
-            state_path.display()
+            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   claw               # start the REPL (writes state on first turn)\n  Or:    claw prompt <text> # run one non-interactive turn\n  Then rerun: claw state [--output-format json]",
+            path = state_path.display()
         )
         .into());
     }
@@ -2930,11 +2955,15 @@ fn run_resume_command(
             json: Some(render_memory_json()?),
         }),
         SlashCommand::Init => {
-            let message = init_claude_md()?;
+            // #142: run the init once, then render both text + structured JSON
+            // from the same InitReport so both surfaces stay in sync.
+            let cwd = env::current_dir()?;
+            let report = crate::init::initialize_repo(&cwd)?;
+            let message = report.render();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(message.clone()),
-                json: Some(init_json_value(&message)),
+                json: Some(init_json_value(&report, &message)),
             })
         }
         SlashCommand::Diff => {
@@ -5369,6 +5398,58 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
             .to_string(),
+        LocalHelpTopic::Init => "Init
+  Usage            claw init [--output-format <format>]
+  Purpose          create .claw/, .claw.json, .gitignore, and CLAUDE.md in the current project
+  Output           list of created vs. skipped files (idempotent: safe to re-run)
+  Formats          text (default), json
+  Related          claw status · claw doctor"
+            .to_string(),
+        LocalHelpTopic::State => "State
+  Usage            claw state [--output-format <format>]
+  Purpose          read .claw/worker-state.json written by the interactive REPL or a one-shot prompt
+  Output           worker id, model, permissions, session reference (text or json)
+  Formats          text (default), json
+  Produces state   `claw` (interactive REPL) or `claw prompt <text>` (one non-interactive turn)
+  Observes state   `claw state` reads; clawhip/CI may poll this file without HTTP
+  Exit codes       0 if state file exists and parses; 1 with actionable hint otherwise
+  Related          claw status · ROADMAP #139 (this worker-concept contract)"
+            .to_string(),
+        LocalHelpTopic::Export => "Export
+  Usage            claw export [--session <id|latest>] [--output <path>] [--output-format <format>]
+  Purpose          serialize a managed session to JSON for review, transfer, or archival
+  Defaults         --session latest (most recent managed session in .claw/sessions/)
+  Formats          text (default), json
+  Related          /session list · claw --resume latest"
+            .to_string(),
+        LocalHelpTopic::Version => "Version
+  Usage            claw version [--output-format <format>]
+  Aliases          claw --version · claw -V
+  Purpose          print the claw CLI version and build metadata
+  Formats          text (default), json
+  Related          claw doctor (full build/auth/config diagnostic)"
+            .to_string(),
+        LocalHelpTopic::SystemPrompt => "System Prompt
+  Usage            claw system-prompt [--cwd <path>] [--date YYYY-MM-DD] [--output-format <format>]
+  Purpose          render the resolved system prompt that `claw` would send for the given cwd + date
+  Options          --cwd overrides the workspace dir · --date injects a deterministic date stamp
+  Formats          text (default), json
+  Related          claw doctor · claw dump-manifests"
+            .to_string(),
+        LocalHelpTopic::DumpManifests => "Dump Manifests
+  Usage            claw dump-manifests [--manifests-dir <path>] [--output-format <format>]
+  Purpose          emit every skill/agent/tool manifest the resolver would load for the current cwd
+  Options          --manifests-dir scopes discovery to a specific directory
+  Formats          text (default), json
+  Related          claw skills · claw agents · claw doctor"
+            .to_string(),
+        LocalHelpTopic::BootstrapPlan => "Bootstrap Plan
+  Usage            claw bootstrap-plan [--output-format <format>]
+  Purpose          list the ordered startup phases the CLI would execute before dispatch
+  Output           phase names (text) or structured phase list (json) — primary output is the plan itself
+  Formats          text (default), json
+  Related          claw doctor · claw status"
+            .to_string(),
     }
 }
 
@@ -5598,20 +5679,31 @@ fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let message = init_claude_md()?;
+    let cwd = env::current_dir()?;
+    let report = initialize_repo(&cwd)?;
+    let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&init_json_value(&message))?
+            serde_json::to_string_pretty(&init_json_value(&report, &message))?
         ),
     }
     Ok(())
 }
 
-fn init_json_value(message: &str) -> serde_json::Value {
+/// #142: emit first-class structured fields alongside the legacy `message`
+/// string so claws can detect per-artifact state without substring matching.
+fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_json::Value {
+    use crate::init::InitStatus;
     json!({
         "kind": "init",
+        "project_path": report.project_root.display().to_string(),
+        "created": report.artifacts_with_status(InitStatus::Created),
+        "updated": report.artifacts_with_status(InitStatus::Updated),
+        "skipped": report.artifacts_with_status(InitStatus::Skipped),
+        "artifacts": report.artifact_json_entries(),
+        "next_step": crate::init::InitReport::NEXT_STEP,
         "message": message,
     })
 }
@@ -8519,7 +8611,7 @@ mod tests {
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_help_topic, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
@@ -9484,6 +9576,96 @@ mod tests {
         assert_eq!(
             parse_args(&["acp".to_string(), "--help".to_string()]).expect("acp help should parse"),
             CliAction::HelpTopic(LocalHelpTopic::Acp)
+        );
+    }
+
+    #[test]
+    fn subcommand_help_flag_has_one_contract_across_all_subcommands_141() {
+        // #141: every documented subcommand must resolve `<subcommand> --help`
+        // to a subcommand-specific help topic, never to global help, never to
+        // an "unknown option" error, never to the subcommand's primary output.
+        let cases: &[(&str, LocalHelpTopic)] = &[
+            ("status", LocalHelpTopic::Status),
+            ("sandbox", LocalHelpTopic::Sandbox),
+            ("doctor", LocalHelpTopic::Doctor),
+            ("acp", LocalHelpTopic::Acp),
+            ("init", LocalHelpTopic::Init),
+            ("state", LocalHelpTopic::State),
+            ("export", LocalHelpTopic::Export),
+            ("version", LocalHelpTopic::Version),
+            ("system-prompt", LocalHelpTopic::SystemPrompt),
+            ("dump-manifests", LocalHelpTopic::DumpManifests),
+            ("bootstrap-plan", LocalHelpTopic::BootstrapPlan),
+        ];
+        for (subcommand, expected_topic) in cases {
+            for flag in ["--help", "-h"] {
+                let parsed = parse_args(&[subcommand.to_string(), flag.to_string()])
+                    .unwrap_or_else(|error| {
+                        panic!("`{subcommand} {flag}` should parse as help but errored: {error}")
+                    });
+                assert_eq!(
+                    parsed,
+                    CliAction::HelpTopic(*expected_topic),
+                    "`{subcommand} {flag}` should resolve to HelpTopic({expected_topic:?})"
+                );
+            }
+            // And the rendered help must actually mention the subcommand name
+            // (or its canonical title) so users know they got the right help.
+            let rendered = render_help_topic(*expected_topic);
+            assert!(
+                !rendered.is_empty(),
+                "{subcommand} help text should not be empty"
+            );
+            assert!(
+                rendered.contains("Usage"),
+                "{subcommand} help text should contain a Usage line"
+            );
+        }
+    }
+
+    #[test]
+    fn state_error_surfaces_actionable_worker_commands_139() {
+        // #139: the error for missing `.claw/worker-state.json` must name
+        // the concrete commands that produce worker state, otherwise claws
+        // have no discoverable path from the error to a fix.
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project-with-no-state");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+
+        let error = with_current_dir(&cwd, || {
+            super::run_worker_state(CliOutputFormat::Text).expect_err("missing state should error")
+        });
+        let message = error.to_string();
+
+        // Keep the original locator so scripts grepping for it still work.
+        assert!(
+            message.contains("no worker state file found at"),
+            "error should keep the canonical prefix: {message}"
+        );
+        // New actionable hints — this is what #139 is fixing.
+        assert!(
+            message.contains("claw prompt"),
+            "error should name `claw prompt <text>` as a producer: {message}"
+        );
+        assert!(
+            message.contains("REPL"),
+            "error should mention the interactive REPL as a producer: {message}"
+        );
+        assert!(
+            message.contains("claw state"),
+            "error should tell the user what to rerun once state exists: {message}"
+        );
+        // And the State --help topic must document the worker relationship
+        // so claws can discover the contract without hitting the error first.
+        let state_help = render_help_topic(LocalHelpTopic::State);
+        assert!(
+            state_help.contains("Produces state"),
+            "state help must document how state is produced: {state_help}"
+        );
+        assert!(
+            state_help.contains("claw prompt"),
+            "state help must name `claw prompt <text>` as a producer: {state_help}"
         );
     }
 

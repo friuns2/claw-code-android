@@ -52,6 +52,26 @@ cd rust
 
 **Note:** Diagnostic verbs (`doctor`, `status`, `sandbox`, `version`) support `--output-format json` for machine-readable output. Invalid suffix arguments (e.g., `--json`) are now rejected at parse time rather than falling through to prompt dispatch.
 
+### Initialize a repository
+
+Set up a new repository with `.claw` config, `.claw.json`, `.gitignore` entries, and a `CLAUDE.md` guidance file:
+
+```bash
+cd /path/to/your/repo
+./target/debug/claw init
+```
+
+Text mode (human-readable) shows artifact creation summary with project path and next steps. Idempotent — running multiple times in the same repo marks already-created files as "skipped".
+
+JSON mode for scripting:
+```bash
+./target/debug/claw init --output-format json
+```
+
+Returns structured output with `project_path`, `created[]`, `updated[]`, `skipped[]` arrays (one per artifact), and `artifacts[]` carrying each file's `name` and machine-stable `status` tag. The legacy `message` field preserves backward compatibility.
+
+**Why structured fields matter:** Claws can detect per-artifact state (`created` vs `updated` vs `skipped`) without substring-matching human prose. Use the `created[]`, `updated[]`, and `skipped[]` arrays for conditional follow-up logic (e.g., only commit if files were actually created, not just updated).
+
 ### Interactive REPL
 
 ```bash
@@ -78,6 +98,31 @@ cd rust
 ```bash
 cd rust
 ./target/debug/claw --output-format json prompt "status"
+```
+
+### Inspect worker state
+
+The `claw state` command reads `.claw/worker-state.json`, which is written by the interactive REPL or a one-shot prompt when a worker executes a task. This file contains the worker ID, session reference, model, and permission mode.
+
+Prerequisite: You must run `claw` (interactive REPL) or `claw prompt <text>` at least once in the repository to produce the worker state file.
+
+```bash
+cd rust
+./target/debug/claw state
+```
+
+JSON mode:
+```bash
+./target/debug/claw state --output-format json
+```
+
+If you run `claw state` before any worker has executed, you will see a helpful error:
+```
+error: no worker state file found at .claw/worker-state.json
+  Hint: worker state is written by the interactive REPL or a non-interactive prompt.
+  Run:   claw               # start the REPL (writes state on first turn)
+  Or:    claw prompt <text> # run one non-interactive turn
+  Then rerun: claw state [--output-format json]
 ```
 
 ## Model and permission controls
