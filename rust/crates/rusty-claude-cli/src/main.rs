@@ -1649,6 +1649,9 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         git_branch,
         git_summary,
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
+        // Doctor path has its own config check; StatusContext here is only
+        // fed into health renderers that don't read config_load_error.
+        config_load_error: config.as_ref().err().map(ToString::to_string),
     };
     Ok(DoctorReport {
         checks: vec![
@@ -2482,6 +2485,13 @@ struct StatusContext {
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
     sandbox_status: runtime::SandboxStatus,
+    /// #143: when `.claw.json` (or another loaded config file) fails to parse,
+    /// we capture the parse error here and still populate every field that
+    /// doesn't depend on runtime config (workspace, git, sandbox defaults,
+    /// discovery counts). Top-level JSON output then reports
+    /// `status: "degraded"` so claws can distinguish "status ran but config
+    /// is broken" from "status ran cleanly".
+    config_load_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5119,8 +5129,16 @@ fn status_json_value(
     permission_mode: &str,
     context: &StatusContext,
 ) -> serde_json::Value {
+    // #143: top-level `status` marker so claws can distinguish
+    // a clean run from a degraded run (config parse failed but other fields
+    // are still populated). `config_load_error` carries the parse-error string
+    // when present; it's a string rather than a typed object in Phase 1 and
+    // will join the typed-error taxonomy in Phase 2 (ROADMAP §4.44).
+    let degraded = context.config_load_error.is_some();
     json!({
         "kind": "status",
+        "status": if degraded { "degraded" } else { "ok" },
+        "config_load_error": context.config_load_error,
         "model": model,
         "permission_mode": permission_mode,
         "usage": {
@@ -5175,22 +5193,43 @@ fn status_context(
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
-    let runtime_config = loader.load()?;
+    // #143: degrade gracefully on config parse failure rather than hard-fail.
+    // `claw doctor` already does this; `claw status` now matches that contract
+    // so that one malformed `mcpServers.*` entry doesn't take down the whole
+    // health surface (workspace, git, model, permission, sandbox can still be
+    // reported independently).
+    let (loaded_config_files, sandbox_status, config_load_error) = match loader.load() {
+        Ok(runtime_config) => (
+            runtime_config.loaded_entries().len(),
+            resolve_sandbox_status(runtime_config.sandbox(), &cwd),
+            None,
+        ),
+        Err(err) => (
+            0,
+            // Fall back to defaults for sandbox resolution so claws still see
+            // a populated sandbox section instead of a missing field. Defaults
+            // produce the same output as a runtime config with no sandbox
+            // overrides, which is the right degraded-mode shape: we cannot
+            // report what the user *intended*, only what is actually in effect.
+            resolve_sandbox_status(&runtime::SandboxConfig::default(), &cwd),
+            Some(err.to_string()),
+        ),
+    };
     let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
-    let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
-        loaded_config_files: runtime_config.loaded_entries().len(),
+        loaded_config_files,
         discovered_config_files,
         memory_file_count: project_context.instruction_files.len(),
         project_root,
         git_branch,
         git_summary,
         sandbox_status,
+        config_load_error,
     })
 }
 
@@ -5200,9 +5239,24 @@ fn format_status_report(
     permission_mode: &str,
     context: &StatusContext,
 ) -> String {
-    [
+    // #143: if config failed to parse, surface a degraded banner at the top
+    // of the text report so humans see the parse error before the body, while
+    // the body below still reports everything that could be resolved without
+    // config (workspace, git, sandbox defaults, etc.).
+    let status_line = if context.config_load_error.is_some() {
+        "Status (degraded)"
+    } else {
+        "Status"
+    };
+    let mut blocks: Vec<String> = Vec::new();
+    if let Some(err) = context.config_load_error.as_deref() {
+        blocks.push(format!(
+            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
+        ));
+    }
+    blocks.extend([
         format!(
-            "Status
+            "{status_line}
   Model            {model}
   Permission mode  {permission_mode}
   Messages         {}
@@ -5255,12 +5309,8 @@ fn format_status_report(
             context.memory_file_count,
         ),
         format_sandbox_report(&context.sandbox_status),
-    ]
-    .join(
-        "
-
-",
-    )
+    ]);
+    blocks.join("\n\n")
 }
 
 fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
@@ -9624,6 +9674,103 @@ mod tests {
     }
 
     #[test]
+    fn status_degrades_gracefully_on_malformed_mcp_config_143() {
+        // #143: previously `claw status` hard-failed on any config parse error,
+        // taking down the entire health surface for one malformed MCP entry.
+        // `claw doctor` already degrades gracefully; this test locks `status`
+        // to the same contract.
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project-with-malformed-mcp");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        // One valid server + one malformed entry missing `command`.
+        std::fs::write(
+            cwd.join(".claw.json"),
+            r#"{
+  "mcpServers": {
+    "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]},
+    "missing-command": {"args": ["arg-only-no-command"]}
+  }
+}
+"#,
+        )
+        .expect("write malformed .claw.json");
+
+        let context = with_current_dir(&cwd, || {
+            super::status_context(None).expect("status_context should not hard-fail on config parse errors (#143)")
+        });
+
+        // Phase 1 contract: config_load_error is populated with the parse error.
+        let err = context
+            .config_load_error
+            .as_ref()
+            .expect("config_load_error should be Some when config parse fails");
+        assert!(
+            err.contains("mcpServers.missing-command"),
+            "config_load_error should name the malformed field path: {err}"
+        );
+        assert!(
+            err.contains("missing string field command"),
+            "config_load_error should carry the underlying parse error: {err}"
+        );
+
+        // Phase 1 contract: workspace/git/sandbox fields are still populated
+        // (independent of config parse). Sandbox falls back to defaults.
+        assert_eq!(context.cwd, cwd.canonicalize().unwrap_or(cwd.clone()));
+        assert_eq!(
+            context.loaded_config_files, 0,
+            "loaded_config_files should be 0 when config parse fails"
+        );
+        assert!(
+            context.discovered_config_files > 0,
+            "discovered_config_files should still count the file that failed to parse"
+        );
+
+        // JSON output contract: top-level `status: "degraded"` + config_load_error field.
+        let usage = super::StatusUsage {
+            message_count: 0,
+            turns: 0,
+            latest: runtime::TokenUsage::default(),
+            cumulative: runtime::TokenUsage::default(),
+            estimated_tokens: 0,
+        };
+        let json = super::status_json_value(Some("test-model"), usage, "workspace-write", &context);
+        assert_eq!(
+            json.get("status").and_then(|v| v.as_str()),
+            Some("degraded"),
+            "top-level status marker should be 'degraded' when config parse failed: {json}"
+        );
+        assert!(
+            json.get("config_load_error")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("mcpServers.missing-command")),
+            "config_load_error should surface in JSON output: {json}"
+        );
+        // Independent fields still populated.
+        assert_eq!(
+            json.get("model").and_then(|v| v.as_str()),
+            Some("test-model")
+        );
+        assert!(json.get("workspace").is_some(), "workspace field still reported");
+        assert!(json.get("sandbox").is_some(), "sandbox field still reported");
+
+        // Clean path: no config error → status: "ok", config_load_error: null.
+        let clean_cwd = root.join("project-with-clean-config");
+        std::fs::create_dir_all(&clean_cwd).expect("clean project dir");
+        let clean_context = with_current_dir(&clean_cwd, || {
+            super::status_context(None).expect("clean status_context should succeed")
+        });
+        assert!(clean_context.config_load_error.is_none());
+        let clean_json =
+            super::status_json_value(Some("test-model"), usage, "workspace-write", &clean_context);
+        assert_eq!(
+            clean_json.get("status").and_then(|v| v.as_str()),
+            Some("ok"),
+            "clean run should report status: 'ok'"
+        );
+    }
+
+    #[test]
     fn state_error_surfaces_actionable_worker_commands_139() {
         // #139: the error for missing `.claw/worker-state.json` must name
         // the concrete commands that produce worker state, otherwise claws
@@ -10761,6 +10908,7 @@ mod tests {
                     conflicted_files: 0,
                 },
                 sandbox_status: runtime::SandboxStatus::default(),
+                config_load_error: None,
             },
         );
         assert!(status.contains("Status"));

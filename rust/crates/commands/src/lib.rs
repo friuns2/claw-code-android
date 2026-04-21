@@ -2554,11 +2554,22 @@ fn render_mcp_report_for(
 
     match normalize_optional_args(args) {
         None | Some("list") => {
-            let runtime_config = loader.load()?;
-            Ok(render_mcp_summary_report(
-                cwd,
-                runtime_config.mcp().servers(),
-            ))
+            // #144: degrade gracefully on config parse failure (same contract
+            // as #143 for `status`). Text mode prepends a "Config load error"
+            // block before the MCP list; the list falls back to empty.
+            match loader.load() {
+                Ok(runtime_config) => Ok(render_mcp_summary_report(
+                    cwd,
+                    runtime_config.mcp().servers(),
+                )),
+                Err(err) => {
+                    let empty = std::collections::BTreeMap::new();
+                    Ok(format!(
+                        "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial MCP view\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
+                        render_mcp_summary_report(cwd, &empty)
+                    ))
+                }
+            }
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
         Some("show") => Ok(render_mcp_usage(Some("show"))),
@@ -2571,12 +2582,19 @@ fn render_mcp_report_for(
             if parts.next().is_some() {
                 return Ok(render_mcp_usage(Some(args)));
             }
-            let runtime_config = loader.load()?;
-            Ok(render_mcp_server_report(
-                cwd,
-                server_name,
-                runtime_config.mcp().get(server_name),
-            ))
+            // #144: same degradation for `mcp show`; if config won't parse,
+            // the specific server lookup can't succeed, so report the parse
+            // error with context.
+            match loader.load() {
+                Ok(runtime_config) => Ok(render_mcp_server_report(
+                    cwd,
+                    server_name,
+                    runtime_config.mcp().get(server_name),
+                )),
+                Err(err) => Ok(format!(
+                    "Config load error\n  Status           fail\n  Summary          runtime config failed to load; cannot resolve `{server_name}`\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
+                )),
+            }
         }
         Some(args) => Ok(render_mcp_usage(Some(args))),
     }
@@ -2599,11 +2617,35 @@ fn render_mcp_report_json_for(
 
     match normalize_optional_args(args) {
         None | Some("list") => {
-            let runtime_config = loader.load()?;
-            Ok(render_mcp_summary_report_json(
-                cwd,
-                runtime_config.mcp().servers(),
-            ))
+            // #144: match #143's degraded envelope contract. On config parse
+            // failure, emit top-level `status: "degraded"` with
+            // `config_load_error`, empty servers[], and exit 0. On clean
+            // runs, the existing serializer adds `status: "ok"` below.
+            match loader.load() {
+                Ok(runtime_config) => {
+                    let mut value = render_mcp_summary_report_json(
+                        cwd,
+                        runtime_config.mcp().servers(),
+                    );
+                    if let Some(map) = value.as_object_mut() {
+                        map.insert("status".to_string(), Value::String("ok".to_string()));
+                        map.insert("config_load_error".to_string(), Value::Null);
+                    }
+                    Ok(value)
+                }
+                Err(err) => {
+                    let empty = std::collections::BTreeMap::new();
+                    let mut value = render_mcp_summary_report_json(cwd, &empty);
+                    if let Some(map) = value.as_object_mut() {
+                        map.insert("status".to_string(), Value::String("degraded".to_string()));
+                        map.insert(
+                            "config_load_error".to_string(),
+                            Value::String(err.to_string()),
+                        );
+                    }
+                    Ok(value)
+                }
+            }
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
         Some("show") => Ok(render_mcp_usage_json(Some("show"))),
@@ -2616,12 +2658,29 @@ fn render_mcp_report_json_for(
             if parts.next().is_some() {
                 return Ok(render_mcp_usage_json(Some(args)));
             }
-            let runtime_config = loader.load()?;
-            Ok(render_mcp_server_report_json(
-                cwd,
-                server_name,
-                runtime_config.mcp().get(server_name),
-            ))
+            // #144: same degradation pattern for show action.
+            match loader.load() {
+                Ok(runtime_config) => {
+                    let mut value = render_mcp_server_report_json(
+                        cwd,
+                        server_name,
+                        runtime_config.mcp().get(server_name),
+                    );
+                    if let Some(map) = value.as_object_mut() {
+                        map.insert("status".to_string(), Value::String("ok".to_string()));
+                        map.insert("config_load_error".to_string(), Value::Null);
+                    }
+                    Ok(value)
+                }
+                Err(err) => Ok(serde_json::json!({
+                    "kind": "mcp",
+                    "action": "show",
+                    "server": server_name,
+                    "status": "degraded",
+                    "config_load_error": err.to_string(),
+                    "working_directory": cwd.display().to_string(),
+                })),
+            }
         }
         Some(args) => Ok(render_mcp_usage_json(Some(args))),
     }
@@ -5477,6 +5536,82 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mcp_degrades_gracefully_on_malformed_mcp_config_144() {
+        // #144: mirror of #143's partial-success contract for `claw mcp`.
+        // Previously `mcp` hard-failed on any config parse error, hiding
+        // well-formed servers and forcing claws to fall back to `doctor`.
+        // Now `mcp` emits a degraded envelope instead: exit 0, status:
+        // "degraded", config_load_error populated, servers[] empty.
+        let _guard = env_guard();
+        let workspace = temp_dir("mcp-degrades-144");
+        let config_home = temp_dir("mcp-degrades-144-cfg");
+        fs::create_dir_all(workspace.join(".claw")).expect("create workspace .claw dir");
+        fs::create_dir_all(&config_home).expect("create config home");
+        // One valid server + one malformed entry missing `command`.
+        fs::write(
+            workspace.join(".claw.json"),
+            r#"{
+  "mcpServers": {
+    "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]},
+    "missing-command": {"args": ["arg-only-no-command"]}
+  }
+}
+"#,
+        )
+        .expect("write malformed .claw.json");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        // list action: must return Ok (not Err) with degraded envelope.
+        let list = render_mcp_report_json_for(&loader, &workspace, None)
+            .expect("mcp list should not hard-fail on config parse errors (#144)");
+        assert_eq!(list["kind"], "mcp");
+        assert_eq!(list["action"], "list");
+        assert_eq!(
+            list["status"].as_str(),
+            Some("degraded"),
+            "top-level status should be 'degraded': {list}"
+        );
+        let err = list["config_load_error"]
+            .as_str()
+            .expect("config_load_error must be a string on degraded runs");
+        assert!(
+            err.contains("mcpServers.missing-command"),
+            "config_load_error should name the malformed field path: {err}"
+        );
+        assert_eq!(list["configured_servers"], 0);
+        assert!(list["servers"].as_array().unwrap().is_empty());
+
+        // show action: should also degrade (not hard-fail).
+        let show = render_mcp_report_json_for(&loader, &workspace, Some("show everything"))
+            .expect("mcp show should not hard-fail on config parse errors (#144)");
+        assert_eq!(show["kind"], "mcp");
+        assert_eq!(show["action"], "show");
+        assert_eq!(
+            show["status"].as_str(),
+            Some("degraded"),
+            "show action should also report status: 'degraded': {show}"
+        );
+        assert!(show["config_load_error"].is_string());
+
+        // Clean path: status: "ok", config_load_error: null.
+        let clean_ws = temp_dir("mcp-degrades-144-clean");
+        fs::create_dir_all(&clean_ws).expect("clean ws");
+        let clean_loader = ConfigLoader::new(&clean_ws, &config_home);
+        let clean_list = render_mcp_report_json_for(&clean_loader, &clean_ws, None)
+            .expect("clean mcp list should succeed");
+        assert_eq!(
+            clean_list["status"].as_str(),
+            Some("ok"),
+            "clean run should report status: 'ok'"
+        );
+        assert!(clean_list["config_load_error"].is_null());
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(clean_ws);
     }
 
     #[test]
