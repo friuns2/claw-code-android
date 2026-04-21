@@ -830,6 +830,30 @@ Acceptance:
 - channel status updates stay short and machine-grounded
 - claws stop inferring state from raw build spam
 
+### 140. Deprecated `permissionMode` migration silently downgrades `DangerFullAccess` to `WorkspaceWrite`
+
+**Filed:** 2026-04-21 from dogfood cycle — `cargo test --workspace` on `main` HEAD `36b3a09` shows 1 deterministic failure.
+
+**Problem:** `tests::punctuation_bearing_single_token_still_dispatches_to_prompt` fails with:
+```
+assert left == right failed
+  left:  ... permission_mode: WorkspaceWrite ...
+  right: ... permission_mode: DangerFullAccess ...
+warning: .claw/settings.json: field "permissionMode" is deprecated (line 1). Use "permissions.defaultMode" instead
+```
+The test fixture writes a `.claw/settings.json` with the deprecated `permissionMode: "dangerFullAccess"` key. The migration/deprecation shim reads it but resolves to `WorkspaceWrite` instead of `DangerFullAccess`. Result: `cargo test --workspace` is red on `main` with 172 passing, 1 failing.
+
+**Root cause hypothesis:** The deprecated field reader in `parse_args` or `ConfigLoader` applies the `permissionMode` value through a permission-mode resolver that does not map `"dangerFullAccess"` to `PermissionMode::DangerFullAccess`, likely defaulting or falling back to `WorkspaceWrite`.
+
+**Fix shape:**
+- Ensure the deprecated-key migration path correctly maps `permissionMode: "dangerFullAccess"` → `PermissionMode::DangerFullAccess` (same as `permissions.defaultMode: "dangerFullAccess"`).
+- Alternatively, update the test fixture to use the canonical `permissions.defaultMode` key so it exercises the migration shim rather than depending on it.
+- Verify `cargo test --workspace` returns 0 failures.
+
+**Acceptance:**
+- `cargo test --workspace` passes with 0 failures on `main`.
+- Deprecated `permissionMode: "dangerFullAccess"` migrates cleanly to `DangerFullAccess` without downgrading to `WorkspaceWrite`.
+
 ### 137. Model-alias shorthand regression in test suite — bare alias parsing broken on `feat/134-135-session-identity` branch
 
 **Filed:** 2026-04-21 from dogfood cycle — `cargo test --workspace` on `feat/134-135-session-identity` HEAD (`91ba54d`) shows 3 failing tests.
@@ -5223,3 +5247,125 @@ $ claw state --output-format json
 **Blocker.** None. Pure error-text + doc fix. ~30 lines.
 
 **Source.** Jobdori dogfood 2026-04-21 16:00 KST on main HEAD `f3f6643`. Joins **error-message-quality** cluster (related to §4.44 typed error taxonomy and §5 failure class enumeration). Joins **CLI discoverability** cluster (#108 did-you-mean for typos, #127 --json on diagnostic verbs). Session tally: ROADMAP #139.
+
+## Pinpoint #141. `claw <subcommand> --help` has 5 different behaviors — inconsistent help surface breaks discoverability
+
+**Gap.** Running `<subcommand> --help` has five different behaviors depending on which subcommand you pick. This breaks the expected CLI contract that `<subcommand> --help` returns subcommand-specific help.
+
+**Matrix (verified on main HEAD `27ffd75` 2026-04-21 16:59 KST):**
+
+| Subcommand | Behavior | Status |
+|---|---|---|
+| `status`, `sandbox`, `doctor`, `skills`, `agents`, `mcp`, `acp` | Subcommand-specific help | ✅ correct |
+| `version` | Global `claw --help` | ⚠️ inconsistent |
+| `init`, `export`, `state` | Global `claw --help` | ⚠️ inconsistent |
+| `dump-manifests`, `system-prompt` | `error: unknown <cmd> option: --help` | ❌ broken |
+| `bootstrap-plan` | Prints phases JSON (not help at all) | ❌ broken |
+
+**Concrete repro:**
+```
+$ claw system-prompt --help
+error: unknown system-prompt option: --help
+
+$ claw dump-manifests --help
+error: unknown dump-manifests option: --help
+
+$ claw bootstrap-plan --help
+- CliEntry
+- FastPathVersion
+...
+
+$ claw init --help
+claw v0.1.0
+Usage:
+  claw [--model MODEL] ...    # this is global help, not init-specific
+```
+
+**Why this is a clawability gap.**
+1. **Product principle violation**: every CLI subcommand should have a consistent `<cmd> --help` contract that returns subcommand-specific help.
+2. **CI/orchestration hazard**: a claw script that tries `<cmd> --help | grep <option>` gets structural behavior differences — some return 0, some return 1 with "unknown option", some return global help that doesn't mention the subcommand at all.
+3. **Discoverability asymmetry**: 7 subcommands have good help, 4 have global-help fallback, 2 error out, 1 produces irrelevant output. No documented reason for the split.
+4. **Follow-on from #108**: #108 fixed subcommand typos at the dispatch layer. #141 is the next layer up — even valid subcommands have inconsistent `--help` dispatch.
+
+**Fix shape (~50 lines).**
+1. For subcommands that return a structured help block (`status`, `sandbox`, `doctor`, `skills`, `agents`, `mcp`, `acp`): this is the model. Use the same pattern.
+2. For `init`, `export`, `state`, `version`: add subcommand-specific help block or explicitly dispatch `--help` to `claw --help` (consistent fallback is OK; returning global help that doesn't mention the subcommand is not).
+3. For `dump-manifests`, `system-prompt`: fix the parser to recognize `--help` as a dispatch rather than unknown flag. Add subcommand-specific help.
+4. For `bootstrap-plan`: add `--help` dispatch to explain what the subcommand does (currently prints phases, which is the primary output but not help text).
+5. Add a consistency test: `for cmd in <list>: assert exitcode_of("claw $cmd --help") == 0 and contains help text`.
+
+**Acceptance.**
+- All 14 subcommands have `<cmd> --help` exit 0 with relevant help text
+- No "unknown option" errors from `<cmd> --help`
+- Consistency test in the regression suite
+
+**Blocker.** None. Scoped to CLI parser + help text. ~50 lines + test.
+
+**Source.** Jobdori dogfood 2026-04-21 16:59 KST on main HEAD `27ffd75`. Joins **CLI/REPL parity** cluster (§7.1) and **discoverability** cluster (#108 did-you-mean, #127 --json on diagnostic verbs, #139 worker concept unactionable). Session tally: ROADMAP #141.
+
+## Pinpoint #142. `claw init --output-format json` dumps human text into `message` — no structured fields for created/skipped files
+
+**Gap.** `claw init --output-format json` emits a valid JSON envelope, but the payload is entirely a human-formatted multi-line text block packed into `message`. There are no structured fields to tell a claw script which files were created, which were skipped, or what the project path was.
+
+**Verified on main HEAD `21b377d` 2026-04-21 17:34 KST.**
+
+**Actual output (fresh directory, everything created):**
+```json
+{
+  "kind": "init",
+  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .claw/           created\n  .claw.json       created\n  .gitignore       created\n  CLAUDE.md        created\n  Next step        Review and tailor the generated guidance"
+}
+```
+
+**Idempotent second call (everything skipped):**
+```json
+{
+  "kind": "init",
+  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .claw/           skipped (already exists)\n  .claw.json       skipped (already exists)\n  .gitignore       skipped (already exists)\n  CLAUDE.md        skipped (already exists)\n  Next step        Review and tailor the generated guidance"
+}
+```
+
+**Compare `claw status --output-format json` (the model):**
+```json
+{
+  "kind": "status",
+  "model": "claude-opus-4-6",
+  "permission_mode": "danger-full-access",
+  "sandbox": { "active": false, "enabled": true, "fallback_reason": "...", ... },
+  "usage": { "cumulative_input": 0, "messages": 0, "turns": 0, ... },
+  "workspace": { "changed_files": 0, ... }
+}
+```
+
+**Why this is a clawability gap.**
+1. **Substring matching required**: to tell whether `.claw/` was created vs skipped, a claw has to grep the `message` string for `"created"` or `"skipped (already exists)"`. Not a contract — human-language fragility.
+2. **No programmatic idempotency signal**: CI/orchestration cannot easily tell "first run produced new files" from "second run was no-op". Both paths end up with `kind: init` and a free-form message.
+3. **Inconsistent with `status`/`sandbox`/`doctor`**: those subcommands have first-class structured JSON. `init` does not. Product contract asymmetry.
+4. **Path isn't a field**: the project path is embedded in the same string. No `project_path` key.
+5. **Joins JSON-output cluster** (#90, #91, #92, #127, #130, #136): every one of those was a JSON contract shortfall where the command technically emitted JSON but did not emit *useful* JSON.
+
+**Fix shape (~40 lines).**
+Add structured fields alongside `message` (keep `message` for backward compat):
+```json
+{
+  "kind": "init",
+  "project_path": "/private/tmp/cd-1730b",
+  "created": [".claw", ".claw.json", ".gitignore", "CLAUDE.md"],
+  "skipped": [],
+  "next_step": "Review and tailor the generated guidance",
+  "message": "Init\n  Project..."
+}
+```
+
+On idempotent call: `created: []`, `skipped: [".claw", ".claw.json", ...]`.
+
+**Acceptance.**
+- `claw init --output-format json` has `created`, `skipped`, `project_path`, `next_step` top-level fields
+- `created.len() + skipped.len() == 4` on standard init
+- Idempotent call has empty `created`
+- Existing `message` field preserved for text consumers (deprecation path only if needed)
+- Regression test: JSON schema assertions for both fresh + idempotent cases
+
+**Blocker.** None. Scoped to `init` subcommand JSON serializer. ~40 lines.
+
+**Source.** Jobdori dogfood 2026-04-21 17:34 KST on main HEAD `21b377d`. Joins **JSON output completeness** cluster (#90/#91/#92/#127/#130/#136). Session tally: ROADMAP #142.

@@ -10061,9 +10061,19 @@ mod tests {
 
     #[test]
     fn punctuation_bearing_single_token_still_dispatches_to_prompt() {
-        assert_eq!(
+        // #140: Guard against test pollution — isolate cwd + env so this test
+        // doesn't pick up a stale .claw/settings.json from other tests that
+        // may have set `permissionMode: acceptEdits` in a shared cwd.
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        let result = with_current_dir(&cwd, || {
             parse_args(&["PARITY_SCENARIO:bash_permission_prompt_approved".to_string()])
-                .expect("scenario token should still dispatch to prompt"),
+                .expect("scenario token should still dispatch to prompt")
+        });
+        assert_eq!(
+            result,
             CliAction::Prompt {
                 prompt: "PARITY_SCENARIO:bash_permission_prompt_approved".to_string(),
                 model: DEFAULT_MODEL.to_string(),
