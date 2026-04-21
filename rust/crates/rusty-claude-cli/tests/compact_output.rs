@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
+use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -121,6 +122,60 @@ fn compact_flag_streaming_text_only_emits_final_message_text() {
         stdout, "Mock streaming says hello from the parity harness.\n",
         "compact streaming stdout should contain only the final assistant text"
     );
+
+    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+}
+
+#[test]
+fn compact_flag_with_json_output_emits_structured_json() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+
+    let workspace = unique_temp_dir("compact-json");
+    let config_home = workspace.join("config-home");
+    let home = workspace.join("home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    let prompt = format!("{SCENARIO_PREFIX}streaming_text");
+    let output = run_claw(
+        &workspace,
+        &config_home,
+        &home,
+        &base_url,
+        &[
+            "--model",
+            "sonnet",
+            "--permission-mode",
+            "read-only",
+            "--output-format",
+            "json",
+            "--compact",
+            &prompt,
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "compact json run should succeed
+stdout:
+{}
+
+stderr:
+{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: Value = serde_json::from_str(&stdout).expect("compact json stdout should parse");
+    assert_eq!(parsed["message"], "Mock streaming says hello from the parity harness.");
+    assert_eq!(parsed["compact"], true);
+    assert_eq!(parsed["model"], "claude-sonnet-4-6");
+    assert!(parsed["usage"].is_object());
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
 }

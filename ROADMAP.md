@@ -5096,3 +5096,78 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 **Blocker.** None. Additive change to existing match arms.
 
 **Source.** Jobdori dogfood 2026-04-21 12:25 KST on main HEAD `8b52e77` during recurring cron cycle. Joins **Output format completeness** cluster (#90/#91/#92/#127/#130) — all surfaces that produce inconsistent or plain-text fallbacks when JSON is requested. Also joins **CLI/REPL parity** (§7.1) — compact is available as both `--compact` flag and `/compact` REPL command; JSON output gap affects only the flag path. Session tally: ROADMAP #136.
+
+## Pinpoint #138. Dogfood cycle report-gate opacity — nudge surface collapses "bundle converged", "follow-up landed", and "pre-existing flake only" into single closure shape
+
+**Gap.** When a dogfood nudge triggers on a branch with landed work, the report surface emits status like "fixed 3 tests, pushed branch, 1 unrelated red remains" — but downstream nudges cannot distinguish:
+1. `bundle converged, merge-ready` (e.g., #134/#135 branch after fixes)
+2. `follow-up landed on main, branch still valid` (e.g., #137 + #136 fixes after #134/#135 was ready)
+3. `only pre-existing flake remains, no new regressions` (e.g., `resume_latest...` test failure on main that also fails on feature branch)
+4. `work still in flight, blocker not yet resolved`
+5. `merged and closed, re-nudge is a dup`
+
+Result: repeat nudges look identical whether the prior work converged or is still broken. Claws re-open what was already resolved, burning cycles on rediscovery.
+
+**Concrete example from this session:**
+- 14:30 nudge triggered on bundle already clear (14:25)
+- Reported finding was "nudge closure-state opacity" but manifested as "should we re-nudge or not?"
+- No explicit surface like "status: done", "last-updated: 2026-04-21T14:25", "next-action: none" that stops re-nudges on unchanged state
+
+**Fix shape (~30-50 lines, surfaces not code).**
+1. Dogfood report should carry an explicit **closure state** field: `converged`, `follow-up-landed`, `pre-existing-flake-only`, `in-flight`, `merged`, `dup`.
+2. Each state has a **last-updated timestamp** (when report was filed) and **next-action** (null if converged, or describe blocker).
+3. Nudge logic checks prior report state: if `converged` + timestamp < 10 min old, skip nudge and post "still converged as of HH:MM, no action".
+4. If state changed (e.g., new commits landed), emit **state transition** explicitly: "bundle done (14:25) → follow-up landed (14:42)".
+5. Store closure state in a **shared metadata surface** (Discord message edit, ROADMAP inline, or compact JSON file) so next cycle can read it.
+
+**Acceptance.**
+- Repeat nudges on converged work are replaced with "no change since last report" (skip).
+- State transitions are explicit: "was X, now Y" instead of ambiguous "X and also Y".
+- Claws can scan closure states and prioritize fresh work over already-handled bundles.
+
+**Blocker.** Design question: **where should closure state live?** Options:
+- Edit the prior Discord message with a closure tag (e.g., 🟢 CONVERGED).
+- Add a `.dogfood-closure.json` file to the worktree branch that tracks state.
+- File a new ROADMAP entry per bundle completion (meta-tracking).
+- Embedded in claw-code CLI output (machine-readable, but creates coupling).
+
+Current state is **design question unresolved**. Implementation is straightforward once closure-state model is settled.
+
+**Source.** Jobdori dogfood 2026-04-21 14:25-14:47 KST — multi-cycle convergence pattern exposed by repeat nudges on #134/#135 bundle. Joins **Dogfood loop observability** (related to earlier §4.7 session-identity, but one level up — session-identity is plumbing, closure-state is the **reporting contract**). Also joins **False-green report gating** (from 14:05 finding) — this is the downstream effect: unclear reports beget re-nudges on stale work.
+
+Session tally: ROADMAP #138.
+
+### Evidence for #138 — feat/134-135-session-identity branch is pushed but no PR was opened (2026-04-21 15:05)
+
+**Concrete gap observed:**
+- Branch `feat/134-135-session-identity` pushed to `origin` at `7235260` (commits `f55612e`, `2b7095e`, `230d97a`, `7235260`)
+- Dogfood loop declared bundle "merge-ready" at 14:25
+- ~40 min elapsed; no PR opened, no merge, branch still unmerged
+- Meanwhile #136 and #137 landed directly on main (`a8beca1`, `21adae9`) without going through the branch
+
+**Direct verification of #135 on main:**
+- `env -i $BIN status --output-format json` on main HEAD `768c1ab` shows `active_session: null, session_id: null`
+- Fields exist in JSON schema (added by schema-only?) but values are None because the producer plumbing (`#134`) is not on main
+- #135 consumer relies on #134 producer; both live on feat/134-135 only
+
+**Impact:**
+- `claw status --output-format json` on main returns JSON without the #135 session identity signals (because they're only on feat/134-135)
+- Orchestrators that shipped using the 13:00 "round-trip proof" report believing #134+#135 was merge-ready will get null fields
+- Evidence for #138: "closure-state" = "pushed branch" ≠ "merged" ≠ "in-PR" — nudge surface collapses all three
+
+**Proposed closure-state transition:**
+1. `pushed` — branch exists on origin but no PR (current state for feat/134-135)
+2. `in-PR` — PR open, review pending
+3. `approved` — PR approved, awaiting merge
+4. `merged` — in main
+5. `deployed` — if applicable
+6. `abandoned` — PR closed without merge
+
+Nudge surface should report explicit state + timestamp: `"feat/134-135 state=pushed (no PR) since 13:00; no closure action taken"` instead of ambiguous "merge-ready."
+
+**Token/permission note:**
+- `code-yeongyu` token has write access to push branches to `ultraworkers/claw-code` but lacks `createPullRequest` permission (GraphQL 404)
+- Issues are disabled on the repo (can't open issue-based tracking)
+- Means closure-state tracking must live inside the repo (ROADMAP) or in an external surface (Discord message edits, `.dogfood-closure.json`)
+
+**Filed:** 2026-04-21 15:05 KST as evidence for #138 by Jobdori dogfood loop.
