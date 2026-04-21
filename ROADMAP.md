@@ -5999,3 +5999,18 @@ New users see these commands in the help output but have no explanation of:
 **Blocker:** None. Pure documentation.
 
 **Source:** Clawhip nudge 2026-04-21 21:47 KST — discovered discrepancy between `claw --help` and USAGE.md coverage.
+
+## Pinpoint #156. Error classification for text-mode output (Phase 2 of #77)
+
+**Gap.** #77 Phase 1 added machine-readable `kind` discriminants to JSON error payloads. Text-mode errors still emit prose-only output with no structured classification.
+
+**Impact.** Observability tools that parse stderr (e.g., log aggregators, CI error parsers) can't distinguish error classes without regex or substring matching. Phase 1 solves it for JSON consumers; Phase 2 should extend the classification to text mode.
+
+**Fix shape (~20 lines).** Option A: Emit a `[error-kind: missing_credentials]` prefix line before the prose error so text parsers can quickly identify the class. Option B: Structured comment format like `# error_class=missing_credentials` at the end. Either way, the `kind` token should appear in text output as well.
+
+**Acceptance.** A stderr observer can distinguish `missing_credentials` from `session_not_found` from `cli_parse` without regex-scraping the full error prose.
+
+**Blocker.** None. Scope is small and non-breaking (adds a prefix or suffix, doesn't change existing error text).
+
+**Source.** Clayhip nudge 2026-04-21 23:18 — dogfood surface clean, Phase 1 proven solid, natural next step is symmetry across output formats.
+

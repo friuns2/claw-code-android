@@ -210,11 +210,17 @@ fn main() {
             .any(|w| w[0] == "--output-format" && w[1] == "json")
             || argv.iter().any(|a| a == "--output-format=json");
         if json_output {
+            // #77: classify error by prefix so downstream claws can route without
+            // regex-scraping the prose. Split short-reason from hint-runbook.
+            let kind = classify_error_kind(&message);
+            let (short_reason, hint) = split_error_hint(&message);
             eprintln!(
                 "{}",
                 serde_json::json!({
                     "type": "error",
-                    "error": message,
+                    "error": short_reason,
+                    "kind": kind,
+                    "hint": hint,
                 })
             );
         } else if message.contains("`claw --help`") {
@@ -227,6 +233,55 @@ Run `claw --help` for usage."
             );
         }
         std::process::exit(1);
+    }
+}
+
+/// #77: Classify a stringified error message into a machine-readable kind.
+///
+/// Returns a snake_case token that downstream consumers can switch on instead
+/// of regex-scraping the prose. The classification is best-effort prefix/keyword
+/// matching against the error messages produced throughout the CLI surface.
+fn classify_error_kind(message: &str) -> &'static str {
+    // Check specific patterns first (more specific before generic)
+    if message.contains("missing Anthropic credentials") {
+        "missing_credentials"
+    } else if message.contains("Manifest source files are missing") {
+        "missing_manifests"
+    } else if message.contains("no worker state file found") {
+        "missing_worker_state"
+    } else if message.contains("session not found") {
+        "session_not_found"
+    } else if message.contains("failed to restore session") {
+        "session_load_failed"
+    } else if message.contains("no managed sessions found") {
+        "no_managed_sessions"
+    } else if message.contains("unrecognized argument") || message.contains("unknown option") {
+        "cli_parse"
+    } else if message.contains("invalid model syntax") {
+        "invalid_model_syntax"
+    } else if message.contains("is not yet implemented") {
+        "unsupported_command"
+    } else if message.contains("unsupported resumed command") {
+        "unsupported_resumed_command"
+    } else if message.contains("confirmation required") {
+        "confirmation_required"
+    } else if message.contains("api failed") || message.contains("api returned") {
+        "api_http_error"
+    } else {
+        "unknown"
+    }
+}
+
+/// #77: Split a multi-line error message into (short_reason, optional_hint).
+///
+/// The short_reason is the first line (up to the first newline), and the hint
+/// is the remaining text or `None` if there's no newline. This prevents the
+/// runbook prose from being stuffed into the `error` field that downstream
+/// parsers expect to be the short reason alone.
+fn split_error_hint(message: &str) -> (String, Option<String>) {
+    match message.split_once('\n') {
+        Some((short, hint)) => (short.to_string(), Some(hint.trim().to_string())),
+        None => (message.to_string(), None),
     }
 }
 
@@ -2576,11 +2631,17 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
         Ok(loaded) => loaded,
         Err(error) => {
             if output_format == CliOutputFormat::Json {
+                // #77: classify session load errors for downstream consumers
+                let full_message = format!("failed to restore session: {error}");
+                let kind = classify_error_kind(&full_message);
+                let (short_reason, hint) = split_error_hint(&full_message);
                 eprintln!(
                     "{}",
                     serde_json::json!({
                         "type": "error",
-                        "error": format!("failed to restore session: {error}"),
+                        "error": short_reason,
+                        "kind": kind,
+                        "hint": hint,
                     })
                 );
             } else {
@@ -2632,6 +2693,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                         serde_json::json!({
                             "type": "error",
                             "error": format!("/{cmd_root} is not yet implemented in this build"),
+                            "kind": "unsupported_command",
                             "command": raw_command,
                         })
                     );
@@ -2650,6 +2712,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                         serde_json::json!({
                             "type": "error",
                             "error": format!("unsupported resumed command: {raw_command}"),
+                            "kind": "unsupported_resumed_command",
                             "command": raw_command,
                         })
                     );
@@ -8945,10 +9008,12 @@ mod tests {
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
+        classify_error_kind,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        split_error_hint,
         render_help_topic, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
@@ -10346,6 +10411,32 @@ mod tests {
             !err_garbage.contains("Did you mean"),
             "Unrelated model errors should not get a hint: {err_garbage}"
         );
+    }
+
+    #[test]
+    fn classify_error_kind_returns_correct_discriminants() {
+        // #77: error kind classification for JSON error payloads
+        assert_eq!(classify_error_kind("missing Anthropic credentials; export ..."), "missing_credentials");
+        assert_eq!(classify_error_kind("no worker state file found at /tmp/..."), "missing_worker_state");
+        assert_eq!(classify_error_kind("session not found: abc123"), "session_not_found");
+        assert_eq!(classify_error_kind("failed to restore session: no managed sessions found"), "session_load_failed");
+        assert_eq!(classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"), "cli_parse");
+        assert_eq!(classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."), "invalid_model_syntax");
+        assert_eq!(classify_error_kind("unsupported resumed command: /blargh"), "unsupported_resumed_command");
+        assert_eq!(classify_error_kind("api failed after 3 attempts: ..."), "api_http_error");
+        assert_eq!(classify_error_kind("something completely unknown"), "unknown");
+    }
+
+    #[test]
+    fn split_error_hint_separates_reason_from_runbook() {
+        // #77: short reason / hint separation for JSON error payloads
+        let (short, hint) = split_error_hint("missing credentials\nHint: export ANTHROPIC_API_KEY");
+        assert_eq!(short, "missing credentials");
+        assert_eq!(hint, Some("Hint: export ANTHROPIC_API_KEY".to_string()));
+
+        let (short, hint) = split_error_hint("simple error with no hint");
+        assert_eq!(short, "simple error with no hint");
+        assert_eq!(hint, None);
     }
 
     #[test]
