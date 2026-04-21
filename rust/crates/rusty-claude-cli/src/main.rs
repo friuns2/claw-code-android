@@ -8946,7 +8946,7 @@ mod tests {
         let args = vec![
             "--output-format=json".to_string(),
             "--model".to_string(),
-            "claude-opus".to_string(),
+            "opus".to_string(),
             "explain".to_string(),
             "this".to_string(),
         ];
@@ -8954,7 +8954,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "claude-opus".to_string(),
+                model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -9724,15 +9724,21 @@ mod tests {
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
-        // Input is ["help", "me", "debug"] so the joined prompt shorthand
-        // must be "help me debug". A previous batch accidentally rewrote
-        // the expected string to "$help overview" (copy-paste slip).
+        // Input is ["--model", "opus", "please", "debug", "this"] so the joined
+        // prompt shorthand must stay a normal multi-word prompt while still
+        // honoring alias validation at parse time.
         assert_eq!(
-            parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
-                .expect("prompt shorthand should still work"),
+            parse_args(&[
+                "--model".to_string(),
+                "opus".to_string(),
+                "please".to_string(),
+                "debug".to_string(),
+                "this".to_string(),
+            ])
+            .expect("prompt shorthand should still work"),
             CliAction::Prompt {
-                prompt: "help me debug".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                prompt: "please debug this".to_string(),
+                model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
