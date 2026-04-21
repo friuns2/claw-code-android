@@ -57,6 +57,96 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+
+/// #148: Model provenance for `claw status` JSON/text output. Records where
+/// the resolved model string came from so claws don't have to re-read argv
+/// to audit whether their `--model` flag was honored vs falling back to env
+/// or config or default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelSource {
+    /// Explicit `--model` / `--model=` CLI flag.
+    Flag,
+    /// ANTHROPIC_MODEL environment variable (when no flag was passed).
+    Env,
+    /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
+    /// flag nor env set it).
+    Config,
+    /// Compiled-in DEFAULT_MODEL fallback.
+    Default,
+}
+
+impl ModelSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ModelSource::Flag => "flag",
+            ModelSource::Env => "env",
+            ModelSource::Config => "config",
+            ModelSource::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelProvenance {
+    /// Resolved model string (after alias expansion).
+    resolved: String,
+    /// Raw user input before alias resolution. None when source is Default.
+    raw: Option<String>,
+    /// Where the resolved model string originated.
+    source: ModelSource,
+}
+
+impl ModelProvenance {
+    fn default_fallback() -> Self {
+        Self {
+            resolved: DEFAULT_MODEL.to_string(),
+            raw: None,
+            source: ModelSource::Default,
+        }
+    }
+
+    fn from_flag(raw: &str) -> Self {
+        Self {
+            resolved: resolve_model_alias_with_config(raw),
+            raw: Some(raw.to_string()),
+            source: ModelSource::Flag,
+        }
+    }
+
+    fn from_env_or_config_or_default(cli_model: &str) -> Self {
+        // Only called when no --model flag was passed. Probe env first,
+        // then config, else fall back to default. Mirrors the logic in
+        // resolve_repl_model() but captures the source.
+        if cli_model != DEFAULT_MODEL {
+            // Already resolved from some prior path; treat as flag.
+            return Self {
+                resolved: cli_model.to_string(),
+                raw: Some(cli_model.to_string()),
+                source: ModelSource::Flag,
+            };
+        }
+        if let Some(env_model) = env::var("ANTHROPIC_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return Self {
+                resolved: resolve_model_alias_with_config(&env_model),
+                raw: Some(env_model),
+                source: ModelSource::Env,
+            };
+        }
+        if let Some(config_model) = config_model_for_current_dir() {
+            return Self {
+                resolved: resolve_model_alias_with_config(&config_model),
+                raw: Some(config_model),
+                source: ModelSource::Config,
+            };
+        }
+        Self::default_fallback()
+    }
+}
+
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -217,9 +307,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => resume_session(&session_path, &commands, output_format),
         CliAction::Status {
             model,
+            model_flag_raw,
             permission_mode,
             output_format,
-        } => print_status_snapshot(&model, permission_mode, output_format)?,
+        } => print_status_snapshot(&model, model_flag_raw.as_deref(), permission_mode, output_format)?,
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
@@ -351,6 +442,10 @@ enum CliAction {
     },
     Status {
         model: String,
+        // #148: raw `--model` flag input (pre-alias-resolution), if any.
+        // None means no flag was supplied; env/config/default fallback is
+        // resolved inside `print_status_snapshot`.
+        model_flag_raw: Option<String>,
         permission_mode: PermissionMode,
         output_format: CliOutputFormat,
     },
@@ -447,6 +542,9 @@ impl CliOutputFormat {
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
+    // #148: when user passes --model/--model=, capture the raw input so we
+    // can attribute source: "flag" later. None means no flag was supplied.
+    let mut model_flag_raw: Option<String> = None;
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -496,12 +594,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     .ok_or_else(|| "missing value for --model".to_string())?;
                 validate_model_syntax(value)?;
                 model = resolve_model_alias_with_config(value);
+                model_flag_raw = Some(value.clone()); // #148
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
                 let value = &flag[8..];
                 validate_model_syntax(value)?;
                 model = resolve_model_alias_with_config(value);
+                model_flag_raw = Some(value.to_string()); // #148
                 index += 1;
             }
             "--output-format" => {
@@ -683,7 +783,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return action;
     }
     if let Some(action) =
-        parse_single_word_command_alias(&rest, &model, permission_mode_override, output_format)
+        parse_single_word_command_alias(&rest, &model, model_flag_raw.as_deref(), permission_mode_override, output_format)
     {
         return action;
     }
@@ -824,8 +924,21 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     return Err(message);
                 }
             }
+            // #147: guard empty/whitespace-only prompts at the fallthrough
+            // path the same way `"prompt"` arm above does. Without this,
+            // `claw ""`, `claw "   "`, and `claw "" ""` silently route to
+            // the Anthropic call and surface a misleading
+            // `missing Anthropic credentials` error (or burn API tokens on
+            // an empty prompt when credentials are present).
+            let joined = rest.join(" ");
+            if joined.trim().is_empty() {
+                return Err(
+                    "empty prompt: provide a subcommand (run `claw --help`) or a non-empty prompt string"
+                        .to_string(),
+                );
+            }
             Ok(CliAction::Prompt {
-                prompt: rest.join(" "),
+                prompt: joined,
                 model,
                 output_format,
                 allowed_tools,
@@ -872,6 +985,8 @@ fn is_help_flag(value: &str) -> bool {
 fn parse_single_word_command_alias(
     rest: &[String],
     model: &str,
+    // #148: raw --model flag input for status provenance. None = no flag.
+    model_flag_raw: Option<&str>,
     permission_mode_override: Option<PermissionMode>,
     output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
@@ -909,6 +1024,7 @@ fn parse_single_word_command_alias(
         "version" => Some(Ok(CliAction::Version { output_format })),
         "status" => Some(Ok(CliAction::Status {
             model: model.to_string(),
+            model_flag_raw: model_flag_raw.map(str::to_string), // #148
             permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
             output_format,
         })),
@@ -2996,6 +3112,7 @@ fn run_resume_command(
                     },
                     default_permission_mode().as_str(),
                     &context,
+                    None, // #148: resumed sessions don't have flag provenance
                 )),
                 json: Some(status_json_value(
                     session.model.as_deref(),
@@ -3008,6 +3125,7 @@ fn run_resume_command(
                     },
                     default_permission_mode().as_str(),
                     &context,
+                    None, // #148: resumed sessions don't have flag provenance
                 )),
             })
         }
@@ -4362,6 +4480,7 @@ impl LiveCli {
                 },
                 self.permission_mode.as_str(),
                 &status_context(Some(&self.session.path)).expect("status context should load"),
+                None, // #148: REPL /status doesn't carry flag provenance
             )
         );
     }
@@ -5195,6 +5314,7 @@ fn render_repl_help() -> String {
 
 fn print_status_snapshot(
     model: &str,
+    model_flag_raw: Option<&str>,
     permission_mode: PermissionMode,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5206,18 +5326,30 @@ fn print_status_snapshot(
         estimated_tokens: 0,
     };
     let context = status_context(None)?;
+    // #148: resolve model provenance. If user passed --model, source is
+    // "flag" with the raw input preserved. Otherwise probe env -> config
+    // -> default and record the winning source.
+    let provenance = match model_flag_raw {
+        Some(raw) => ModelProvenance {
+            resolved: model.to_string(),
+            raw: Some(raw.to_string()),
+            source: ModelSource::Flag,
+        },
+        None => ModelProvenance::from_env_or_config_or_default(model),
+    };
     match output_format {
         CliOutputFormat::Text => println!(
             "{}",
-            format_status_report(model, usage, permission_mode.as_str(), &context)
+            format_status_report(&provenance.resolved, usage, permission_mode.as_str(), &context, Some(&provenance))
         ),
         CliOutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&status_json_value(
-                Some(model),
+                Some(&provenance.resolved),
                 usage,
                 permission_mode.as_str(),
                 &context,
+                Some(&provenance),
             ))?
         ),
     }
@@ -5229,6 +5361,12 @@ fn status_json_value(
     usage: StatusUsage,
     permission_mode: &str,
     context: &StatusContext,
+    // #148: optional provenance for `model` field. Surfaces `model_source`
+    // ("flag" | "env" | "config" | "default") and `model_raw` (user input
+    // before alias resolution, or null when source is "default"). Callers
+    // that don't have provenance (legacy resume paths) pass None, in which
+    // case both new fields are omitted.
+    provenance: Option<&ModelProvenance>,
 ) -> serde_json::Value {
     // #143: top-level `status` marker so claws can distinguish
     // a clean run from a degraded run (config parse failed but other fields
@@ -5236,11 +5374,15 @@ fn status_json_value(
     // when present; it's a string rather than a typed object in Phase 1 and
     // will join the typed-error taxonomy in Phase 2 (ROADMAP §4.44).
     let degraded = context.config_load_error.is_some();
+    let model_source = provenance.map(|p| p.source.as_str());
+    let model_raw = provenance.and_then(|p| p.raw.clone());
     json!({
         "kind": "status",
         "status": if degraded { "degraded" } else { "ok" },
         "config_load_error": context.config_load_error,
         "model": model,
+        "model_source": model_source,
+        "model_raw": model_raw,
         "permission_mode": permission_mode,
         "usage": {
             "messages": usage.message_count,
@@ -5339,6 +5481,10 @@ fn format_status_report(
     usage: StatusUsage,
     permission_mode: &str,
     context: &StatusContext,
+    // #148: optional model provenance to surface in a `Model source` line.
+    // Callers without provenance (legacy resume paths) pass None and the
+    // source line is omitted for backward compat.
+    provenance: Option<&ModelProvenance>,
 ) -> String {
     // #143: if config failed to parse, surface a degraded banner at the top
     // of the text report so humans see the parse error before the body, while
@@ -5355,10 +5501,21 @@ fn format_status_report(
             "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
         ));
     }
+    // #148: render Model source line after Model, showing where the string
+    // came from (flag / env / config / default) and the raw input if any.
+    let model_source_line = provenance
+        .map(|p| match &p.raw {
+            Some(raw) if raw != model => {
+                format!("\n  Model source     {} (raw: {raw})", p.source.as_str())
+            }
+            Some(_) => format!("\n  Model source     {}", p.source.as_str()),
+            None => format!("\n  Model source     {}", p.source.as_str()),
+        })
+        .unwrap_or_default();
     blocks.extend([
         format!(
             "{status_line}
-  Model            {model}
+  Model            {model}{model_source_line}
   Permission mode  {permission_mode}
   Messages         {}
   Turns            {}
@@ -9743,6 +9900,80 @@ mod tests {
                 output_format: CliOutputFormat::Json,
             }
         );
+        // #147: empty / whitespace-only positional args must be rejected
+        // with a specific error instead of falling through to the prompt
+        // path (where they surface a misleading "missing Anthropic
+        // credentials" error or burn API tokens on an empty prompt).
+        let empty_err = parse_args(&["".to_string()])
+            .expect_err("empty positional arg should be rejected");
+        assert!(
+            empty_err.starts_with("empty prompt:"),
+            "empty-arg error should be specific, got: {empty_err}"
+        );
+        let whitespace_err = parse_args(&["   ".to_string()])
+            .expect_err("whitespace-only positional arg should be rejected");
+        assert!(
+            whitespace_err.starts_with("empty prompt:"),
+            "whitespace-only error should be specific, got: {whitespace_err}"
+        );
+        let multi_empty_err = parse_args(&["".to_string(), "".to_string()])
+            .expect_err("multiple empty positional args should be rejected");
+        assert!(
+            multi_empty_err.starts_with("empty prompt:"),
+            "multi-empty error should be specific, got: {multi_empty_err}"
+        );
+        // Typo guard from #108 must still take precedence for non-empty
+        // single-word non-prompt-looking inputs.
+        let typo_err = parse_args(&["sttaus".to_string()])
+            .expect_err("typo'd subcommand should be caught by #108 guard");
+        assert!(
+            typo_err.starts_with("unknown subcommand:"),
+            "typo guard should fire for 'sttaus', got: {typo_err}"
+        );
+        // #148: `--model` flag must be captured as model_flag_raw so status
+        // JSON can report provenance (source: flag, raw: <user-input>).
+        match parse_args(&[
+            "--model".to_string(),
+            "sonnet".to_string(),
+            "status".to_string(),
+        ])
+        .expect("--model sonnet status should parse")
+        {
+            CliAction::Status {
+                model,
+                model_flag_raw,
+                ..
+            } => {
+                assert_eq!(model, "claude-sonnet-4-6", "sonnet alias should resolve");
+                assert_eq!(
+                    model_flag_raw.as_deref(),
+                    Some("sonnet"),
+                    "raw flag input should be preserved"
+                );
+            }
+            other => panic!("expected CliAction::Status, got: {other:?}"),
+        }
+        // --model= form should also capture raw.
+        match parse_args(&[
+            "--model=anthropic/claude-opus-4-6".to_string(),
+            "status".to_string(),
+        ])
+        .expect("--model=... status should parse")
+        {
+            CliAction::Status {
+                model,
+                model_flag_raw,
+                ..
+            } => {
+                assert_eq!(model, "anthropic/claude-opus-4-6");
+                assert_eq!(
+                    model_flag_raw.as_deref(),
+                    Some("anthropic/claude-opus-4-6"),
+                    "--model= form should also preserve raw input"
+                );
+            }
+            other => panic!("expected CliAction::Status, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -9928,7 +10159,7 @@ mod tests {
             cumulative: runtime::TokenUsage::default(),
             estimated_tokens: 0,
         };
-        let json = super::status_json_value(Some("test-model"), usage, "workspace-write", &context);
+        let json = super::status_json_value(Some("test-model"), usage, "workspace-write", &context, None);
         assert_eq!(
             json.get("status").and_then(|v| v.as_str()),
             Some("degraded"),
@@ -9956,7 +10187,7 @@ mod tests {
         });
         assert!(clean_context.config_load_error.is_none());
         let clean_json =
-            super::status_json_value(Some("test-model"), usage, "workspace-write", &clean_context);
+            super::status_json_value(Some("test-model"), usage, "workspace-write", &clean_context, None);
         assert_eq!(
             clean_json.get("status").and_then(|v| v.as_str()),
             Some("ok"),
@@ -10030,6 +10261,7 @@ mod tests {
             parse_args(&["status".to_string()]).expect("status should parse"),
             CliAction::Status {
                 model: DEFAULT_MODEL.to_string(),
+                model_flag_raw: None, // #148: no --model flag passed
                 permission_mode: PermissionMode::DangerFullAccess,
                 output_format: CliOutputFormat::Text,
             }
@@ -11104,6 +11336,7 @@ mod tests {
                 sandbox_status: runtime::SandboxStatus::default(),
                 config_load_error: None,
             },
+            None, // #148
         );
         assert!(status.contains("Status"));
         assert!(status.contains("Model            claude-sonnet"));
