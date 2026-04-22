@@ -6043,3 +6043,103 @@ New users see these commands in the help output but have no explanation of:
 **Blocker.** None. Natural Phase 3 progression from #77 P1 (JSON kind) → #156 (text kind) → #157 (structured remediation).
 
 **Source.** gaebal-gajae dogfood sweep 2026-04-22 05:30 KST — identified that `kind` is structured but `hint` remains prose-derived, leaving downstream claws with half an error contract.
+
+## Pinpoint #158. `compact_messages_if_needed` drops turns silently — no structured compaction event emitted
+
+**Gap.** `QueryEnginePort.compact_messages_if_needed()` (`src/query_engine.py:129`) silently truncates `mutable_messages` and `transcript_store` whenever turn count exceeds `compact_after_turns` (default 12). The truncation is invisible to any consumer — `TurnResult` carries no compaction indicator, the streaming path emits no `compaction_occurred` event, and `persist_session()` persists only the post-compaction slice. A claw polling session state after compaction sees the same `session_id` but a different (shorter) context window with no structured signal that turns were dropped.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+from query_engine import QueryEnginePort, QueryEngineConfig
+
+engine = QueryEnginePort.from_workspace()
+engine.config = QueryEngineConfig(compact_after_turns=3)
+for i in range(5):
+    r = engine.submit_message(f'turn {i}')
+    # TurnResult has no compaction field
+    assert not hasattr(r, 'compaction_occurred')  # passes every time
+print(len(engine.mutable_messages))  # 3 — silently truncated from 5
+```
+
+**Root cause.** `compact_messages_if_needed` is called inside `submit_message` with no return value and no side-channel notification. `stream_submit_message` yields a `message_stop` event that includes `transcript_size` but not a `compaction_occurred` flag or `turns_dropped` count.
+
+**Fix shape (~15 lines).**
+1. Add `compaction_occurred: bool` and `turns_dropped: int` to `TurnResult`.
+2. In `compact_messages_if_needed`, return `(bool, int)` — whether compaction ran and how many turns were dropped.
+3. Propagate into `TurnResult` in `submit_message`.
+4. In `stream_submit_message`, include `compaction_occurred` and `turns_dropped` in the `message_stop` event.
+
+**Acceptance.** A claw watching the stream can detect that compaction occurred and how many turns were silently dropped, without polling `transcript_size` across two consecutive turns.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 06:36 KST — probed `query_engine.py` compact path, confirmed no structured compaction signal in `TurnResult` or stream output.
+
+## Pinpoint #159. `run_turn_loop` hardcodes empty denied_tools — permission denials silently absent from multi-turn sessions
+
+**Gap.** `PortRuntime.run_turn_loop` (`src/runtime.py:163`) calls `engine.submit_message(turn_prompt, command_names, tool_names, ())` with a hardcoded empty tuple for `denied_tools`. By contrast, `bootstrap_session` calls `_infer_permission_denials(matches)` and passes the result. Result: any tool that would be denied (e.g., bash-family tools gated as "destructive") silently appears unblocked across all turns in `turn-loop` mode. The `TurnResult.permission_denials` tuple is always empty for multi-turn runs, giving a false "clean" permission picture to any claw consuming those results.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+from runtime import PortRuntime
+results = PortRuntime().run_turn_loop('run bash ls', max_turns=2)
+for r in results:
+    assert r.permission_denials == ()  # passes — denials never surfaced
+```
+
+Compare `bootstrap_session` for the same prompt — it produces a `PermissionDenial` for bash-family tools.
+
+**Root cause.** `src/runtime.py:163` — `engine.submit_message(turn_prompt, command_names, tool_names, ())`. The `()` is a hardcoded literal; `_infer_permission_denials` is never called in the turn-loop path.
+
+**Fix shape (~5 lines).** Before the turn loop, compute:
+```python
+denials = tuple(self._infer_permission_denials(matches))
+```
+Then pass `denied_tools=denials` to every `submit_message` call inside the loop. Mirrors the existing pattern in `bootstrap_session`.
+
+**Acceptance.** `run_turn_loop('run bash ls').permission_denials` is non-empty and matches what `bootstrap_session` returns for the same prompt. Multi-turn session security posture is symmetric with single-turn bootstrap.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 06:46 KST — diffed `bootstrap_session` vs `run_turn_loop` in `src/runtime.py`, confirmed asymmetric permission denial propagation.
+
+## Pinpoint #160. `session_store` has no `list_sessions`, `delete_session`, or `session_exists` — claw cannot enumerate or clean up sessions without filesystem hacks
+
+**Gap.** `src/session_store.py` exposes exactly two public functions: `save_session` and `load_session`. There is no `list_sessions`, `delete_session`, or `session_exists`. Any claw that needs to enumerate stored sessions, verify a session exists before loading (to avoid `FileNotFoundError`), or clean up stale sessions must reach past the module and glob `DEFAULT_SESSION_DIR` directly. This couples callers to the on-disk layout (`<dir>/<session_id>.json`) and makes it impossible to swap storage backends (e.g., sqlite, remote store) without touching every call site.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+import session_store, inspect
+print([n for n, _ in inspect.getmembers(session_store, inspect.isfunction)
+       if not n.startswith('_')])
+# ['asdict', 'dataclass', 'load_session', 'save_session']
+# list_sessions, delete_session, session_exists — all absent
+```
+
+Try to enumerate sessions without the module:
+```python
+from pathlib import Path
+sessions = list((Path('.port_sessions')).glob('*.json'))
+# Works today, breaks if the dir layout ever changes — no abstraction layer
+```
+
+Try to load a session that doesn't exist:
+```python
+load_session('nonexistent')  # raises FileNotFoundError with no structured error type
+```
+
+**Root cause.** `src/session_store.py` was scaffolded with the minimum needed to save/load a single session and was never extended with the CRUD surface a claw actually needs to manage session lifecycle.
+
+**Fix shape (~25 lines).**
+1. `list_sessions(directory: Path | None = None) -> list[str]` — glob `*.json` in target dir, return sorted session ids (filename stems). Claws can call this to discover all stored sessions without touching the filesystem directly.
+2. `session_exists(session_id: str, directory: Path | None = None) -> bool` — `(target_dir / f'{session_id}.json').exists()`. Use before `load_session` to get a bool check instead of catching `FileNotFoundError`.
+3. `delete_session(session_id: str, directory: Path | None = None) -> bool` — unlink the file if present, return True on success, False if not found. Claws can use this for cleanup without knowing the path scheme.
+
+**Acceptance.** A claw can call `list_sessions()`, `session_exists(id)`, and `delete_session(id)` without importing `Path` or knowing the `.port_sessions/<id>.json` layout. `load_session` on a missing id raises a typed `SessionNotFoundError` subclass of `KeyError` (not `FileNotFoundError`) so callers can distinguish "not found" from IO errors.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 08:46 KST — inspected `src/session_store.py` public API, confirmed only `save_session` + `load_session` present, no list/delete/exists surface.
