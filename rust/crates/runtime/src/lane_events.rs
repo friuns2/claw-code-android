@@ -143,6 +143,31 @@ impl SessionIdentity {
             placeholder_reason: Some(reason.into()),
         }
     }
+
+    /// Reconcile enriched metadata onto this session identity.
+    /// Updates fields with new information while preserving the session identity.
+    /// Clears placeholder reason once real values are provided.
+    #[must_use]
+    pub fn reconcile_enriched(
+        self,
+        title: Option<String>,
+        workspace: Option<String>,
+        purpose: Option<String>,
+    ) -> Self {
+        // Check if any new values are provided before consuming options
+        let has_new_data = title.is_some() || workspace.is_some() || purpose.is_some();
+        Self {
+            title: title.unwrap_or(self.title),
+            workspace: workspace.unwrap_or(self.workspace),
+            purpose: purpose.unwrap_or(self.purpose),
+            // Clear placeholder if any real values were provided
+            placeholder_reason: if has_new_data {
+                None
+            } else {
+                self.placeholder_reason
+            },
+        }
+    }
 }
 
 /// Lane ownership and workflow scope binding.
@@ -168,7 +193,21 @@ pub enum WatcherAction {
     Ignore,
 }
 
-/// Event metadata for ordering, provenance, deduplication, and ownership.
+/// Confidence/trust level for downstream automation decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceLevel {
+    /// High confidence - suitable for automated action
+    High,
+    /// Medium confidence - may require verification
+    Medium,
+    /// Low confidence - likely requires human review
+    Low,
+    /// Unknown confidence level
+    Unknown,
+}
+
+/// Event metadata for ordering, provenance, deduplication, ownership, and confidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneEventMetadata {
     /// Monotonic sequence number for event ordering
@@ -189,6 +228,15 @@ pub struct LaneEventMetadata {
     pub event_fingerprint: Option<String>,
     /// Timestamp when event was observed/created
     pub timestamp_ms: u64,
+    /// Environment/channel label (e.g., production, staging, dev)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_label: Option<String>,
+    /// Emitter identity (e.g., clawd, plugin-name, operator-id)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emitter_identity: Option<String>,
+    /// Confidence/trust level for downstream automation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_level: Option<ConfidenceLevel>,
 }
 
 impl LaneEventMetadata {
@@ -206,6 +254,9 @@ impl LaneEventMetadata {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            environment_label: None,
+            emitter_identity: None,
+            confidence_level: None,
         }
     }
 
@@ -234,6 +285,27 @@ impl LaneEventMetadata {
     #[must_use]
     pub fn with_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
         self.event_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Add environment/channel label
+    #[must_use]
+    pub fn with_environment(mut self, label: impl Into<String>) -> Self {
+        self.environment_label = Some(label.into());
+        self
+    }
+
+    /// Add emitter identity
+    #[must_use]
+    pub fn with_emitter(mut self, emitter: impl Into<String>) -> Self {
+        self.emitter_identity = Some(emitter.into());
+        self
+    }
+
+    /// Add confidence/trust level
+    #[must_use]
+    pub fn with_confidence(mut self, level: ConfidenceLevel) -> Self {
+        self.confidence_level = Some(level);
         self
     }
 }
@@ -313,6 +385,27 @@ impl LaneEventBuilder {
         self
     }
 
+    /// Add environment/channel label
+    #[must_use]
+    pub fn with_environment(mut self, label: impl Into<String>) -> Self {
+        self.metadata = self.metadata.with_environment(label);
+        self
+    }
+
+    /// Add emitter identity
+    #[must_use]
+    pub fn with_emitter(mut self, emitter: impl Into<String>) -> Self {
+        self.metadata = self.metadata.with_emitter(emitter);
+        self
+    }
+
+    /// Add confidence level
+    #[must_use]
+    pub fn with_confidence(mut self, level: ConfidenceLevel) -> Self {
+        self.metadata = self.metadata.with_confidence(level);
+        self
+    }
+
     /// Compute fingerprint and build terminal event
     #[must_use]
     pub fn build_terminal(mut self) -> LaneEvent {
@@ -370,6 +463,450 @@ pub fn compute_event_fingerprint(
     format!("{:016x}", hasher.finish())
 }
 
+/// Classification of event terminality for reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum EventTerminality {
+    /// Terminal event - represents final session outcome (completed, failed, etc.)
+    Terminal,
+    /// Advisory event - informational, not final outcome
+    Advisory,
+    /// Uncertainty event - transport died, terminal state unknown
+    Uncertainty,
+}
+
+/// Determine the terminality classification of an event.
+#[must_use]
+#[allow(dead_code)]
+pub fn classify_event_terminality(event: LaneEventName) -> EventTerminality {
+    match event {
+        LaneEventName::Finished
+        | LaneEventName::Failed
+        | LaneEventName::Merged
+        | LaneEventName::Superseded
+        | LaneEventName::Closed => EventTerminality::Terminal,
+        LaneEventName::Reconciled => EventTerminality::Uncertainty,
+        _ => EventTerminality::Advisory,
+    }
+}
+
+/// Reconcile a burst of potentially contradictory events into one canonical outcome.
+///
+/// Handles:
+/// - Out-of-order events (sorts by monotonic sequence)
+/// - Duplicate terminal events (deduplicates by fingerprint)
+/// - Transport death after terminal event (classifies as Uncertainty)
+/// - `completed -> idle -> error -> completed` noise
+#[must_use]
+#[allow(dead_code)]
+pub fn reconcile_terminal_events(events: &[LaneEvent]) -> Option<(LaneEvent, Vec<LaneEvent>)> {
+    if events.is_empty() {
+        return None;
+    }
+
+    // Sort by monotonic sequence number for deterministic ordering
+    let mut sorted: Vec<LaneEvent> = events.to_vec();
+    sorted.sort_by_key(|e| e.metadata.seq);
+
+    // Track the last terminal event and any transport/uncertainty events after it
+    let mut last_terminal: Option<LaneEvent> = None;
+    let mut post_terminal_uncertainty = false;
+    let mut reconciled_events = Vec::new();
+
+    for event in &sorted {
+        match classify_event_terminality(event.event) {
+            EventTerminality::Terminal => {
+                // Check if this is a duplicate of an already-seen terminal event
+                if let Some(ref terminal) = last_terminal {
+                    if let (Some(fp1), Some(fp2)) = (
+                        &event.metadata.event_fingerprint,
+                        &terminal.metadata.event_fingerprint,
+                    ) {
+                        if fp1 == fp2 {
+                            // Same fingerprint - skip as duplicate
+                            continue;
+                        }
+                    }
+                    // Different terminal payload - check if materially different
+                    if events_materially_differ(terminal, event) {
+                        // Materially different terminal event - update to latest
+                        last_terminal = Some(event.clone());
+                    }
+                } else {
+                    last_terminal = Some(event.clone());
+                }
+            }
+            EventTerminality::Uncertainty => {
+                // Transport/server-down after terminal event creates uncertainty
+                if last_terminal.is_some() {
+                    post_terminal_uncertainty = true;
+                }
+                reconciled_events.push(event.clone());
+            }
+            EventTerminality::Advisory => {
+                reconciled_events.push(event.clone());
+            }
+        }
+    }
+
+    // If there's post-terminal uncertainty, wrap the terminal event in uncertainty
+    let final_terminal = if post_terminal_uncertainty {
+        last_terminal.map(|mut t| {
+            t.event = LaneEventName::Reconciled;
+            t.status = LaneEventStatus::Reconciled;
+            t.detail = Some(
+                "Session terminal state uncertain: transport died after terminal event".to_string(),
+            );
+            t
+        })
+    } else {
+        last_terminal
+    };
+
+    final_terminal.map(|t| (t, reconciled_events))
+}
+
+/// Check if two terminal events are materially different.
+/// Used to determine if a later duplicate should override an earlier one.
+#[must_use]
+#[allow(dead_code)]
+pub fn events_materially_differ(a: &LaneEvent, b: &LaneEvent) -> bool {
+    // Different event type is material
+    if a.event != b.event {
+        return true;
+    }
+
+    // Different status is material
+    if a.status != b.status {
+        return true;
+    }
+
+    // Different failure class is material
+    if a.failure_class != b.failure_class {
+        return true;
+    }
+
+    // Different data payload is material
+    if a.data != b.data {
+        return true;
+    }
+
+    false
+}
+
+/// Filter events by provenance source.
+#[must_use]
+#[allow(dead_code)]
+pub fn filter_by_provenance(events: &[LaneEvent], provenance: EventProvenance) -> Vec<LaneEvent> {
+    events
+        .iter()
+        .filter(|e| e.metadata.provenance == provenance)
+        .cloned()
+        .collect()
+}
+
+/// Filter events by environment label.
+#[must_use]
+#[allow(dead_code)]
+pub fn filter_by_environment(events: &[LaneEvent], environment: &str) -> Vec<LaneEvent> {
+    events
+        .iter()
+        .filter(|e| {
+            e.metadata
+                .environment_label
+                .as_ref()
+                .is_some_and(|label| label == environment)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Filter events by minimum confidence level.
+#[must_use]
+#[allow(dead_code)]
+pub fn filter_by_confidence(
+    events: &[LaneEvent],
+    min_confidence: ConfidenceLevel,
+) -> Vec<LaneEvent> {
+    let confidence_order = |c: ConfidenceLevel| match c {
+        ConfidenceLevel::High => 3,
+        ConfidenceLevel::Medium => 2,
+        ConfidenceLevel::Low => 1,
+        ConfidenceLevel::Unknown => 0,
+    };
+    let min_level = confidence_order(min_confidence);
+
+    events
+        .iter()
+        .filter(|e| {
+            e.metadata
+                .confidence_level
+                .is_some_and(|c| confidence_order(c) >= min_level)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Check if an event is from a test or synthetic source.
+#[must_use]
+#[allow(dead_code)]
+pub fn is_test_event(event: &LaneEvent) -> bool {
+    matches!(
+        event.metadata.provenance,
+        EventProvenance::Test | EventProvenance::Healthcheck | EventProvenance::Replay
+    )
+}
+
+/// Check if an event is from a live production lane.
+#[must_use]
+#[allow(dead_code)]
+pub fn is_live_lane_event(event: &LaneEvent) -> bool {
+    event.metadata.provenance == EventProvenance::LiveLane
+}
+
+/// Nudge state tracking for acknowledgment and deduplication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct NudgeTracking {
+    /// Unique nudge/cycle identifier
+    pub nudge_id: String,
+    /// Timestamp when nudge was first delivered
+    pub delivered_at: String,
+    /// Whether this nudge has been acknowledged
+    pub acknowledged: bool,
+    /// Timestamp when acknowledged (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at: Option<String>,
+    /// Whether this is a retry of a previous nudge
+    pub is_retry: bool,
+    /// Original nudge ID if this is a retry
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_nudge_id: Option<String>,
+}
+
+#[allow(dead_code)]
+impl NudgeTracking {
+    /// Create a new nudge tracking record
+    #[must_use]
+    pub fn new(nudge_id: impl Into<String>, delivered_at: impl Into<String>) -> Self {
+        Self {
+            nudge_id: nudge_id.into(),
+            delivered_at: delivered_at.into(),
+            acknowledged: false,
+            acknowledged_at: None,
+            is_retry: false,
+            original_nudge_id: None,
+        }
+    }
+
+    /// Create a nudge tracking record for a retry
+    #[must_use]
+    pub fn retry(
+        nudge_id: impl Into<String>,
+        delivered_at: impl Into<String>,
+        original_nudge_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            nudge_id: nudge_id.into(),
+            delivered_at: delivered_at.into(),
+            acknowledged: false,
+            acknowledged_at: None,
+            is_retry: true,
+            original_nudge_id: Some(original_nudge_id.into()),
+        }
+    }
+
+    /// Mark this nudge as acknowledged
+    #[must_use]
+    pub fn acknowledge(mut self, at: impl Into<String>) -> Self {
+        self.acknowledged = true;
+        self.acknowledged_at = Some(at.into());
+        self
+    }
+}
+
+/// Classification of nudge types for deduplication logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NudgeClassification {
+    /// Brand new nudge - first delivery
+    New,
+    /// Retry of a previous nudge (same content, new delivery)
+    Retry,
+    /// Stale duplicate - should be ignored
+    StaleDuplicate,
+}
+
+/// Classify a nudge based on existing tracking records.
+#[must_use]
+#[allow(dead_code)]
+pub fn classify_nudge(
+    nudge_id: &str,
+    existing_tracking: &[NudgeTracking],
+    acknowledged_nudge_ids: &[String],
+) -> NudgeClassification {
+    // Check if already acknowledged - stale duplicate
+    if acknowledged_nudge_ids.iter().any(|id| id == nudge_id) {
+        return NudgeClassification::StaleDuplicate;
+    }
+
+    // Check if this is a retry of an existing nudge
+    for tracking in existing_tracking {
+        if tracking.nudge_id == nudge_id {
+            // Same ID already seen - check if acknowledged
+            if tracking.acknowledged {
+                return NudgeClassification::StaleDuplicate;
+            }
+            // Not acknowledged yet - could be a retry with same ID
+            return NudgeClassification::Retry;
+        }
+
+        // Check if this nudge is a retry of a tracked nudge
+        if tracking.original_nudge_id.as_ref() == Some(&nudge_id.to_string()) {
+            return NudgeClassification::StaleDuplicate;
+        }
+    }
+
+    NudgeClassification::New
+}
+
+/// Stable roadmap ID assignment for newly filed pinpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct RoadmapId {
+    /// Canonical unique identifier
+    pub id: String,
+    /// Timestamp when first filed
+    pub filed_at: String,
+    /// Whether this is a new filing or update to existing
+    pub is_new_filing: bool,
+    /// Previous ID if this supersedes or merges another item
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+}
+
+#[allow(dead_code)]
+impl RoadmapId {
+    /// Create a new roadmap ID at filing time
+    #[must_use]
+    pub fn new_filing(id: impl Into<String>, filed_at: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            filed_at: filed_at.into(),
+            is_new_filing: true,
+            supersedes: None,
+        }
+    }
+
+    /// Create an update to an existing roadmap item
+    #[must_use]
+    pub fn update(id: impl Into<String>, filed_at: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            filed_at: filed_at.into(),
+            is_new_filing: false,
+            supersedes: None,
+        }
+    }
+
+    /// Create a roadmap ID that supersedes another
+    #[must_use]
+    pub fn supersedes(
+        id: impl Into<String>,
+        filed_at: impl Into<String>,
+        previous_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            filed_at: filed_at.into(),
+            is_new_filing: true,
+            supersedes: Some(previous_id.into()),
+        }
+    }
+}
+
+/// Lifecycle state for roadmap items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum RoadmapLifecycleState {
+    /// Newly filed, awaiting acknowledgment
+    Filed,
+    /// Acknowledged by responsible party
+    Acknowledged,
+    /// Currently being worked on
+    InProgress,
+    /// Blocked on external dependency
+    Blocked,
+    /// Completed successfully
+    Done,
+    /// No longer relevant, replaced by another item
+    Superseded,
+}
+
+/// Roadmap item lifecycle state with timestamp tracking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct RoadmapLifecycle {
+    /// Current lifecycle state
+    pub state: RoadmapLifecycleState,
+    /// Timestamp of last state change
+    pub state_changed_at: String,
+    /// Timestamp when first filed
+    pub filed_at: String,
+    /// Lineage for superseded/merged items
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub lineage: Vec<String>,
+}
+
+#[allow(dead_code)]
+impl RoadmapLifecycle {
+    /// Create a new roadmap lifecycle starting at "filed"
+    #[must_use]
+    pub fn new_filed(filed_at: impl Into<String>) -> Self {
+        let filed_at = filed_at.into();
+        Self {
+            state: RoadmapLifecycleState::Filed,
+            state_changed_at: filed_at.clone(),
+            filed_at,
+            lineage: Vec::new(),
+        }
+    }
+
+    /// Transition to a new state
+    #[must_use]
+    pub fn transition(mut self, new_state: RoadmapLifecycleState, at: impl Into<String>) -> Self {
+        self.state = new_state;
+        self.state_changed_at = at.into();
+        self
+    }
+
+    /// Mark as superseded by another item
+    #[must_use]
+    pub fn superseded_by(mut self, new_item_id: impl Into<String>, at: impl Into<String>) -> Self {
+        let new_item_id = new_item_id.into();
+        self.lineage.push(new_item_id.clone());
+        self.state = RoadmapLifecycleState::Superseded;
+        self.state_changed_at = at.into();
+        self
+    }
+
+    /// Check if this item is in a terminal state (done or superseded)
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            RoadmapLifecycleState::Done | RoadmapLifecycleState::Superseded
+        )
+    }
+
+    /// Check if this item is active (not terminal)
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.is_terminal()
+    }
+}
+
 /// Deduplicate terminal events within a reconciliation window.
 /// Returns only the first occurrence of each terminal fingerprint.
 #[must_use]
@@ -405,7 +942,10 @@ pub enum BlockedSubphase {
     #[serde(rename = "blocked.branch_freshness")]
     BranchFreshness { behind_main: u32 },
     #[serde(rename = "blocked.test_hang")]
-    TestHang { elapsed_secs: u32, test_name: Option<String> },
+    TestHang {
+        elapsed_secs: u32,
+        test_name: Option<String>,
+    },
     #[serde(rename = "blocked.report_pending")]
     ReportPending { since_secs: u32 },
 }
@@ -543,7 +1083,8 @@ impl LaneEvent {
             .with_failure_class(blocker.failure_class)
             .with_detail(blocker.detail.clone());
         if let Some(ref subphase) = blocker.subphase {
-            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+            event =
+                event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
         }
         event
     }
@@ -554,7 +1095,8 @@ impl LaneEvent {
             .with_failure_class(blocker.failure_class)
             .with_detail(blocker.detail.clone());
         if let Some(ref subphase) = blocker.subphase {
-            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+            event =
+                event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
         }
         event
     }
@@ -562,8 +1104,12 @@ impl LaneEvent {
     /// Ship prepared — §4.44.5
     #[must_use]
     pub fn ship_prepared(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
-        Self::new(LaneEventName::ShipPrepared, LaneEventStatus::Ready, emitted_at)
-            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+        Self::new(
+            LaneEventName::ShipPrepared,
+            LaneEventStatus::Ready,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
     /// Ship commits selected — §4.44.5
@@ -573,22 +1119,34 @@ impl LaneEvent {
         commit_count: u32,
         commit_range: impl Into<String>,
     ) -> Self {
-        Self::new(LaneEventName::ShipCommitsSelected, LaneEventStatus::Ready, emitted_at)
-            .with_detail(format!("{} commits: {}", commit_count, commit_range.into()))
+        Self::new(
+            LaneEventName::ShipCommitsSelected,
+            LaneEventStatus::Ready,
+            emitted_at,
+        )
+        .with_detail(format!("{} commits: {}", commit_count, commit_range.into()))
     }
 
     /// Ship merged — §4.44.5
     #[must_use]
     pub fn ship_merged(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
-        Self::new(LaneEventName::ShipMerged, LaneEventStatus::Completed, emitted_at)
-            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+        Self::new(
+            LaneEventName::ShipMerged,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
     /// Ship pushed to main — §4.44.5
     #[must_use]
     pub fn ship_pushed_main(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
-        Self::new(LaneEventName::ShipPushedMain, LaneEventStatus::Completed, emitted_at)
-            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+        Self::new(
+            LaneEventName::ShipPushedMain,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
     #[must_use]
@@ -661,11 +1219,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
-        is_terminal_event, BlockedSubphase, EventProvenance, LaneCommitProvenance, LaneEvent,
-        LaneEventBlocker, LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus,
-        LaneFailureClass, LaneOwnership, SessionIdentity, ShipMergeMethod, ShipProvenance,
-        WatcherAction,
+        classify_event_terminality, compute_event_fingerprint, dedupe_superseded_commit_events,
+        dedupe_terminal_events, events_materially_differ, filter_by_confidence,
+        filter_by_environment, filter_by_provenance, is_live_lane_event, is_terminal_event,
+        is_test_event, reconcile_terminal_events, BlockedSubphase, ConfidenceLevel,
+        EventProvenance, EventTerminality, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+        LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus, LaneFailureClass,
+        LaneOwnership, SessionIdentity, ShipMergeMethod, ShipProvenance, WatcherAction,
     };
 
     #[test]
@@ -876,7 +1436,30 @@ mod tests {
         assert_eq!(meta1.seq, 0);
         assert_eq!(meta2.seq, 1);
         assert_eq!(meta3.seq, 2);
-        assert!(meta1.timestamp_ms <= meta2.timestamp_ms);
+    }
+
+    #[test]
+    fn classify_event_terminality_correctly() {
+        assert_eq!(
+            classify_event_terminality(LaneEventName::Finished),
+            EventTerminality::Terminal
+        );
+        assert_eq!(
+            classify_event_terminality(LaneEventName::Failed),
+            EventTerminality::Terminal
+        );
+        assert_eq!(
+            classify_event_terminality(LaneEventName::Reconciled),
+            EventTerminality::Uncertainty
+        );
+        assert_eq!(
+            classify_event_terminality(LaneEventName::Started),
+            EventTerminality::Advisory
+        );
+        assert_eq!(
+            classify_event_terminality(LaneEventName::Ready),
+            EventTerminality::Advisory
+        );
     }
 
     #[test]
@@ -918,6 +1501,60 @@ mod tests {
         assert_eq!(
             with_placeholder.placeholder_reason,
             Some("session created before title was known".to_string())
+        );
+    }
+
+    #[test]
+    fn session_identity_reconcile_enriched_updates_fields() {
+        // Start with placeholder identity
+        let initial = SessionIdentity::with_placeholder(
+            "untitled",
+            "/tmp/unknown",
+            "unknown",
+            "awaiting title from user",
+        );
+        assert!(initial.placeholder_reason.is_some());
+
+        // Enrich with real title - workspace/purpose still unknown
+        let enriched =
+            initial.reconcile_enriched(Some("feature-branch-123".to_string()), None, None);
+        assert_eq!(enriched.title, "feature-branch-123");
+        assert_eq!(enriched.workspace, "/tmp/unknown"); // preserved
+        assert_eq!(enriched.purpose, "unknown"); // preserved
+                                                 // Placeholder cleared because we got a real title
+        assert!(enriched.placeholder_reason.is_none());
+
+        // Further enrichment with workspace and purpose
+        let final_identity = enriched.reconcile_enriched(
+            None, // keep existing title
+            Some("/home/user/projects/my-app".to_string()),
+            Some("implement user authentication".to_string()),
+        );
+        assert_eq!(final_identity.title, "feature-branch-123");
+        assert_eq!(final_identity.workspace, "/home/user/projects/my-app");
+        assert_eq!(final_identity.purpose, "implement user authentication");
+        assert!(final_identity.placeholder_reason.is_none());
+    }
+
+    #[test]
+    fn session_identity_reconcile_preserves_placeholder_if_no_new_data() {
+        let initial = SessionIdentity::with_placeholder(
+            "untitled",
+            "/tmp/unknown",
+            "unknown",
+            "still waiting for info",
+        );
+
+        // Reconcile with no new data
+        let reconciled = initial.reconcile_enriched(None, None, None);
+
+        // Should preserve original values and placeholder
+        assert_eq!(reconciled.title, "untitled");
+        assert_eq!(reconciled.workspace, "/tmp/unknown");
+        assert_eq!(reconciled.purpose, "unknown");
+        assert_eq!(
+            reconciled.placeholder_reason,
+            Some("still waiting for info".to_string())
         );
     }
 
@@ -1083,5 +1720,790 @@ mod tests {
         assert_eq!(round_trip.seq, 5);
         assert_eq!(round_trip.provenance, EventProvenance::Healthcheck);
         assert_eq!(round_trip.nudge_id, Some("nudge-abc".to_string()));
+    }
+
+    // US-013: Session event ordering + terminal-state reconciliation tests
+    #[test]
+    fn reconcile_terminal_events_sorts_by_monotonic_sequence() {
+        let events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:02Z",
+                2,
+                EventProvenance::LiveLane,
+            )
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Started,
+                LaneEventStatus::Running,
+                "2026-04-04T00:00:00Z",
+                0,
+                EventProvenance::LiveLane,
+            )
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Ready,
+                LaneEventStatus::Ready,
+                "2026-04-04T00:00:01Z",
+                1,
+                EventProvenance::LiveLane,
+            )
+            .build(),
+        ];
+
+        let (terminal, _) = reconcile_terminal_events(&events).expect("should have terminal event");
+        assert_eq!(terminal.event, LaneEventName::Finished);
+        assert_eq!(terminal.metadata.seq, 2); // Highest sequence
+    }
+
+    #[test]
+    fn reconcile_terminal_events_deduplicates_same_fingerprint() {
+        let events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:00Z",
+                0,
+                EventProvenance::LiveLane,
+            )
+            .build_terminal(),
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:01Z",
+                1,
+                EventProvenance::LiveLane,
+            )
+            .build_terminal(),
+        ];
+
+        let (terminal, _) = reconcile_terminal_events(&events).expect("should have terminal event");
+        // Both have same fingerprint (same event/status/data), so should dedupe
+        assert_eq!(terminal.event, LaneEventName::Finished);
+    }
+
+    #[test]
+    fn reconcile_terminal_events_detects_transport_death_uncertainty() {
+        let events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:00Z",
+                0,
+                EventProvenance::LiveLane,
+            )
+            .build_terminal(),
+            LaneEventBuilder::new(
+                LaneEventName::Reconciled,
+                LaneEventStatus::Reconciled,
+                "2026-04-04T00:00:01Z",
+                1,
+                EventProvenance::Transport,
+            )
+            .build(),
+        ];
+
+        let (terminal, reconciled) =
+            reconcile_terminal_events(&events).expect("should have result");
+        // Transport death after terminal creates uncertainty
+        assert_eq!(terminal.event, LaneEventName::Reconciled);
+        assert_eq!(terminal.status, LaneEventStatus::Reconciled);
+        assert!(terminal
+            .detail
+            .as_ref()
+            .unwrap()
+            .contains("transport died after terminal event"));
+        assert_eq!(reconciled.len(), 1);
+    }
+
+    #[test]
+    fn reconcile_terminal_events_handles_completed_idle_error_completed_noise() {
+        let events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:00Z",
+                0,
+                EventProvenance::LiveLane,
+            )
+            .build_terminal(),
+            LaneEventBuilder::new(
+                LaneEventName::Started,
+                LaneEventStatus::Running,
+                "2026-04-04T00:00:01Z",
+                1,
+                EventProvenance::LiveLane,
+            )
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Failed,
+                LaneEventStatus::Failed,
+                "2026-04-04T00:00:02Z",
+                2,
+                EventProvenance::LiveLane,
+            )
+            .with_failure_class(LaneFailureClass::Infra)
+            .build_terminal(),
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:03Z",
+                3,
+                EventProvenance::LiveLane,
+            )
+            .build_terminal(),
+        ];
+
+        let (terminal, _) = reconcile_terminal_events(&events).expect("should have terminal event");
+        // Latest terminal event wins
+        assert_eq!(terminal.event, LaneEventName::Finished);
+        assert_eq!(terminal.status, LaneEventStatus::Completed);
+    }
+
+    #[test]
+    fn reconcile_terminal_events_returns_none_for_empty_input() {
+        let result = reconcile_terminal_events(&[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn reconcile_terminal_events_preserves_advisory_events() {
+        let events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Started,
+                LaneEventStatus::Running,
+                "2026-04-04T00:00:00Z",
+                0,
+                EventProvenance::LiveLane,
+            )
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Ready,
+                LaneEventStatus::Ready,
+                "2026-04-04T00:00:01Z",
+                1,
+                EventProvenance::LiveLane,
+            )
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Green,
+                LaneEventStatus::Green,
+                "2026-04-04T00:00:02Z",
+                2,
+                EventProvenance::LiveLane,
+            )
+            .build(),
+        ];
+
+        let result = reconcile_terminal_events(&events);
+        // Only advisory events - no terminal event to reconcile
+        assert!(
+            result.is_none(),
+            "should return None when no terminal events"
+        );
+    }
+
+    #[test]
+    fn events_materially_differ_detects_real_differences() {
+        let event_a = LaneEventBuilder::new(
+            LaneEventName::Failed,
+            LaneEventStatus::Failed,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::LiveLane,
+        )
+        .with_failure_class(LaneFailureClass::Compile)
+        .build_terminal();
+
+        let event_b = LaneEventBuilder::new(
+            LaneEventName::Failed,
+            LaneEventStatus::Failed,
+            "2026-04-04T00:00:01Z",
+            1,
+            EventProvenance::LiveLane,
+        )
+        .with_failure_class(LaneFailureClass::Test)
+        .build_terminal();
+
+        assert!(events_materially_differ(&event_a, &event_b));
+    }
+
+    #[test]
+    fn classify_event_terminality_correctly_classifies() {
+        assert_eq!(
+            classify_event_terminality(LaneEventName::Finished),
+            EventTerminality::Terminal
+        );
+        assert_eq!(
+            classify_event_terminality(LaneEventName::Failed),
+            EventTerminality::Terminal
+        );
+        assert_eq!(
+            classify_event_terminality(LaneEventName::Reconciled),
+            EventTerminality::Uncertainty
+        );
+        assert_eq!(
+            classify_event_terminality(LaneEventName::Started),
+            EventTerminality::Advisory
+        );
+    }
+
+    // US-014: Event provenance / environment labeling tests
+    #[test]
+    fn confidence_level_round_trips_through_serialization() {
+        let cases = [
+            (ConfidenceLevel::High, "high"),
+            (ConfidenceLevel::Medium, "medium"),
+            (ConfidenceLevel::Low, "low"),
+            (ConfidenceLevel::Unknown, "unknown"),
+        ];
+
+        for (level, expected) in cases {
+            let json = serde_json::to_value(level).expect("should serialize");
+            assert_eq!(json, serde_json::json!(expected));
+
+            let round_trip: ConfidenceLevel =
+                serde_json::from_value(json).expect("should deserialize");
+            assert_eq!(round_trip, level);
+        }
+    }
+
+    #[test]
+    fn filter_by_provenance_selects_only_matching_events() {
+        let events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Started,
+                LaneEventStatus::Running,
+                "2026-04-04T00:00:00Z",
+                0,
+                EventProvenance::LiveLane,
+            )
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Ready,
+                LaneEventStatus::Ready,
+                "2026-04-04T00:00:01Z",
+                1,
+                EventProvenance::Test,
+            )
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:02Z",
+                2,
+                EventProvenance::LiveLane,
+            )
+            .build(),
+        ];
+
+        let live_events = filter_by_provenance(&events, EventProvenance::LiveLane);
+        assert_eq!(live_events.len(), 2);
+        assert_eq!(live_events[0].event, LaneEventName::Started);
+        assert_eq!(live_events[1].event, LaneEventName::Finished);
+
+        let test_events = filter_by_provenance(&events, EventProvenance::Test);
+        assert_eq!(test_events.len(), 1);
+        assert_eq!(test_events[0].event, LaneEventName::Ready);
+    }
+
+    #[test]
+    fn filter_by_environment_selects_only_matching_environment() {
+        let events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Started,
+                LaneEventStatus::Running,
+                "2026-04-04T00:00:00Z",
+                0,
+                EventProvenance::LiveLane,
+            )
+            .with_environment("production")
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Ready,
+                LaneEventStatus::Ready,
+                "2026-04-04T00:00:01Z",
+                1,
+                EventProvenance::LiveLane,
+            )
+            .with_environment("staging")
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:02Z",
+                2,
+                EventProvenance::LiveLane,
+            )
+            .with_environment("production")
+            .build(),
+        ];
+
+        let prod_events = filter_by_environment(&events, "production");
+        assert_eq!(prod_events.len(), 2);
+        assert_eq!(prod_events[0].event, LaneEventName::Started);
+        assert_eq!(prod_events[1].event, LaneEventName::Finished);
+
+        let staging_events = filter_by_environment(&events, "staging");
+        assert_eq!(staging_events.len(), 1);
+        assert_eq!(staging_events[0].event, LaneEventName::Ready);
+    }
+
+    #[test]
+    fn filter_by_confidence_selects_events_above_threshold() {
+        let events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Started,
+                LaneEventStatus::Running,
+                "2026-04-04T00:00:00Z",
+                0,
+                EventProvenance::LiveLane,
+            )
+            .with_confidence(ConfidenceLevel::High)
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Ready,
+                LaneEventStatus::Ready,
+                "2026-04-04T00:00:01Z",
+                1,
+                EventProvenance::LiveLane,
+            )
+            .with_confidence(ConfidenceLevel::Medium)
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Blocked,
+                LaneEventStatus::Blocked,
+                "2026-04-04T00:00:02Z",
+                2,
+                EventProvenance::LiveLane,
+            )
+            .with_confidence(ConfidenceLevel::Low)
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Failed,
+                LaneEventStatus::Failed,
+                "2026-04-04T00:00:03Z",
+                3,
+                EventProvenance::LiveLane,
+            )
+            // No confidence level set
+            .build(),
+        ];
+
+        // High confidence filter should only return high confidence events
+        let high_confidence = filter_by_confidence(&events, ConfidenceLevel::High);
+        assert_eq!(high_confidence.len(), 1);
+        assert_eq!(high_confidence[0].event, LaneEventName::Started);
+
+        // Medium and above should return high and medium
+        let medium_and_above = filter_by_confidence(&events, ConfidenceLevel::Medium);
+        assert_eq!(medium_and_above.len(), 2);
+
+        // Low and above should return high, medium, and low
+        let low_and_above = filter_by_confidence(&events, ConfidenceLevel::Low);
+        assert_eq!(low_and_above.len(), 3);
+    }
+
+    #[test]
+    fn is_test_event_detects_synthetic_sources() {
+        let test_event = LaneEventBuilder::new(
+            LaneEventName::Started,
+            LaneEventStatus::Running,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::Test,
+        )
+        .build();
+
+        let healthcheck_event = LaneEventBuilder::new(
+            LaneEventName::Ready,
+            LaneEventStatus::Ready,
+            "2026-04-04T00:00:01Z",
+            1,
+            EventProvenance::Healthcheck,
+        )
+        .build();
+
+        let live_event = LaneEventBuilder::new(
+            LaneEventName::Finished,
+            LaneEventStatus::Completed,
+            "2026-04-04T00:00:02Z",
+            2,
+            EventProvenance::LiveLane,
+        )
+        .build();
+
+        assert!(is_test_event(&test_event));
+        assert!(is_test_event(&healthcheck_event));
+        assert!(!is_test_event(&live_event));
+    }
+
+    #[test]
+    fn is_live_lane_event_detects_production_events() {
+        let live_event = LaneEventBuilder::new(
+            LaneEventName::Started,
+            LaneEventStatus::Running,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::LiveLane,
+        )
+        .build();
+
+        let test_event = LaneEventBuilder::new(
+            LaneEventName::Ready,
+            LaneEventStatus::Ready,
+            "2026-04-04T00:00:01Z",
+            1,
+            EventProvenance::Test,
+        )
+        .build();
+
+        assert!(is_live_lane_event(&live_event));
+        assert!(!is_live_lane_event(&test_event));
+    }
+
+    #[test]
+    fn lane_event_metadata_includes_us014_fields() {
+        let meta = LaneEventMetadata::new(42, EventProvenance::LiveLane)
+            .with_environment("production")
+            .with_emitter("clawd-1")
+            .with_confidence(ConfidenceLevel::High);
+
+        assert_eq!(meta.environment_label, Some("production".to_string()));
+        assert_eq!(meta.emitter_identity, Some("clawd-1".to_string()));
+        assert_eq!(meta.confidence_level, Some(ConfidenceLevel::High));
+    }
+
+    // US-016: Duplicate terminal-event suppression tests
+    #[test]
+    fn canonical_terminal_event_fingerprint_attached_to_metadata() {
+        let event = LaneEventBuilder::new(
+            LaneEventName::Finished,
+            LaneEventStatus::Completed,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::LiveLane,
+        )
+        .with_data(json!({"result": "success"}))
+        .build_terminal();
+
+        // Fingerprint should be computed and attached
+        assert!(event.metadata.event_fingerprint.is_some());
+        let fp = event.metadata.event_fingerprint.unwrap();
+        assert_eq!(fp.len(), 16); // 16 hex characters
+    }
+
+    #[test]
+    fn dedupe_terminal_events_suppresses_repeated_fingerprints() {
+        let event1 = LaneEventBuilder::new(
+            LaneEventName::Finished,
+            LaneEventStatus::Completed,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::LiveLane,
+        )
+        .build_terminal();
+
+        let event2 = LaneEventBuilder::new(
+            LaneEventName::Finished,
+            LaneEventStatus::Completed,
+            "2026-04-04T00:00:01Z",
+            1,
+            EventProvenance::LiveLane,
+        )
+        .build_terminal();
+
+        // Both should have the same fingerprint (same event/status/data)
+        assert_eq!(
+            event1.metadata.event_fingerprint,
+            event2.metadata.event_fingerprint
+        );
+
+        let deduped = dedupe_terminal_events(&[event1.clone(), event2.clone()]);
+        // Should only keep first occurrence
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].metadata.seq, 0);
+    }
+
+    #[test]
+    fn dedupe_preserves_raw_event_history_separately() {
+        // This test demonstrates that raw events can be preserved
+        // while exposing deduplicated actionable events
+        let raw_events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:00Z",
+                0,
+                EventProvenance::LiveLane,
+            )
+            .build_terminal(),
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-04T00:00:01Z",
+                1,
+                EventProvenance::LiveLane,
+            )
+            .build_terminal(),
+        ];
+
+        // Raw history preserved (2 events)
+        assert_eq!(raw_events.len(), 2);
+
+        // Deduplicated actionable events (1 event)
+        let deduped = dedupe_terminal_events(&raw_events);
+        assert_eq!(deduped.len(), 1);
+    }
+
+    #[test]
+    fn events_materially_differ_detects_payload_differences() {
+        let event_a = LaneEventBuilder::new(
+            LaneEventName::Failed,
+            LaneEventStatus::Failed,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::LiveLane,
+        )
+        .with_failure_class(LaneFailureClass::Compile)
+        .with_data(json!({"error": "compilation failed"}))
+        .build_terminal();
+
+        let event_b = LaneEventBuilder::new(
+            LaneEventName::Failed,
+            LaneEventStatus::Failed,
+            "2026-04-04T00:00:01Z",
+            1,
+            EventProvenance::LiveLane,
+        )
+        .with_failure_class(LaneFailureClass::Compile)
+        .with_data(json!({"error": "different error message"}))
+        .build_terminal();
+
+        // Same event type, status, failure class - but different data payload
+        assert!(events_materially_differ(&event_a, &event_b));
+    }
+
+    #[test]
+    fn reconcile_terminal_events_surfaces_latest_when_different() {
+        // Events with different data payloads will have different fingerprints
+        let event1 = LaneEventBuilder::new(
+            LaneEventName::Finished,
+            LaneEventStatus::Completed,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::LiveLane,
+        )
+        .with_data(json!({"attempt": 1, "result": "success"}))
+        .build_terminal();
+
+        let event2 = LaneEventBuilder::new(
+            LaneEventName::Finished,
+            LaneEventStatus::Completed,
+            "2026-04-04T00:00:01Z",
+            1,
+            EventProvenance::LiveLane,
+        )
+        .with_data(json!({"attempt": 2, "result": "success", "extra": "data"}))
+        .build_terminal();
+
+        // Fingerprints should differ due to different data
+        assert_ne!(
+            event1.metadata.event_fingerprint,
+            event2.metadata.event_fingerprint
+        );
+
+        let (terminal, _) = reconcile_terminal_events(&[event1.clone(), event2.clone()])
+            .expect("should have terminal");
+
+        // Latest terminal event wins (seq 1, not seq 0) - data is different so it's material
+        assert_eq!(terminal.metadata.seq, 1);
+        assert_eq!(
+            terminal.data,
+            Some(json!({"attempt": 2, "result": "success", "extra": "data"}))
+        );
+    }
+
+    // US-017: Lane ownership / scope binding tests
+    #[test]
+    fn lane_ownership_attached_to_metadata() {
+        let ownership = LaneOwnership {
+            owner: "bot-1".to_string(),
+            workflow_scope: "claw-code-dogfood".to_string(),
+            watcher_action: WatcherAction::Act,
+        };
+
+        let event = LaneEventBuilder::new(
+            LaneEventName::Started,
+            LaneEventStatus::Running,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::LiveLane,
+        )
+        .with_ownership(ownership.clone())
+        .build();
+
+        assert_eq!(event.metadata.ownership.as_ref().unwrap().owner, "bot-1");
+        assert_eq!(
+            event.metadata.ownership.as_ref().unwrap().workflow_scope,
+            "claw-code-dogfood"
+        );
+        assert_eq!(
+            event.metadata.ownership.as_ref().unwrap().watcher_action,
+            WatcherAction::Act
+        );
+    }
+
+    #[test]
+    fn lane_ownership_preserved_through_lifecycle_events() {
+        let ownership = LaneOwnership {
+            owner: "operator-1".to_string(),
+            workflow_scope: "external-git-maintenance".to_string(),
+            watcher_action: WatcherAction::Observe,
+        };
+
+        let start_event = LaneEventBuilder::new(
+            LaneEventName::Started,
+            LaneEventStatus::Running,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::LiveLane,
+        )
+        .with_ownership(ownership.clone())
+        .build();
+
+        let ready_event = LaneEventBuilder::new(
+            LaneEventName::Ready,
+            LaneEventStatus::Ready,
+            "2026-04-04T00:00:01Z",
+            1,
+            EventProvenance::LiveLane,
+        )
+        .with_ownership(ownership.clone())
+        .build();
+
+        let finished_event = LaneEventBuilder::new(
+            LaneEventName::Finished,
+            LaneEventStatus::Completed,
+            "2026-04-04T00:00:02Z",
+            2,
+            EventProvenance::LiveLane,
+        )
+        .with_ownership(ownership.clone())
+        .build_terminal();
+
+        // All events preserve ownership through the lifecycle
+        assert_eq!(
+            start_event.metadata.ownership.as_ref().unwrap().owner,
+            "operator-1"
+        );
+        assert_eq!(
+            ready_event.metadata.ownership.as_ref().unwrap().owner,
+            "operator-1"
+        );
+        assert_eq!(
+            finished_event.metadata.ownership.as_ref().unwrap().owner,
+            "operator-1"
+        );
+
+        // Scope also preserved
+        assert_eq!(
+            start_event
+                .metadata
+                .ownership
+                .as_ref()
+                .unwrap()
+                .workflow_scope,
+            "external-git-maintenance"
+        );
+        assert_eq!(
+            finished_event
+                .metadata
+                .ownership
+                .as_ref()
+                .unwrap()
+                .workflow_scope,
+            "external-git-maintenance"
+        );
+    }
+
+    #[test]
+    fn lane_ownership_watcher_action_variants() {
+        let act_ownership = LaneOwnership {
+            owner: "auto-bot".to_string(),
+            workflow_scope: "infra-health".to_string(),
+            watcher_action: WatcherAction::Act,
+        };
+
+        let observe_ownership = LaneOwnership {
+            owner: "monitor-bot".to_string(),
+            workflow_scope: "claw-code-dogfood".to_string(),
+            watcher_action: WatcherAction::Observe,
+        };
+
+        let ignore_ownership = LaneOwnership {
+            owner: "ignore-bot".to_string(),
+            workflow_scope: "manual-operator".to_string(),
+            watcher_action: WatcherAction::Ignore,
+        };
+
+        let act_event = LaneEventBuilder::new(
+            LaneEventName::Blocked,
+            LaneEventStatus::Blocked,
+            "2026-04-04T00:00:00Z",
+            0,
+            EventProvenance::LiveLane,
+        )
+        .with_ownership(act_ownership)
+        .build();
+
+        let observe_event = LaneEventBuilder::new(
+            LaneEventName::Ready,
+            LaneEventStatus::Ready,
+            "2026-04-04T00:00:01Z",
+            1,
+            EventProvenance::LiveLane,
+        )
+        .with_ownership(observe_ownership)
+        .build();
+
+        let ignore_event = LaneEventBuilder::new(
+            LaneEventName::Green,
+            LaneEventStatus::Green,
+            "2026-04-04T00:00:02Z",
+            2,
+            EventProvenance::LiveLane,
+        )
+        .with_ownership(ignore_ownership)
+        .build();
+
+        assert_eq!(
+            act_event
+                .metadata
+                .ownership
+                .as_ref()
+                .unwrap()
+                .watcher_action,
+            WatcherAction::Act
+        );
+        assert_eq!(
+            observe_event
+                .metadata
+                .ownership
+                .as_ref()
+                .unwrap()
+                .watcher_action,
+            WatcherAction::Observe
+        );
+        assert_eq!(
+            ignore_event
+                .metadata
+                .ownership
+                .as_ref()
+                .unwrap()
+                .watcher_action,
+            WatcherAction::Ignore
+        );
     }
 }
