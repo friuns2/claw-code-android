@@ -930,6 +930,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             Ok(CliAction::Diff { output_format })
         }
+        // `claw permissions <mode>` falls through to the LLM when called
+        // with a subcommand argument because parse_single_word_command_alias
+        // only intercepts the bare single-word form. Catch all multi-word
+        // forms here and return a structured guidance error so no network
+        // call or session is created.
+        "permissions" => Err(format!(
+            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
+        )),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -5099,10 +5107,17 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::to_string_pretty(&handle_mcp_slash_command_json(args, &cwd)?)?
-            ),
+            CliOutputFormat::Json => {
+                let value = handle_mcp_slash_command_json(args, &cwd)?;
+                // Propagate ok:false → non-zero exit so automation callers
+                // can rely on exit code instead of inspecting the envelope.
+                // (#68: mcp error envelopes previously always exited 0.)
+                let is_error = value.get("ok").and_then(|v| v.as_bool()) == Some(false);
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                if is_error {
+                    std::process::exit(1);
+                }
+            }
         }
         Ok(())
     }
