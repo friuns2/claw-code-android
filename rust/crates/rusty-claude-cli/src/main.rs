@@ -877,13 +877,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // `missing Anthropic credentials` even though the command is purely
         // local introspection. Mirror `agents`/`mcp`/`skills`: action is the
         // first positional arg, target is the second.
-        "plugins" => {
+        // `plugin` (singular) and `marketplace` are aliases for `plugins`.
+        // All three must route to the same local handler so that no form
+        // falls through to the LLM/prompt path.
+        "plugins" | "plugin" | "marketplace" => {
             let tail = &rest[1..];
             let action = tail.first().cloned();
             let target = tail.get(1).cloned();
             if tail.len() > 2 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw plugins {}`: {}",
+                    "unexpected extra arguments after `claw {} {}`: {}",
+                    rest[0],
                     tail[..2].join(" "),
                     tail[2..].join(" ")
                 ));
@@ -3545,6 +3549,37 @@ fn run_resume_command(
                 json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
+        SlashCommand::Plugins { action, target } => {
+            // Only list is supported in resume mode (no runtime to reload)
+            match action.as_deref() {
+                Some("install") | Some("uninstall") | Some("enable") | Some("disable")
+                | Some("update") => {
+                    return Err(
+                        "resumed /plugins mutations are interactive-only; start `claw` and run `/plugins` in the REPL".into(),
+                    );
+                }
+                _ => {}
+            }
+            let cwd = env::current_dir()?;
+            let loader = ConfigLoader::default_for(&cwd);
+            let runtime_config = loader.load()?;
+            let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+            let result =
+                handle_plugins_slash_command(action.as_deref(), target.as_deref(), &mut manager)?;
+            let action_str = action.as_deref().unwrap_or("list");
+            let json = serde_json::json!({
+                "kind": "plugin",
+                "action": action_str,
+                "target": target,
+                "message": &result.message,
+                "reload_runtime": result.reload_runtime,
+            });
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(result.message),
+                json: Some(json),
+            })
+        }
         SlashCommand::Doctor => {
             let report = render_doctor_report()?;
             Ok(ResumeCommandOutcome {
@@ -3631,7 +3666,6 @@ fn run_resume_command(
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
-        | SlashCommand::Plugins { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -6210,7 +6244,7 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
 }
 
 fn render_config_json(
-    _section: Option<&str>,
+    section: Option<&str>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
@@ -6243,13 +6277,52 @@ fn render_config_json(
         })
         .collect();
 
-    Ok(serde_json::json!({
+    let base = serde_json::json!({
         "kind": "config",
         "cwd": cwd.display().to_string(),
         "loaded_files": loaded_paths.len(),
         "merged_keys": runtime_config.merged().len(),
         "files": files,
-    }))
+    });
+
+    if let Some(section) = section {
+        let section_rendered: Option<String> = match section {
+            "env" => runtime_config.get("env").map(|v| v.render()),
+            "hooks" => runtime_config.get("hooks").map(|v| v.render()),
+            "model" => runtime_config.get("model").map(|v| v.render()),
+            "plugins" => runtime_config
+                .get("plugins")
+                .or_else(|| runtime_config.get("enabledPlugins"))
+                .map(|v| v.render()),
+            other => {
+                return Ok(serde_json::json!({
+                    "kind": "config",
+                    "section": other,
+                    "ok": false,
+                    "error": format!("Unsupported config section '{other}'. Use env, hooks, model, or plugins."),
+                    "cwd": cwd.display().to_string(),
+                    "loaded_files": loaded_paths.len(),
+                    "files": files,
+                }));
+            }
+        };
+        // Parse the rendered JSON string back into serde_json::Value so that
+        // section_value is a real JSON object/array in the envelope, not a quoted string.
+        let section_value: serde_json::Value = section_rendered
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let mut obj = base;
+        let map = obj.as_object_mut().expect("base is object");
+        map.insert(
+            "section".to_string(),
+            serde_json::Value::String(section.to_string()),
+        );
+        map.insert("section_value".to_string(), section_value);
+        return Ok(obj);
+    }
+
+    Ok(base)
 }
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {

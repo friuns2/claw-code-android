@@ -2371,6 +2371,40 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             let skills = load_skills_from_roots(&roots)?;
             Ok(render_skills_report(&skills))
         }
+        Some(args) if args.starts_with("list ") => {
+            let filter = args["list ".len()..].trim().to_lowercase();
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            let filtered: Vec<_> = skills
+                .into_iter()
+                .filter(|s| s.name.to_lowercase().contains(&filter))
+                .collect();
+            Ok(render_skills_report(&filtered))
+        }
+        Some("show" | "info" | "describe") => {
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            Ok(render_skills_report(&skills))
+        }
+        Some(args)
+            if args.starts_with("show ")
+                || args.starts_with("info ")
+                || args.starts_with("describe ") =>
+        {
+            let name = args
+                .splitn(2, ' ')
+                .nth(1)
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            let matched: Vec<_> = skills
+                .into_iter()
+                .filter(|s| s.name.to_lowercase() == name)
+                .collect();
+            Ok(render_skills_report(&matched))
+        }
         Some("install") => Ok(render_skills_usage(Some("install"))),
         Some(args) if args.starts_with("install ") => {
             let target = args["install ".len()..].trim();
@@ -2402,6 +2436,40 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             let skills = load_skills_from_roots(&roots)?;
             Ok(render_skills_report_json(&skills))
         }
+        Some(args) if args.starts_with("list ") => {
+            let filter = args["list ".len()..].trim().to_lowercase();
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            let filtered: Vec<_> = skills
+                .into_iter()
+                .filter(|s| s.name.to_lowercase().contains(&filter))
+                .collect();
+            Ok(render_skills_report_json(&filtered))
+        }
+        Some("show" | "info" | "describe") => {
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            Ok(render_skills_report_json(&skills))
+        }
+        Some(args)
+            if args.starts_with("show ")
+                || args.starts_with("info ")
+                || args.starts_with("describe ") =>
+        {
+            let name = args
+                .splitn(2, ' ')
+                .nth(1)
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            let matched: Vec<_> = skills
+                .into_iter()
+                .filter(|s| s.name.to_lowercase() == name)
+                .collect();
+            Ok(render_skills_report_json(&matched))
+        }
         Some("install") => Ok(render_skills_usage_json(Some("install"))),
         Some(args) if args.starts_with("install ") => {
             let target = args["install ".len()..].trim();
@@ -2419,8 +2487,18 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
 #[must_use]
 pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
     match normalize_optional_args(args) {
-        None | Some("list" | "help" | "-h" | "--help") => SkillSlashDispatch::Local,
+        None | Some("list" | "help" | "-h" | "--help" | "show" | "info" | "describe") => {
+            SkillSlashDispatch::Local
+        }
         Some(args) if args == "install" || args.starts_with("install ") => {
+            SkillSlashDispatch::Local
+        }
+        Some(args)
+            if args.starts_with("list ")
+                || args.starts_with("show ")
+                || args.starts_with("info ")
+                || args.starts_with("describe ") =>
+        {
             SkillSlashDispatch::Local
         }
         Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
@@ -2596,8 +2674,42 @@ fn render_mcp_report_for(
                 )),
             }
         }
+        Some(args) if args.split_whitespace().next() == Some("list") && args.contains(' ') => {
+            // `mcp list <filter>` — list does not accept arguments; treat as unsupported action.
+            Ok(render_mcp_unsupported_action_text(
+                args,
+                "list accepts no filter argument; use `claw mcp list`",
+            ))
+        }
+        Some(args) if matches!(args.split_whitespace().next(), Some("info" | "describe")) => {
+            Ok(render_mcp_unsupported_action_text(
+                args,
+                "use `claw mcp show <server>` to inspect a server",
+            ))
+        }
         Some(args) => Ok(render_mcp_usage(Some(args))),
     }
+}
+
+fn render_mcp_unsupported_action_text(action: &str, hint: &str) -> String {
+    format!(
+        "MCP\n  Error            unsupported action '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|help]"
+    )
+}
+
+fn render_mcp_unsupported_action_json(action: &str, hint: &str) -> Value {
+    json!({
+        "kind": "mcp",
+        "action": "error",
+        "ok": false,
+        "error_kind": "unsupported_action",
+        "requested_action": action,
+        "hint": hint,
+        "usage": {
+            "slash_command": "/mcp [list|show <server>|help]",
+            "direct_cli": "claw mcp [list|show <server>|help]",
+        },
+    })
 }
 
 fn render_mcp_report_json_for(
@@ -2679,6 +2791,18 @@ fn render_mcp_report_json_for(
                     "working_directory": cwd.display().to_string(),
                 })),
             }
+        }
+        Some(args) if args.split_whitespace().next() == Some("list") && args.contains(' ') => {
+            Ok(render_mcp_unsupported_action_json(
+                args,
+                "list accepts no filter argument; use `claw mcp list`",
+            ))
+        }
+        Some(args) if matches!(args.split_whitespace().next(), Some("info" | "describe")) => {
+            Ok(render_mcp_unsupported_action_json(
+                args,
+                "use `claw mcp show <server>` to inspect a server",
+            ))
         }
         Some(args) => Ok(render_mcp_usage_json(Some(args))),
     }
@@ -4620,6 +4744,32 @@ mod tests {
     }
 
     #[test]
+    fn skills_show_and_list_filter_do_not_invoke_model() {
+        // `show`, `info`, `list <filter>` must route to Local, not Invoke.
+        // Regression for: `claw skills show plan` unexpectedly spawned a model session.
+        for token in &["show", "info", "describe"] {
+            assert_eq!(
+                classify_skills_slash_command(Some(token)),
+                SkillSlashDispatch::Local,
+                "`skills {token}` alone must be Local"
+            );
+        }
+        for prefix in &["show ", "info ", "list ", "describe "] {
+            let arg = format!("{prefix}plan");
+            assert_eq!(
+                classify_skills_slash_command(Some(&arg)),
+                SkillSlashDispatch::Local,
+                "`skills {arg}` must be Local, not Invoke"
+            );
+        }
+        // Bare invocable tokens still dispatch to Invoke.
+        assert_eq!(
+            classify_skills_slash_command(Some("plan")),
+            SkillSlashDispatch::Invoke("$plan".to_string()),
+        );
+    }
+
+    #[test]
     fn accepts_skills_invocation_arguments_for_prompt_dispatch() {
         assert_eq!(
             SlashCommand::parse("/skills help overview"),
@@ -4639,6 +4789,38 @@ mod tests {
             classify_skills_slash_command(Some("install ./skill-pack")),
             SkillSlashDispatch::Local
         );
+    }
+
+    #[test]
+    fn mcp_unsupported_actions_return_typed_error_not_generic_help() {
+        // `mcp info <name>` and `mcp list <filter>` must return typed errors, not raw help.
+        // Regression for #504: these previously fell through to render_mcp_usage with
+        // unexpected=arg, giving no machine-readable error_kind.
+        use crate::handle_mcp_slash_command_json;
+        use std::path::PathBuf;
+        let cwd = PathBuf::from("/tmp");
+
+        let info_json = handle_mcp_slash_command_json(Some("info nonexistent"), &cwd)
+            .expect("info nonexistent should not error at IO level");
+        assert_eq!(info_json["kind"], "mcp");
+        assert_eq!(info_json["ok"], false);
+        assert_eq!(info_json["error_kind"], "unsupported_action");
+        assert!(info_json["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("show"));
+
+        let list_filter_json = handle_mcp_slash_command_json(Some("list nonexistent"), &cwd)
+            .expect("list nonexistent should not error at IO level");
+        assert_eq!(list_filter_json["kind"], "mcp");
+        assert_eq!(list_filter_json["ok"], false);
+        assert_eq!(list_filter_json["error_kind"], "unsupported_action");
+
+        let describe_json = handle_mcp_slash_command_json(Some("describe myserver"), &cwd)
+            .expect("describe myserver should not error at IO level");
+        assert_eq!(describe_json["kind"], "mcp");
+        assert_eq!(describe_json["ok"], false);
+        assert_eq!(describe_json["error_kind"], "unsupported_action");
     }
 
     #[test]

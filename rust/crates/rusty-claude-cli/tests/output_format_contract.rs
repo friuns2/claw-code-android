@@ -397,6 +397,34 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
         agents["count"].is_number(),
         "count must be a number, not a text render"
     );
+
+    let plugins = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "/plugins",
+        ],
+        &[
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("utf8 config home"),
+            ),
+            ("HOME", home.to_str().expect("utf8 home")),
+        ],
+    );
+    assert_eq!(plugins["kind"], "plugin");
+    assert_eq!(plugins["action"], "list");
+    assert!(
+        plugins["reload_runtime"].is_boolean(),
+        "plugins reload_runtime should be a boolean"
+    );
+    assert!(
+        plugins["target"].is_null(),
+        "plugins target should be null when no plugin is targeted"
+    );
 }
 
 #[test]
@@ -431,6 +459,44 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
     );
     assert_eq!(init["kind"], "init");
     assert!(root.join("CLAUDE.md").exists());
+}
+
+#[test]
+fn config_section_json_emits_section_and_value() {
+    let root = unique_temp_dir("config-section-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    // Without a section: should return base envelope (no section field).
+    let base = assert_json_command(&root, &["--output-format", "json", "config"]);
+    assert_eq!(base["kind"], "config");
+    assert!(base["loaded_files"].is_number());
+    assert!(base["merged_keys"].is_number());
+    assert!(
+        base.get("section").is_none(),
+        "no section field without section arg"
+    );
+
+    // With a known section: should add section + section_value fields.
+    for section in &["model", "env", "hooks", "plugins"] {
+        let result = assert_json_command(&root, &["--output-format", "json", "config", section]);
+        assert_eq!(result["kind"], "config", "section={section}");
+        assert_eq!(
+            result["section"].as_str(),
+            Some(*section),
+            "section field must match requested section, got {result:?}"
+        );
+        assert!(
+            result.get("section_value").is_some(),
+            "section_value field must be present for section={section}"
+        );
+    }
+
+    // With an unsupported section: should return ok:false + error field.
+    let bad = assert_json_command(&root, &["--output-format", "json", "config", "unknown"]);
+    assert_eq!(bad["kind"], "config");
+    assert_eq!(bad["ok"], false);
+    assert!(bad["error"].as_str().is_some());
+    assert!(bad["section"].as_str().is_some());
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
