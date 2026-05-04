@@ -30,6 +30,15 @@ fn version_emits_json_when_requested() {
     let parsed = assert_json_command(&root, &["--output-format", "json", "version"]);
     assert_eq!(parsed["kind"], "version");
     assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
+    // Provenance fields must be present for binary identification (#507).
+    assert!(
+        parsed["build_date"].is_string(),
+        "build_date must be a string in version JSON"
+    );
+    assert!(
+        parsed["executable_path"].is_string(),
+        "executable_path must be a string in version JSON so callers can identify which binary is running"
+    );
 }
 
 #[test]
@@ -360,6 +369,34 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
     assert_eq!(skills["action"], "list");
     assert!(skills["summary"]["total"].is_number());
     assert!(skills["skills"].is_array());
+
+    let agents = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "/agents",
+        ],
+        &[
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("utf8 config home"),
+            ),
+            ("HOME", home.to_str().expect("utf8 home")),
+        ],
+    );
+    assert_eq!(agents["kind"], "agents");
+    assert_eq!(agents["action"], "list");
+    assert!(
+        agents["agents"].is_array(),
+        "agents field must be a JSON array"
+    );
+    assert!(
+        agents["count"].is_number(),
+        "count must be a number, not a text render"
+    );
 }
 
 #[test]

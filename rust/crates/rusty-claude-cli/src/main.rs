@@ -2627,12 +2627,15 @@ fn print_version(output_format: CliOutputFormat) -> Result<(), Box<dyn std::erro
 }
 
 fn version_json_value() -> serde_json::Value {
+    let executable_path = env::current_exe().ok().map(|p| p.display().to_string());
     json!({
         "kind": "version",
         "message": render_version_report(),
         "version": VERSION,
         "git_sha": GIT_SHA,
         "target": BUILD_TARGET,
+        "build_date": DEFAULT_DATE,
+        "executable_path": executable_path,
     })
 }
 
@@ -3523,10 +3526,10 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
-                json: Some(serde_json::json!({
-                    "kind": "agents",
-                    "text": handle_agents_slash_command(args.as_deref(), &cwd)?,
-                })),
+                json: Some(
+                    serde_json::to_value(handle_agents_slash_command_json(args.as_deref(), &cwd)?)
+                        .unwrap_or_else(|_| serde_json::json!(null)),
+                ),
             })
         }
         SlashCommand::Skills { args } => {
