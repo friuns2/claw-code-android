@@ -248,6 +248,7 @@ fn detect_scenario(request: &MessageRequest) -> Option<Scenario> {
                 .split_whitespace()
                 .find_map(|token| token.strip_prefix(SCENARIO_PREFIX))
                 .and_then(Scenario::parse),
+            InputContentBlock::Thinking { .. } => None,
             _ => None,
         })
     })

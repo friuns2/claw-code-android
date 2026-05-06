@@ -30,6 +30,10 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -737,6 +741,22 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
+            Self::Thinking {
+                thinking,
+                signature,
+            } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("thinking".to_string()),
+                );
+                object.insert("thinking".to_string(), JsonValue::String(thinking.clone()));
+                if let Some(signature) = signature {
+                    object.insert(
+                        "signature".to_string(),
+                        JsonValue::String(signature.clone()),
+                    );
+                }
+            }
             Self::ToolUse { id, name, input } => {
                 object.insert(
                     "type".to_string(),
@@ -782,6 +802,13 @@ impl ContentBlock {
         {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
+            }),
+            "thinking" => Ok(Self::Thinking {
+                thinking: required_string(object, "thinking")?,
+                signature: object
+                    .get("signature")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
             }),
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,
@@ -1206,6 +1233,36 @@ mod tests {
             17
         );
         assert_eq!(restored.session_id, session.session_id);
+    }
+
+    #[test]
+    fn persists_assistant_thinking_block_round_trip_through_jsonl() {
+        // given
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: "trace the path through session persistence".to_string(),
+                    signature: Some("sig-123".to_string()),
+                },
+            ]))
+            .expect("thinking block should append");
+        let path = temp_session_path("thinking-jsonl");
+
+        // when
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        // then
+        assert_eq!(restored, session);
+        assert_eq!(
+            restored.messages[0].blocks[0],
+            ContentBlock::Thinking {
+                thinking: "trace the path through session persistence".to_string(),
+                signature: Some("sig-123".to_string()),
+            }
+        );
     }
 
     #[test]

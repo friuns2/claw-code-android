@@ -4,9 +4,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -3075,27 +3076,33 @@ fn extract_quoted_value(input: &str) -> Option<(String, &str)> {
 }
 
 fn decode_duckduckgo_redirect(url: &str) -> Option<String> {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Some(html_entity_decode_url(url));
-    }
-
-    let joined = if url.starts_with("//") {
-        format!("https:{url}")
-    } else if url.starts_with('/') {
-        format!("https://duckduckgo.com{url}")
+    let decoded = html_entity_decode_url(url);
+    let parsed = if decoded.starts_with("http://") || decoded.starts_with("https://") {
+        reqwest::Url::parse(&decoded).ok()
+    } else if decoded.starts_with("//") {
+        reqwest::Url::parse(&format!("https:{decoded}")).ok()
+    } else if decoded.starts_with('/') {
+        reqwest::Url::parse(&format!("https://duckduckgo.com{decoded}")).ok()
     } else {
         return None;
-    };
+    }?;
 
-    let parsed = reqwest::Url::parse(&joined).ok()?;
-    if parsed.path() == "/l/" || parsed.path() == "/l" {
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if (host == "duckduckgo.com" || host.ends_with(".duckduckgo.com"))
+        && (parsed.path() == "/l/" || parsed.path() == "/l")
+    {
         for (key, value) in parsed.query_pairs() {
             if key == "uddg" {
                 return Some(html_entity_decode_url(value.as_ref()));
             }
         }
     }
-    Some(joined)
+
+    if decoded.starts_with("http://") || decoded.starts_with("https://") {
+        Some(decoded)
+    } else {
+        Some(parsed.to_string())
+    }
 }
 
 fn html_entity_decode_url(url: &str) -> String {
@@ -3510,7 +3517,7 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
+    let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
     let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
 
     let output_contents = format!(
@@ -3623,13 +3630,14 @@ fn build_agent_runtime(
     ))
 }
 
-fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
+fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut prompt = load_system_prompt(
         cwd,
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
         std::env::consts::OS,
         "unknown",
+        model_family_identity_for(model),
     )
     .map_err(|error| error.to_string())?;
     prompt.push(format!(
@@ -4630,13 +4638,21 @@ async fn stream_with_provider(
     let mut stream = client.stream_message(message_request).await?;
     let mut events = Vec::new();
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+    let mut pending_thinking: BTreeMap<u32, (String, Option<String>)> = BTreeMap::new();
     let mut saw_stop = false;
 
     while let Some(event) = stream.next_event().await? {
         match event {
             ApiStreamEvent::MessageStart(start) => {
                 for block in start.message.content {
-                    push_output_block(block, 0, &mut events, &mut pending_tools, true);
+                    push_output_block(
+                        block,
+                        0,
+                        &mut events,
+                        &mut pending_tools,
+                        &mut pending_thinking,
+                        true,
+                    );
                 }
             }
             ApiStreamEvent::ContentBlockStart(start) => {
@@ -4645,6 +4661,7 @@ async fn stream_with_provider(
                     start.index,
                     &mut events,
                     &mut pending_tools,
+                    &mut pending_thinking,
                     true,
                 );
             }
@@ -4659,10 +4676,23 @@ async fn stream_with_provider(
                         input.push_str(&partial_json);
                     }
                 }
-                ContentBlockDelta::ThinkingDelta { .. }
-                | ContentBlockDelta::SignatureDelta { .. } => {}
+                ContentBlockDelta::ThinkingDelta { thinking } => {
+                    if let Some((pending, _)) = pending_thinking.get_mut(&delta.index) {
+                        pending.push_str(&thinking);
+                    }
+                }
+                ContentBlockDelta::SignatureDelta { signature } => {
+                    if let Some((_, pending_signature)) = pending_thinking.get_mut(&delta.index) {
+                        pending_signature
+                            .get_or_insert_with(String::new)
+                            .push_str(&signature);
+                    }
+                }
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
+                if let Some((thinking, signature)) = pending_thinking.remove(&stop.index) {
+                    events.push(AssistantEvent::Thinking { thinking, signature });
+                }
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                     events.push(AssistantEvent::ToolUse { id, name, input });
                 }
@@ -4759,6 +4789,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
@@ -4778,6 +4815,9 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         is_error: *is_error,
                     },
                 })
+                .filter(
+                    |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
+                )
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
                 role: role.to_string(),
@@ -4792,6 +4832,7 @@ fn push_output_block(
     block_index: u32,
     events: &mut Vec<AssistantEvent>,
     pending_tools: &mut BTreeMap<u32, (String, String, String)>,
+    pending_thinking: &mut BTreeMap<u32, (String, Option<String>)>,
     streaming_tool_input: bool,
 ) {
     match block {
@@ -4811,17 +4852,35 @@ fn push_output_block(
             };
             pending_tools.insert(block_index, (id, name, initial_input));
         }
-        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            if streaming_tool_input {
+                pending_thinking.insert(block_index, (thinking, signature));
+            } else {
+                events.push(AssistantEvent::Thinking { thinking, signature });
+            }
+        }
+        OutputContentBlock::RedactedThinking { .. } => {}
     }
 }
 
 fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
     let mut events = Vec::new();
     let mut pending_tools = BTreeMap::new();
+    let mut pending_thinking = BTreeMap::new();
 
     for (index, block) in response.content.into_iter().enumerate() {
         let index = u32::try_from(index).expect("response block index overflow");
-        push_output_block(block, index, &mut events, &mut pending_tools, false);
+        push_output_block(
+            block,
+            index,
+            &mut events,
+            &mut pending_tools,
+            &mut pending_thinking,
+            false,
+        );
         if let Some((id, name, input)) = pending_tools.remove(&index) {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -6134,12 +6193,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
-        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
+        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
+        extract_recovery_outcome, final_assistant_text, global_cron_registry,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -7149,9 +7209,102 @@ mod tests {
     }
 
     #[test]
+    fn web_search_decodes_absolute_duckduckgo_redirect_urls() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=duckduckgo+redirects "));
+            HttpResponse::html(
+                200,
+                "OK",
+                r#"
+                <html><body>
+                  <a rel="nofollow" class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.rs%2Freqwest&amp;rut=abc">Reqwest docs</a>
+                </body></html>
+                "#,
+            )
+        }));
+
+        // when
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let result = execute_tool(
+            "WebSearch",
+            &json!({
+                "query": "duckduckgo redirects"
+            }),
+        )
+        .expect("WebSearch should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        // then
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let results = output["results"].as_array().expect("results array");
+        let search_result = results
+            .iter()
+            .find(|item| item.get("content").is_some())
+            .expect("search result block present");
+        let content = search_result["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["title"], "Reqwest docs");
+        assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
+    }
+
+    #[test]
+    fn web_search_decodes_protocol_relative_duckduckgo_redirect_urls() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=duckduckgo+protocol+relative "));
+            HttpResponse::html(
+                200,
+                "OK",
+                r#"
+                <html><body>
+                  <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.rs%2Ftokio&amp;rut=xyz">Tokio Docs</a>
+                </body></html>
+                "#,
+            )
+        }));
+
+        // when
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let result = execute_tool(
+            "WebSearch",
+            &json!({
+                "query": "duckduckgo protocol relative"
+            }),
+        )
+        .expect("WebSearch should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        // then
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let results = output["results"].as_array().expect("results array");
+        let search_result = results
+            .iter()
+            .find(|item| item.get("content").is_some())
+            .expect("search result block present");
+        let content = search_result["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["title"], "Tokio Docs");
+        assert_eq!(content[0]["url"], "https://docs.rs/tokio");
+    }
+
+    #[test]
     fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
         let mut events = Vec::new();
         let mut pending_tools = BTreeMap::new();
+        let mut pending_thinking = BTreeMap::new();
 
         push_output_block(
             OutputContentBlock::ToolUse {
@@ -7162,6 +7315,7 @@ mod tests {
             1,
             &mut events,
             &mut pending_tools,
+            &mut pending_thinking,
             true,
         );
         push_output_block(
@@ -7173,6 +7327,7 @@ mod tests {
             2,
             &mut events,
             &mut pending_tools,
+            &mut pending_thinking,
             true,
         );
 
@@ -8407,6 +8562,28 @@ mod tests {
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
         assert!(!verification.contains("write_file"));
+    }
+
+    #[test]
+    fn subagent_system_prompt_uses_resolved_model_identity() {
+        // given: a temporary workspace and an OpenAI-compatible subagent model
+        let _guard = env_guard();
+        let root = temp_path("subagent-prompt-identity");
+        fs::create_dir_all(&root).expect("create temp workspace");
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&root).expect("enter temp workspace");
+
+        // when: building the subagent system prompt
+        let prompt = build_agent_system_prompt("Explore", "openai/gpt-4.1-mini")
+            .expect("subagent system prompt should build")
+            .join("\n");
+        std::env::set_current_dir(previous).expect("restore current dir");
+
+        // then: the prompt renders a generic model family identity
+        assert!(prompt.contains("Model family: an AI assistant"));
+        assert!(!prompt.contains("Model family: Claude Opus 4.6"));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
 
     #[derive(Debug)]

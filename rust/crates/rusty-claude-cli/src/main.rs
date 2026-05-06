@@ -24,10 +24,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, model_family_identity_for, resolve_startup_auth_source, AnthropicClient,
+    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -148,11 +149,7 @@ impl ModelProvenance {
 }
 
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
+    api::max_tokens_for_model(model)
 }
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
@@ -361,8 +358,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::PrintSystemPrompt {
             cwd,
             date,
+            model,
             output_format,
-        } => print_system_prompt(cwd, date, output_format)?,
+        } => print_system_prompt(cwd, date, &model, output_format)?,
         CliAction::Version { output_format } => print_version(output_format)?,
         CliAction::ResumeSession {
             session_path,
@@ -464,7 +462,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
-        CliAction::HelpTopic(topic) => print_help_topic(topic),
+        CliAction::HelpTopic {
+            topic,
+            output_format,
+        } => print_help_topic(topic, output_format)?,
         CliAction::Help { output_format } => print_help(output_format)?,
     }
     Ok(())
@@ -499,6 +500,7 @@ enum CliAction {
     PrintSystemPrompt {
         cwd: PathBuf,
         date: String,
+        model: String,
         output_format: CliOutputFormat,
     },
     Version {
@@ -567,7 +569,10 @@ enum CliAction {
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
     },
-    HelpTopic(LocalHelpTopic),
+    HelpTopic {
+        topic: LocalHelpTopic,
+        output_format: CliOutputFormat,
+    },
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
         output_format: CliOutputFormat,
@@ -843,7 +848,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..], output_format);
     }
-    if let Some(action) = parse_local_help_action(&rest) {
+    if let Some(action) = parse_local_help_action(&rest, output_format) {
         return action;
     }
     if let Some(action) = parse_single_word_command_alias(
@@ -958,7 +963,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }),
             }
         }
-        "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
+        "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
@@ -1033,7 +1038,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 }
 
-fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
+fn parse_local_help_action(
+    rest: &[String],
+    output_format: CliOutputFormat,
+) -> Option<Result<CliAction, String>> {
     if rest.len() != 2 || !is_help_flag(&rest[1]) {
         return None;
     }
@@ -1056,7 +1064,10 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
         _ => return None,
     };
-    Some(Ok(CliAction::HelpTopic(topic)))
+    Some(Ok(CliAction::HelpTopic {
+        topic,
+        output_format,
+    }))
 }
 
 fn is_help_flag(value: &str) -> bool {
@@ -1630,6 +1641,7 @@ fn filter_tool_specs(
 
 fn parse_system_prompt_args(
     args: &[String],
+    model: String,
     output_format: CliOutputFormat,
 ) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
@@ -1666,6 +1678,7 @@ fn parse_system_prompt_args(
     Ok(CliAction::PrintSystemPrompt {
         cwd,
         date,
+        model,
         output_format,
     })
 }
@@ -2606,9 +2619,16 @@ fn print_bootstrap_plan(output_format: CliOutputFormat) -> Result<(), Box<dyn st
 fn print_system_prompt(
     cwd: PathBuf,
     date: String,
+    model: &str,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
+    let sections = load_system_prompt(
+        cwd,
+        date,
+        env::consts::OS,
+        "unknown",
+        model_family_identity_for(model),
+    )?;
     let message = sections.join(
         "
 
@@ -4386,7 +4406,7 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
+        let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -4522,6 +4542,10 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                let final_text = final_assistant_text(&summary);
+                if !final_text.is_empty() {
+                    println!("{final_text}");
+                }
                 println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -6142,8 +6166,90 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
     }
 }
 
-fn print_help_topic(topic: LocalHelpTopic) {
-    println!("{}", render_help_topic(topic));
+fn local_help_topic_command(topic: LocalHelpTopic) -> &'static str {
+    match topic {
+        LocalHelpTopic::Status => "status",
+        LocalHelpTopic::Sandbox => "sandbox",
+        LocalHelpTopic::Doctor => "doctor",
+        LocalHelpTopic::Acp => "acp",
+        LocalHelpTopic::Init => "init",
+        LocalHelpTopic::State => "state",
+        LocalHelpTopic::Export => "export",
+        LocalHelpTopic::Version => "version",
+        LocalHelpTopic::SystemPrompt => "system-prompt",
+        LocalHelpTopic::DumpManifests => "dump-manifests",
+        LocalHelpTopic::BootstrapPlan => "bootstrap-plan",
+    }
+}
+
+fn render_export_help_json() -> serde_json::Value {
+    json!({
+        "kind": "help",
+        "topic": "export",
+        "command": "export",
+        "usage": "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]",
+        "purpose": "serialize a managed session to JSON for review, transfer, or archival",
+        "defaults": {
+            "session": LATEST_SESSION_REFERENCE,
+            "session_source": ".claw/sessions/",
+            "output": "derived from the selected session when omitted"
+        },
+        "formats": ["text", "json"],
+        "options": [
+            {
+                "name": "--session",
+                "value": "<id|latest>",
+                "default": LATEST_SESSION_REFERENCE,
+                "description": "managed session to export"
+            },
+            {
+                "name": "--output",
+                "aliases": ["-o"],
+                "value": "<path>",
+                "description": "write the exported transcript to this path"
+            },
+            {
+                "name": "--output-format",
+                "value": "<format>",
+                "values": ["text", "json"],
+                "default": "text",
+                "description": "format for the command result envelope"
+            },
+            {
+                "name": "--help",
+                "aliases": ["-h"],
+                "description": "show help for the export command"
+            }
+        ],
+        "related": ["/session list", "claw --resume latest"]
+    })
+}
+
+fn render_help_topic_json(topic: LocalHelpTopic) -> serde_json::Value {
+    if topic == LocalHelpTopic::Export {
+        return render_export_help_json();
+    }
+
+    json!({
+        "kind": "help",
+        "topic": local_help_topic_command(topic),
+        "command": local_help_topic_command(topic),
+        "message": render_help_topic(topic),
+    })
+}
+
+fn print_help_topic(
+    topic: LocalHelpTopic,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::Text => println!("{}", render_help_topic(topic)),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&render_help_topic_json(topic))?
+        ),
+    }
+    Ok(())
 }
 
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -6915,6 +7021,7 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { .. } => {}
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -7101,6 +7208,7 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                         lines.push(String::new());
                     }
                 }
+                ContentBlock::Thinking { .. } => {}
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!(
                         "**Tool call** `{name}` _(id `{}`)_",
@@ -7154,12 +7262,13 @@ fn short_tool_id(id: &str) -> String {
     format!("{prefix}…")
 }
 
-fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
+        model_family_identity_for(model),
     )?)
 }
 
@@ -9121,26 +9230,29 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::Thinking { .. } => None,
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -9340,17 +9452,17 @@ mod tests {
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_list, render_session_markdown, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
-        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
-        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary,
-        SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        render_help_topic_json, render_memory_report, render_prompt_history_report,
+        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
+        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
+        resolve_session_reference, response_to_events, resume_supported_slash_commands,
+        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
+        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
+        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
+        SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -9506,6 +9618,41 @@ mod tests {
         assert!(
             rendered
                 .contains("Detail           This model's maximum context length is 200000 tokens"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Fresh session    /clear --confirm"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn openai_configured_limit_errors_are_rendered_as_context_window_guidance() {
+        let error = ApiError::Api {
+            status: "400".parse().expect("status"),
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some(
+                "Input tokens exceed the configured limit of 922000 tokens. Your messages resulted in 1860900 tokens. Please reduce the length of the messages."
+                    .to_string(),
+            ),
+            request_id: Some("req_ctx_openai_456".to_string()),
+            body: String::new(),
+            retryable: false,
+            suggested_action: None,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("Context window blocked"), "{rendered}");
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Trace            req_ctx_openai_456"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "Detail           Input tokens exceed the configured limit of 922000 tokens."
+            ),
             "{rendered}"
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
@@ -10141,6 +10288,7 @@ mod tests {
 
     #[test]
     fn parses_system_prompt_options() {
+        // given: system-prompt options for cwd and date
         let args = vec![
             "system-prompt".to_string(),
             "--cwd".to_string(),
@@ -10148,14 +10296,41 @@ mod tests {
             "--date".to_string(),
             "2026-04-01".to_string(),
         ];
+
+        // when: parsing the direct system-prompt command
+        let action = parse_args(&args).expect("args should parse");
+
+        // then: the action carries prompt options and default model
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            action,
             CliAction::PrintSystemPrompt {
                 cwd: PathBuf::from("/tmp/project"),
                 date: "2026-04-01".to_string(),
+                model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
             }
         );
+    }
+
+    #[test]
+    fn parses_global_model_for_system_prompt() {
+        // given: a global OpenAI-compatible model before system-prompt
+        let args = vec![
+            "--model".to_string(),
+            "openai/gpt-4.1-mini".to_string(),
+            "system-prompt".to_string(),
+        ];
+
+        // when: parsing the CLI arguments
+        let action = parse_args(&args).expect("args should parse");
+
+        // then: the system-prompt action carries the selected model
+        match action {
+            CliAction::PrintSystemPrompt { model, .. } => {
+                assert_eq!(model, "openai/gpt-4.1-mini");
+            }
+            other => panic!("expected PrintSystemPrompt, got {other:?}"),
+        }
     }
 
     #[test]
@@ -10470,21 +10645,33 @@ mod tests {
         assert_eq!(
             parse_args(&["status".to_string(), "--help".to_string()])
                 .expect("status help should parse"),
-            CliAction::HelpTopic(LocalHelpTopic::Status)
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Status,
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["sandbox".to_string(), "-h".to_string()])
                 .expect("sandbox help should parse"),
-            CliAction::HelpTopic(LocalHelpTopic::Sandbox)
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Sandbox,
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["doctor".to_string(), "--help".to_string()])
                 .expect("doctor help should parse"),
-            CliAction::HelpTopic(LocalHelpTopic::Doctor)
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Doctor,
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["acp".to_string(), "--help".to_string()]).expect("acp help should parse"),
-            CliAction::HelpTopic(LocalHelpTopic::Acp)
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Acp,
+                output_format: CliOutputFormat::Text,
+            }
         );
     }
 
@@ -10514,10 +10701,30 @@ mod tests {
                     });
                 assert_eq!(
                     parsed,
-                    CliAction::HelpTopic(*expected_topic),
+                    CliAction::HelpTopic {
+                        topic: *expected_topic,
+                        output_format: CliOutputFormat::Text,
+                    },
                     "`{subcommand} {flag}` should resolve to HelpTopic({expected_topic:?})"
                 );
             }
+            let json_parsed = parse_args(&[
+                subcommand.to_string(),
+                "--help".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .unwrap_or_else(|error| {
+                panic!("`{subcommand} --help --output-format json` should parse: {error}")
+            });
+            assert_eq!(
+                json_parsed,
+                CliAction::HelpTopic {
+                    topic: *expected_topic,
+                    output_format: CliOutputFormat::Json,
+                },
+                "`{subcommand} --help --output-format json` should preserve json output format"
+            );
             // And the rendered help must actually mention the subcommand name
             // (or its canonical title) so users know they got the right help.
             let rendered = render_help_topic(*expected_topic);
@@ -10530,6 +10737,24 @@ mod tests {
                 "{subcommand} help text should contain a Usage line"
             );
         }
+    }
+
+    #[test]
+    fn export_help_json_is_bounded_and_parseable_384() {
+        let value = render_help_topic_json(LocalHelpTopic::Export);
+        assert_eq!(value["kind"], "help");
+        assert_eq!(value["topic"], "export");
+        assert_eq!(value["command"], "export");
+        assert_eq!(
+            value["usage"],
+            "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]"
+        );
+        assert_eq!(value["defaults"]["session"], LATEST_SESSION_REFERENCE);
+        assert!(value["options"].as_array().expect("options array").len() >= 4);
+        assert!(
+            value.get("message").is_none(),
+            "export help json should be a bounded envelope, not plaintext help wrapped in json"
+        );
     }
 
     #[test]

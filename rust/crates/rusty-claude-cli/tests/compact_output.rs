@@ -127,6 +127,66 @@ fn compact_flag_streaming_text_only_emits_final_message_text() {
 }
 
 #[test]
+fn text_prompt_mode_prints_final_assistant_text_after_spinner() {
+    // given a workspace pointed at the mock Anthropic service running the
+    // streaming_text scenario which only emits a single assistant text block
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+
+    let workspace = unique_temp_dir("text-prompt-mode");
+    let config_home = workspace.join("config-home");
+    let home = workspace.join("home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    // when we invoke claw in normal text prompt mode for the streaming text scenario
+    let prompt = format!("{SCENARIO_PREFIX}streaming_text");
+    let output = run_claw(
+        &workspace,
+        &config_home,
+        &home,
+        &base_url,
+        &[
+            "--model",
+            "sonnet",
+            "--permission-mode",
+            "read-only",
+            &prompt,
+        ],
+    );
+
+    // then stdout should contain the final assistant text, not just spinner output
+    assert!(
+        output.status.success(),
+        "text prompt run should succeed\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let plain_stdout = strip_ansi_codes(&stdout);
+    assert!(
+        plain_stdout.contains("Mock streaming says hello from the parity harness."),
+        "text prompt stdout should include the assistant text ({stdout:?})"
+    );
+    assert!(
+        plain_stdout.contains("✔ ✨ Done"),
+        "text prompt stdout should still include spinner completion ({stdout:?})"
+    );
+    assert!(
+        plain_stdout
+            .lines()
+            .any(|line| line == "Mock streaming says hello from the parity harness."),
+        "text prompt stdout should print the assistant text as its own line ({stdout:?})"
+    );
+
+    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+}
+
+#[test]
 fn compact_flag_with_json_output_emits_structured_json() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
     let server = runtime
@@ -214,4 +274,22 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         "claw-compact-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && matches!(chars.peek(), Some('[')) {
+            chars.next();
+            while let Some(next) = chars.next() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        output.push(ch);
+    }
+    output
 }

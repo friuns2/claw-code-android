@@ -43,6 +43,24 @@ pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
+/// Neutral identity for the model family line in generated prompts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelFamilyIdentity {
+    #[default]
+    Claude,
+    Generic,
+}
+
+impl ModelFamilyIdentity {
+    #[must_use]
+    pub const fn family_label(self) -> &'static str {
+        match self {
+            Self::Claude => FRONTIER_MODEL_NAME,
+            Self::Generic => "an AI assistant",
+        }
+    }
+}
+
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
@@ -97,6 +115,7 @@ pub struct SystemPromptBuilder {
     output_style_prompt: Option<String>,
     os_name: Option<String>,
     os_version: Option<String>,
+    model_family: Option<ModelFamilyIdentity>,
     append_sections: Vec<String>,
     project_context: Option<ProjectContext>,
     config: Option<RuntimeConfig>,
@@ -119,6 +138,12 @@ impl SystemPromptBuilder {
     pub fn with_os(mut self, os_name: impl Into<String>, os_version: impl Into<String>) -> Self {
         self.os_name = Some(os_name.into());
         self.os_version = Some(os_version.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_family(mut self, model_family: ModelFamilyIdentity) -> Self {
+        self.model_family = Some(model_family);
         self
     }
 
@@ -179,9 +204,10 @@ impl SystemPromptBuilder {
             || "unknown".to_string(),
             |context| context.current_date.clone(),
         );
+        let identity = self.model_family.unwrap_or_default();
         let mut lines = vec!["# Environment context".to_string()];
         lines.extend(prepend_bullets(vec![
-            format!("Model family: {FRONTIER_MODEL_NAME}"),
+            format!("Model family: {}", identity.family_label()),
             format!("Working directory: {cwd}"),
             format!("Date: {date}"),
             format!(
@@ -434,12 +460,14 @@ pub fn load_system_prompt(
     current_date: impl Into<String>,
     os_name: impl Into<String>,
     os_version: impl Into<String>,
+    model_family: ModelFamilyIdentity,
 ) -> Result<Vec<String>, PromptBuildError> {
     let cwd = cwd.into();
     let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
     let config = ConfigLoader::default_for(&cwd).load()?;
     Ok(SystemPromptBuilder::new()
         .with_os(os_name, os_version)
+        .with_model_family(model_family)
         .with_project_context(project_context)
         .with_runtime_config(config)
         .build())
@@ -522,7 +550,8 @@ mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
         render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        ContextFile, ModelFamilyIdentity, ProjectContext, SystemPromptBuilder,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -804,13 +833,19 @@ mod tests {
         std::env::set_var("HOME", &root);
         std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
         std::env::set_current_dir(&root).expect("change cwd");
-        let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
-            .expect("system prompt should load")
-            .join(
-                "
+        let prompt = super::load_system_prompt(
+            &root,
+            "2026-03-31",
+            "linux",
+            "6.8",
+            ModelFamilyIdentity::Claude,
+        )
+        .expect("system prompt should load")
+        .join(
+            "
 
 ",
-            );
+        );
         std::env::set_current_dir(previous).expect("restore cwd");
         if let Some(value) = original_home {
             std::env::set_var("HOME", value);
@@ -826,6 +861,50 @@ mod tests {
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn renders_default_claude_model_family_identity() {
+        // given: a prompt builder without an explicit model family override
+        let project_context = ProjectContext {
+            cwd: PathBuf::from("/tmp/project"),
+            current_date: "2026-03-31".to_string(),
+            ..ProjectContext::default()
+        };
+
+        // when: rendering the system prompt environment section
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .render();
+
+        // then: the Claude model family label is preserved by default
+        assert!(prompt.contains("Model family: Claude Opus 4.6"));
+    }
+
+    #[test]
+    fn renders_generic_model_family_identity_without_claude_label() {
+        // given: a prompt builder with generic model family identity
+        let project_context = ProjectContext {
+            cwd: PathBuf::from("/tmp/project"),
+            current_date: "2026-03-31".to_string(),
+            ..ProjectContext::default()
+        };
+
+        // when: rendering the system prompt environment section
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_model_family(ModelFamilyIdentity::Generic)
+            .with_project_context(project_context)
+            .render();
+        let model_family_line = prompt
+            .lines()
+            .find(|line| line.contains("Model family:"))
+            .expect("model family line should render");
+
+        // then: the model family line is neutral and excludes Claude Opus 4.6
+        assert_eq!(model_family_line, " - Model family: an AI assistant");
+        assert!(!model_family_line.contains("Claude Opus 4.6"));
     }
 
     #[test]

@@ -64,6 +64,50 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
 }
 
 #[tokio::test]
+async fn send_message_preserves_deepseek_reasoning_content_before_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_deepseek_reasoning\",",
+        "\"model\":\"deepseek-v4-pro\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"reasoning_content\":\"Think first\",\"content\":\"Answer second\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/deepseek-v4-pro".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(
+        response.content,
+        vec![
+            OutputContentBlock::Thinking {
+                thinking: "Think first".to_string(),
+                signature: None,
+            },
+            OutputContentBlock::Text {
+                text: "Answer second".to_string(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(

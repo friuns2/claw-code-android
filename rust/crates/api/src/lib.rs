@@ -21,11 +21,12 @@ pub use prompt_cache::{
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
-    model_rejects_is_error_field, translate_message, OpenAiCompatClient, OpenAiCompatConfig,
+    model_rejects_is_error_field, model_requires_reasoning_content_in_history, translate_message,
+    OpenAiCompatClient, OpenAiCompatConfig,
 };
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    resolve_model_alias, ProviderKind,
+    model_family_identity_for, model_family_identity_for_kind, resolve_model_alias, ProviderKind,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{
