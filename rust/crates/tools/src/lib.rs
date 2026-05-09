@@ -4691,7 +4691,10 @@ async fn stream_with_provider(
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if let Some((thinking, signature)) = pending_thinking.remove(&stop.index) {
-                    events.push(AssistantEvent::Thinking { thinking, signature });
+                    events.push(AssistantEvent::Thinking {
+                        thinking,
+                        signature,
+                    });
                 }
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                     events.push(AssistantEvent::ToolUse { id, name, input });
@@ -4859,7 +4862,10 @@ fn push_output_block(
             if streaming_tool_input {
                 pending_thinking.insert(block_index, (thinking, signature));
             } else {
-                events.push(AssistantEvent::Thinking { thinking, signature });
+                events.push(AssistantEvent::Thinking {
+                    thinking,
+                    signature,
+                });
             }
         }
         OutputContentBlock::RedactedThinking { .. } => {}
