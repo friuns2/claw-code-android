@@ -344,7 +344,7 @@ fn glob_search_impl(
         if let Some(root) = canonical_root.as_deref() {
             let canonical_walk_root = walk_root
                 .canonicalize()
-                .unwrap_or_else(|_| walk_root.to_path_buf());
+                .unwrap_or_else(|_| walk_root.clone());
             validate_workspace_boundary(&canonical_walk_root, root)?;
         }
         let entries = WalkDir::new(&walk_root)
@@ -484,32 +484,46 @@ fn grep_search_impl(
 
     let (filenames, applied_limit, applied_offset) =
         apply_limit(filenames, input.head_limit, input.offset);
-    let content_output = if output_mode == "content" {
-        let (lines, limit, offset) = apply_limit(content_lines, input.head_limit, input.offset);
-        return Ok(GrepSearchOutput {
-            mode: Some(output_mode),
-            num_files: filenames.len(),
+    if output_mode == "content" {
+        return Ok(build_grep_content_output(
+            output_mode,
             filenames,
-            num_lines: Some(lines.len()),
-            content: Some(lines.join("\n")),
-            num_matches: None,
-            applied_limit: limit,
-            applied_offset: offset,
-        });
-    } else {
-        None
-    };
+            content_lines,
+            input.head_limit,
+            input.offset,
+        ));
+    }
 
     Ok(GrepSearchOutput {
         mode: Some(output_mode.clone()),
         num_files: filenames.len(),
         filenames,
-        content: content_output,
+        content: None,
         num_lines: None,
         num_matches: (output_mode == "count").then_some(total_matches),
         applied_limit,
         applied_offset,
     })
+}
+
+fn build_grep_content_output(
+    output_mode: String,
+    filenames: Vec<String>,
+    content_lines: Vec<String>,
+    head_limit: Option<usize>,
+    offset: Option<usize>,
+) -> GrepSearchOutput {
+    let (lines, limit, offset) = apply_limit(content_lines, head_limit, offset);
+    GrepSearchOutput {
+        mode: Some(output_mode),
+        num_files: filenames.len(),
+        filenames,
+        num_lines: Some(lines.len()),
+        content: Some(lines.join("\n")),
+        num_matches: None,
+        applied_limit: limit,
+        applied_offset: offset,
+    }
 }
 
 fn canonicalize_workspace_root(workspace_root: &Path) -> PathBuf {
