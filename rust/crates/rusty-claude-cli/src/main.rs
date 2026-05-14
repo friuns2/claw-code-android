@@ -1972,8 +1972,16 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let branch_freshness = BranchFreshness::from_git_status(project_context.git_status.as_deref());
     let empty_config = runtime::RuntimeConfig::empty();
     let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
+    let boot_preflight = build_boot_preflight_snapshot(
+        &cwd,
+        project_root.as_deref(),
+        project_context.git_status.as_deref(),
+        config.as_ref().ok(),
+        config.as_ref().err().map(ToString::to_string).as_deref(),
+    );
     let context = StatusContext {
         cwd: cwd.clone(),
         session_path: None,
@@ -1986,7 +1994,9 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         project_root,
         git_branch,
         git_summary,
+        branch_freshness,
         session_lifecycle: classify_session_lifecycle_for(&cwd),
+        boot_preflight,
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
         // Doctor path has its own config check; StatusContext here is only
         // fed into health renderers that don't read config_load_error.
@@ -1998,6 +2008,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
             check_config_health(&config_loader, config.as_ref()),
             check_install_source_health(),
             check_workspace_health(&context),
+            check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_system_health(&cwd, config.as_ref().ok()),
         ],
@@ -2391,6 +2402,73 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             json!(context.discovered_config_files),
         ),
     ]))
+}
+
+fn check_boot_preflight_health(context: &StatusContext) -> DiagnosticCheck {
+    let preflight = &context.boot_preflight;
+    let missing_binaries = preflight
+        .required_binaries
+        .iter()
+        .filter(|binary| !binary.available)
+        .map(|binary| binary.name)
+        .collect::<Vec<_>>();
+    let socket_details = preflight
+        .control_sockets
+        .iter()
+        .map(|socket| {
+            format!(
+                "Control socket  {} configured={} exists={} path={}",
+                socket.name,
+                socket.configured,
+                socket.exists,
+                socket.path.as_deref().unwrap_or("<none>")
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut details = vec![
+        format!("Repo exists      {}", preflight.repo_exists),
+        format!("Worktree exists  {}", preflight.worktree_exists),
+        format!("Git dir exists   {}", preflight.git_dir_exists),
+        format!("Branch behind    {}", preflight.branch_freshness.behind),
+        format!("Trust allowlist  {:?}", preflight.trust_gate_allowed),
+        format!("Trusted roots    {}", preflight.trusted_roots_count),
+        format!(
+            "MCP eligible     {} · servers {}",
+            preflight.mcp_startup_eligible, preflight.mcp_servers_configured
+        ),
+        format!(
+            "Plugin eligible  {} · configured {}",
+            preflight.plugin_startup_eligible, preflight.plugins_configured
+        ),
+        format!(
+            "Last failed boot {}",
+            preflight
+                .last_failed_boot_reason
+                .as_deref()
+                .unwrap_or("<none>")
+        ),
+    ];
+    details.extend(preflight.required_binaries.iter().map(|binary| {
+        format!(
+            "Required binary {} available={}",
+            binary.name, binary.available
+        )
+    }));
+    details.extend(socket_details);
+    DiagnosticCheck::new(
+        "Boot preflight",
+        if preflight.repo_exists && preflight.worktree_exists && missing_binaries.is_empty() {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Warn
+        },
+        preflight.summary(),
+    )
+    .with_details(details)
+    .with_data(Map::from_iter([(
+        "boot_preflight".to_string(),
+        preflight.json_value(),
+    )]))
 }
 
 fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
@@ -2841,7 +2919,9 @@ struct StatusContext {
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
+    branch_freshness: BranchFreshness,
     session_lifecycle: SessionLifecycleSummary,
+    boot_preflight: BootPreflightSnapshot,
     sandbox_status: runtime::SandboxStatus,
     /// #143: when `.claw.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
@@ -2850,6 +2930,162 @@ struct StatusContext {
     /// `status: "degraded"` so claws can distinguish "status ran but config
     /// is broken" from "status ran cleanly".
     config_load_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchFreshness {
+    upstream: Option<String>,
+    ahead: u32,
+    behind: u32,
+    fresh: Option<bool>,
+}
+
+impl BranchFreshness {
+    fn from_git_status(status: Option<&str>) -> Self {
+        let first_line = status
+            .and_then(|status| status.lines().next())
+            .unwrap_or_default();
+        let upstream = first_line
+            .split_once("...")
+            .and_then(|(_, rest)| rest.split([' ', '[']).next())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let mut ahead = 0;
+        let mut behind = 0;
+        if let Some((_, bracketed)) = first_line.split_once('[') {
+            let bracketed = bracketed.trim_end_matches(']');
+            for part in bracketed.split(',').map(str::trim) {
+                if let Some(value) = part.strip_prefix("ahead ") {
+                    ahead = value.parse().unwrap_or(0);
+                } else if let Some(value) = part.strip_prefix("behind ") {
+                    behind = value.parse().unwrap_or(0);
+                }
+            }
+        }
+        let fresh = upstream.as_ref().map(|_| behind == 0);
+        Self {
+            upstream,
+            ahead,
+            behind,
+            fresh,
+        }
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "upstream": self.upstream,
+            "ahead": self.ahead,
+            "behind": self.behind,
+            "fresh": self.fresh,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryPreflight {
+    name: &'static str,
+    available: bool,
+}
+
+impl BinaryPreflight {
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "available": self.available,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlSocketPreflight {
+    name: &'static str,
+    configured: bool,
+    exists: bool,
+    path: Option<String>,
+}
+
+impl ControlSocketPreflight {
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "configured": self.configured,
+            "exists": self.exists,
+            "path": self.path,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootPreflightSnapshot {
+    repo_exists: bool,
+    worktree_exists: bool,
+    git_dir_exists: bool,
+    branch_freshness: BranchFreshness,
+    trust_gate_allowed: Option<bool>,
+    trusted_roots_count: usize,
+    required_binaries: Vec<BinaryPreflight>,
+    control_sockets: Vec<ControlSocketPreflight>,
+    mcp_startup_eligible: bool,
+    mcp_servers_configured: usize,
+    plugin_startup_eligible: bool,
+    plugins_configured: usize,
+    last_failed_boot_reason: Option<String>,
+}
+
+impl BootPreflightSnapshot {
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "repo": {
+                "exists": self.repo_exists,
+                "worktree_exists": self.worktree_exists,
+                "git_dir_exists": self.git_dir_exists,
+            },
+            "branch_freshness": self.branch_freshness.json_value(),
+            "trust_gate": {
+                "allowlisted": self.trust_gate_allowed,
+                "trusted_roots_count": self.trusted_roots_count,
+            },
+            "required_binaries": self.required_binaries.iter().map(BinaryPreflight::json_value).collect::<Vec<_>>(),
+            "control_sockets": self.control_sockets.iter().map(ControlSocketPreflight::json_value).collect::<Vec<_>>(),
+            "mcp_startup": {
+                "eligible": self.mcp_startup_eligible,
+                "servers_configured": self.mcp_servers_configured,
+            },
+            "plugin_startup": {
+                "eligible": self.plugin_startup_eligible,
+                "plugins_configured": self.plugins_configured,
+            },
+            "last_failed_boot_reason": self.last_failed_boot_reason,
+        })
+    }
+
+    fn summary(&self) -> String {
+        let trust = self
+            .trust_gate_allowed
+            .map(|value| {
+                if value {
+                    "allowlisted"
+                } else {
+                    "not allowlisted"
+                }
+            })
+            .unwrap_or("unknown");
+        let freshness = self
+            .branch_freshness
+            .fresh
+            .map(|fresh| if fresh { "fresh" } else { "behind" })
+            .unwrap_or("no upstream");
+        format!(
+            "repo={} worktree={} branch={} trust={} mcp={} plugins={} last_failed={}",
+            self.repo_exists,
+            self.worktree_exists,
+            freshness,
+            trust,
+            self.mcp_startup_eligible,
+            self.plugin_startup_eligible,
+            self.last_failed_boot_reason.as_deref().unwrap_or("none")
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3292,6 +3528,123 @@ fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
     }
 
     summary
+}
+
+fn build_boot_preflight_snapshot(
+    cwd: &Path,
+    project_root: Option<&Path>,
+    git_status: Option<&str>,
+    runtime_config: Option<&runtime::RuntimeConfig>,
+    config_load_error: Option<&str>,
+) -> BootPreflightSnapshot {
+    let branch_freshness = BranchFreshness::from_git_status(git_status);
+    let worktree_exists = run_git_bool(cwd, &["rev-parse", "--is-inside-work-tree"]);
+    let git_dir_exists = run_git_capture_in(cwd, &["rev-parse", "--git-dir"])
+        .map(|path| {
+            let path = PathBuf::from(path.trim());
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .is_some_and(|path| path.exists());
+    let trusted_roots = runtime_config
+        .map(runtime::RuntimeConfig::trusted_roots)
+        .unwrap_or(&[]);
+    let trust_gate_allowed = runtime_config.map(|_| {
+        trusted_roots
+            .iter()
+            .any(|root| path_matches_trusted_root_local(cwd, root))
+    });
+    let plugin_configured = runtime_config
+        .map(|config| config.plugins().enabled_plugins().len())
+        .unwrap_or_default();
+    let mcp_configured = runtime_config
+        .map(|config| config.mcp().servers().len())
+        .unwrap_or_default();
+    let config_ok = config_load_error.is_none();
+    BootPreflightSnapshot {
+        repo_exists: project_root.is_some_and(Path::exists),
+        worktree_exists,
+        git_dir_exists,
+        branch_freshness,
+        trust_gate_allowed,
+        trusted_roots_count: trusted_roots.len(),
+        required_binaries: vec![
+            BinaryPreflight {
+                name: "claw",
+                available: env::current_exe().is_ok_and(|path| path.exists()),
+            },
+            BinaryPreflight {
+                name: "git",
+                available: command_available("git"),
+            },
+            BinaryPreflight {
+                name: "tmux",
+                available: command_available("tmux"),
+            },
+        ],
+        control_sockets: vec![tmux_control_socket_preflight()],
+        mcp_startup_eligible: config_ok,
+        mcp_servers_configured: mcp_configured,
+        plugin_startup_eligible: config_ok,
+        plugins_configured: plugin_configured,
+        last_failed_boot_reason: last_failed_boot_reason(cwd),
+    }
+}
+
+fn run_git_bool(cwd: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn tmux_control_socket_preflight() -> ControlSocketPreflight {
+    let path = env::var("TMUX")
+        .ok()
+        .and_then(|value| value.split(',').next().map(str::to_string))
+        .filter(|value| !value.is_empty());
+    let exists = path.as_ref().is_some_and(|path| Path::new(path).exists());
+    ControlSocketPreflight {
+        name: "tmux",
+        configured: path.is_some(),
+        exists,
+        path,
+    }
+}
+
+fn last_failed_boot_reason(cwd: &Path) -> Option<String> {
+    env::var("CLAW_LAST_FAILED_BOOT_REASON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            fs::read_to_string(cwd.join(".claw").join("last-failed-boot.txt"))
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn path_matches_trusted_root_local(cwd: &Path, trusted_root: &str) -> bool {
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let trusted_root = Path::new(trusted_root);
+    let trusted_root = if trusted_root.is_absolute() {
+        trusted_root.to_path_buf()
+    } else {
+        cwd.join(trusted_root)
+    };
+    let trusted_root = fs::canonicalize(&trusted_root).unwrap_or(trusted_root);
+    cwd == trusted_root || cwd.starts_with(trusted_root)
 }
 
 fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
@@ -5810,6 +6163,8 @@ fn status_json_value(
                 path.file_stem().map(|n| n.to_string_lossy().into_owned())
             }),
             "session_lifecycle": context.session_lifecycle.json_value(),
+            "branch_freshness": context.branch_freshness.json_value(),
+            "boot_preflight": context.boot_preflight.json_value(),
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
@@ -5843,7 +6198,8 @@ fn status_context(
     // so that one malformed `mcpServers.*` entry doesn't take down the whole
     // health surface (workspace, git, model, permission, sandbox can still be
     // reported independently).
-    let (loaded_config_files, sandbox_status, config_load_error) = match loader.load() {
+    let runtime_config = loader.load();
+    let (loaded_config_files, sandbox_status, config_load_error) = match runtime_config.as_ref() {
         Ok(runtime_config) => (
             runtime_config.loaded_entries().len(),
             resolve_sandbox_status(runtime_config.sandbox(), &cwd),
@@ -5864,6 +6220,14 @@ fn status_context(
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let branch_freshness = BranchFreshness::from_git_status(project_context.git_status.as_deref());
+    let boot_preflight = build_boot_preflight_snapshot(
+        &cwd,
+        project_root.as_deref(),
+        project_context.git_status.as_deref(),
+        runtime_config.as_ref().ok(),
+        config_load_error.as_deref(),
+    );
     Ok(StatusContext {
         cwd: cwd.clone(),
         session_path: session_path.map(Path::to_path_buf),
@@ -5873,7 +6237,9 @@ fn status_context(
         project_root,
         git_branch,
         git_summary,
+        branch_freshness,
         session_lifecycle: classify_session_lifecycle_for(&cwd),
+        boot_preflight,
         sandbox_status,
         config_load_error,
     })
@@ -5948,6 +6314,8 @@ fn format_status_report(
   Untracked        {}
   Session          {}
   Lifecycle        {}
+  Branch fresh     {}
+  Boot preflight   {}
   Config files     loaded {}/{}
   Memory files     {}
   Suggested flow   /status → /diff → /commit",
@@ -5967,6 +6335,12 @@ fn format_status_report(
                 |path| path.display().to_string()
             ),
             context.session_lifecycle.signal(),
+            context
+                .branch_freshness
+                .fresh
+                .map(|fresh| if fresh { "yes" } else { "behind" })
+                .unwrap_or("no upstream"),
+            context.boot_preflight.summary(),
             context.loaded_config_files,
             context.discovered_config_files,
             context.memory_file_count,
@@ -12119,6 +12493,33 @@ mod tests {
         assert!(report.contains("Switch models with /model <name>"));
     }
 
+    fn test_branch_freshness() -> super::BranchFreshness {
+        super::BranchFreshness {
+            upstream: Some("origin/main".to_string()),
+            ahead: 0,
+            behind: 0,
+            fresh: Some(true),
+        }
+    }
+
+    fn test_boot_preflight() -> super::BootPreflightSnapshot {
+        super::BootPreflightSnapshot {
+            repo_exists: true,
+            worktree_exists: true,
+            git_dir_exists: true,
+            branch_freshness: test_branch_freshness(),
+            trust_gate_allowed: Some(false),
+            trusted_roots_count: 0,
+            required_binaries: Vec::new(),
+            control_sockets: Vec::new(),
+            mcp_startup_eligible: true,
+            mcp_servers_configured: 0,
+            plugin_startup_eligible: true,
+            plugins_configured: 0,
+            last_failed_boot_reason: None,
+        }
+    }
+
     #[test]
     fn model_switch_report_preserves_context_summary() {
         let report = format_model_switch_report("claude-sonnet", "claude-opus", 9);
@@ -12165,6 +12566,7 @@ mod tests {
                     untracked_files: 1,
                     conflicted_files: 0,
                 },
+                branch_freshness: test_branch_freshness(),
                 session_lifecycle: SessionLifecycleSummary {
                     kind: SessionLifecycleKind::IdleShell,
                     pane_id: Some("%7".to_string()),
@@ -12173,6 +12575,7 @@ mod tests {
                     workspace_dirty: true,
                     abandoned: true,
                 },
+                boot_preflight: test_boot_preflight(),
                 sandbox_status: runtime::SandboxStatus::default(),
                 config_load_error: None,
             },
@@ -12300,6 +12703,7 @@ mod tests {
             project_root: Some(PathBuf::from("/tmp/project")),
             git_branch: Some("feature/session-lifecycle".to_string()),
             git_summary: GitWorkspaceSummary::default(),
+            branch_freshness: test_branch_freshness(),
             session_lifecycle: SessionLifecycleSummary {
                 kind: SessionLifecycleKind::RunningProcess,
                 pane_id: Some("%9".to_string()),
@@ -12308,6 +12712,7 @@ mod tests {
                 workspace_dirty: false,
                 abandoned: false,
             },
+            boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
             config_load_error: None,
         };
@@ -12336,6 +12741,67 @@ mod tests {
             "claw"
         );
         assert_eq!(value["workspace"]["session_lifecycle"]["abandoned"], false);
+        assert_eq!(value["workspace"]["branch_freshness"]["fresh"], true);
+        assert_eq!(
+            value["workspace"]["boot_preflight"]["repo"]["worktree_exists"],
+            true
+        );
+        assert_eq!(
+            value["workspace"]["boot_preflight"]["mcp_startup"]["eligible"],
+            true
+        );
+        assert_eq!(
+            value["workspace"]["boot_preflight"]["last_failed_boot_reason"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn branch_freshness_parses_ahead_behind_status_header() {
+        let freshness = super::BranchFreshness::from_git_status(Some(
+            "## feature/boot...origin/feature/boot [ahead 2, behind 3]\n M src/main.rs",
+        ));
+
+        assert_eq!(freshness.upstream.as_deref(), Some("origin/feature/boot"));
+        assert_eq!(freshness.ahead, 2);
+        assert_eq!(freshness.behind, 3);
+        assert_eq!(freshness.fresh, Some(false));
+    }
+
+    #[test]
+    fn boot_preflight_snapshot_reports_machine_readable_contract_fields() {
+        let _guard = env_lock();
+        let workspace = temp_workspace("boot-preflight-json");
+        fs::create_dir_all(&workspace).expect("workspace should create");
+        git(&["init", "--quiet"], &workspace);
+        git(&["config", "user.email", "tests@example.com"], &workspace);
+        git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
+        fs::write(workspace.join("tracked.txt"), "hello\n").expect("write tracked");
+        fs::write(workspace.join(".claw.json"), r#"{"trustedRoots": ["."]}"#)
+            .expect("write config");
+        git(&["add", "tracked.txt"], &workspace);
+        git(&["commit", "-m", "init", "--quiet"], &workspace);
+
+        let loader = ConfigLoader::default_for(&workspace);
+        let config = loader.load().expect("config should load");
+        let status = super::run_git_capture_in(&workspace, &["status", "--short", "--branch"]);
+        let snapshot = super::build_boot_preflight_snapshot(
+            &workspace,
+            Some(&workspace),
+            status.as_deref(),
+            Some(&config),
+            None,
+        );
+        let json = snapshot.json_value();
+
+        assert_eq!(json["repo"]["exists"], true);
+        assert_eq!(json["repo"]["worktree_exists"], true);
+        assert_eq!(json["trust_gate"]["allowlisted"], true);
+        assert_eq!(json["mcp_startup"]["eligible"], true);
+        assert!(json["required_binaries"]
+            .as_array()
+            .is_some_and(|items| { items.iter().any(|item| item["name"] == "git") }));
+        fs::remove_dir_all(workspace).expect("cleanup temp dir");
     }
 
     #[test]

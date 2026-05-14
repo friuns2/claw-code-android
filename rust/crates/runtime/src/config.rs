@@ -414,6 +414,17 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    /// Merge config-level default trusted roots with per-call roots.
+    ///
+    /// Config roots are defaults and are kept first; per-call roots extend the
+    /// allowlist for a specific worker/session creation request. Duplicates are
+    /// removed without reordering the first occurrence so evidence remains
+    /// deterministic while avoiding repeated trust checks.
+    #[must_use]
+    pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
+        merge_trusted_roots(self.trusted_roots(), per_call_roots)
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -483,6 +494,22 @@ impl RuntimeFeatureConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
     }
+
+    /// Merge this config's default trusted roots with per-call roots.
+    #[must_use]
+    pub fn trusted_roots_with_overrides(&self, per_call_roots: &[String]) -> Vec<String> {
+        merge_trusted_roots(self.trusted_roots(), per_call_roots)
+    }
+}
+
+fn merge_trusted_roots(config_roots: &[String], per_call_roots: &[String]) -> Vec<String> {
+    let mut merged = Vec::with_capacity(config_roots.len() + per_call_roots.len());
+    for root in config_roots.iter().chain(per_call_roots.iter()) {
+        if !merged.contains(root) {
+            merged.push(root.clone());
+        }
+    }
+    merged
 }
 
 impl ProviderFallbackConfig {
@@ -1245,8 +1272,8 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
+        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1500,6 +1527,51 @@ mod tests {
         assert_eq!(roots, ["/tmp/worktrees", "/home/user/projects"]);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn trusted_roots_with_overrides_preserves_config_defaults_and_adds_per_call_roots() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"trustedRoots": ["/tmp/config-default", "/tmp/shared"]}"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let merged = loaded.trusted_roots_with_overrides(&[
+            "/tmp/per-call".to_string(),
+            "/tmp/shared".to_string(),
+        ]);
+
+        // then
+        assert_eq!(
+            merged,
+            ["/tmp/config-default", "/tmp/shared", "/tmp/per-call"]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn runtime_feature_trusted_roots_with_overrides_matches_runtime_config_merge() {
+        let config = RuntimeFeatureConfig {
+            trusted_roots: vec!["/tmp/config".to_string()],
+            ..RuntimeFeatureConfig::default()
+        };
+
+        assert_eq!(
+            config.trusted_roots_with_overrides(&["/tmp/per-call".to_string()]),
+            ["/tmp/config", "/tmp/per-call"]
+        );
     }
 
     #[test]

@@ -92,6 +92,32 @@ fn status_and_sandbox_emit_json_when_requested() {
 }
 
 #[test]
+fn status_json_surfaces_permission_mode_override_for_security_audit() {
+    let root = unique_temp_dir("status-json-permission-mode");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let parsed = assert_json_command(
+        &root,
+        &[
+            "--permission-mode",
+            "read-only",
+            "--output-format",
+            "json",
+            "status",
+        ],
+    );
+
+    assert_eq!(parsed["kind"], "status");
+    assert_eq!(parsed["permission_mode"], "read-only");
+    assert!(
+        parsed["workspace"]["cwd"].as_str().is_some(),
+        "status JSON should retain workspace context with permission mode"
+    );
+
+    fs::remove_dir_all(root).expect("cleanup temp dir");
+}
+
+#[test]
 fn acp_guidance_emits_json_when_requested() {
     let root = unique_temp_dir("acp-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
@@ -284,7 +310,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(summary["failures"].as_u64().is_some());
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 6);
+    assert_eq!(checks.len(), 7);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -301,6 +327,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
             "config",
             "install source",
             "workspace",
+            "boot preflight",
             "sandbox",
             "system"
         ]
@@ -325,6 +352,14 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .expect("workspace check");
     assert!(workspace["cwd"].as_str().is_some());
     assert!(workspace["in_git_repo"].is_boolean());
+
+    let boot_preflight = checks
+        .iter()
+        .find(|check| check["name"] == "boot preflight")
+        .expect("boot preflight check");
+    assert!(boot_preflight["boot_preflight"]["repo"]["exists"].is_boolean());
+    assert!(boot_preflight["boot_preflight"]["mcp_startup"]["eligible"].is_boolean());
+    assert!(boot_preflight["boot_preflight"]["required_binaries"].is_array());
 
     let sandbox = checks
         .iter()
