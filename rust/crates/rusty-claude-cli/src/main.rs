@@ -45,11 +45,11 @@ use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    ApiClient, ApiRequest, AssistantEvent, BaseCommitState, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -1973,6 +1973,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
     let branch_freshness = BranchFreshness::from_git_status(project_context.git_status.as_deref());
+    let stale_base_state = stale_base_state_for(&cwd, None);
     let empty_config = runtime::RuntimeConfig::empty();
     let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
     let boot_preflight = build_boot_preflight_snapshot(
@@ -1995,6 +1996,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         git_branch,
         git_summary,
         branch_freshness,
+        stale_base_state,
         session_lifecycle: classify_session_lifecycle_for(&cwd),
         boot_preflight,
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
@@ -2334,9 +2336,10 @@ fn check_install_source_health() -> DiagnosticCheck {
 
 fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
+    let stale_base_warning = format_stale_base_warning(&context.stale_base_state);
     DiagnosticCheck::new(
         "Workspace",
-        if in_repo {
+        if in_repo && stale_base_warning.is_none() {
             DiagnosticLevel::Ok
         } else {
             DiagnosticLevel::Warn
@@ -2369,6 +2372,10 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             "Memory files     {} · config files loaded {}/{}",
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
         ),
+        format!(
+            "Stale base      {}",
+            stale_base_warning.as_deref().unwrap_or("ok")
+        ),
     ])
     .with_data(Map::from_iter([
         ("cwd".to_string(), json!(context.cwd.display().to_string())),
@@ -2400,6 +2407,10 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
         (
             "discovered_config_files".to_string(),
             json!(context.discovered_config_files),
+        ),
+        (
+            "stale_base".to_string(),
+            stale_base_json_value(&context.stale_base_state),
         ),
     ]))
 }
@@ -2920,6 +2931,7 @@ struct StatusContext {
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
     branch_freshness: BranchFreshness,
+    stale_base_state: BaseCommitState,
     session_lifecycle: SessionLifecycleSummary,
     boot_preflight: BootPreflightSnapshot,
     sandbox_status: runtime::SandboxStatus,
@@ -4167,12 +4179,30 @@ fn enforce_broad_cwd_policy(
     }
 }
 
+fn stale_base_state_for(cwd: &Path, flag_value: Option<&str>) -> BaseCommitState {
+    let source = resolve_expected_base(flag_value, cwd);
+    check_base_commit(cwd, source.as_ref())
+}
+
+fn stale_base_json_value(state: &BaseCommitState) -> serde_json::Value {
+    match state {
+        BaseCommitState::Matches => json!({"status": "matches", "fresh": true}),
+        BaseCommitState::Diverged { expected, actual } => json!({
+            "status": "diverged",
+            "fresh": false,
+            "expected": expected,
+            "actual": actual,
+        }),
+        BaseCommitState::NoExpectedBase => json!({"status": "no_expected_base", "fresh": null}),
+        BaseCommitState::NotAGitRepo => json!({"status": "not_git_repo", "fresh": null}),
+    }
+}
+
 fn run_stale_base_preflight(flag_value: Option<&str>) {
     let Ok(cwd) = env::current_dir() else {
         return;
     };
-    let source = resolve_expected_base(flag_value, &cwd);
-    let state = check_base_commit(&cwd, source.as_ref());
+    let state = stale_base_state_for(&cwd, flag_value);
     if let Some(warning) = format_stale_base_warning(&state) {
         eprintln!("{warning}");
     }
@@ -6221,6 +6251,7 @@ fn status_context(
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
     let branch_freshness = BranchFreshness::from_git_status(project_context.git_status.as_deref());
+    let stale_base_state = stale_base_state_for(&cwd, None);
     let boot_preflight = build_boot_preflight_snapshot(
         &cwd,
         project_root.as_deref(),
@@ -6238,6 +6269,7 @@ fn status_context(
         git_branch,
         git_summary,
         branch_freshness,
+        stale_base_state,
         session_lifecycle: classify_session_lifecycle_for(&cwd),
         boot_preflight,
         sandbox_status,
@@ -12567,6 +12599,7 @@ mod tests {
                     conflicted_files: 0,
                 },
                 branch_freshness: test_branch_freshness(),
+                stale_base_state: super::BaseCommitState::NoExpectedBase,
                 session_lifecycle: SessionLifecycleSummary {
                     kind: SessionLifecycleKind::IdleShell,
                     pane_id: Some("%7".to_string()),
@@ -12693,6 +12726,46 @@ mod tests {
     }
 
     #[test]
+    fn workspace_health_warns_when_stale_base_diverged() {
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/project"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: Some(PathBuf::from("/tmp/project")),
+            git_branch: Some("feature/stale-base".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            branch_freshness: test_branch_freshness(),
+            stale_base_state: super::BaseCommitState::Diverged {
+                expected: "base".to_string(),
+                actual: "head".to_string(),
+            },
+            session_lifecycle: SessionLifecycleSummary {
+                kind: SessionLifecycleKind::SavedOnly,
+                pane_id: None,
+                pane_command: None,
+                pane_path: None,
+                workspace_dirty: false,
+                abandoned: false,
+            },
+            boot_preflight: test_boot_preflight(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            config_load_error: None,
+        };
+
+        let check = super::check_workspace_health(&context);
+
+        assert_eq!(check.level, super::DiagnosticLevel::Warn);
+        assert_eq!(check.data["stale_base"]["status"], "diverged");
+        assert_eq!(check.data["stale_base"]["fresh"], false);
+        assert!(check
+            .details
+            .iter()
+            .any(|detail| detail.contains("stale codebase")));
+    }
+
+    #[test]
     fn status_json_surfaces_session_lifecycle_for_clawhip() {
         let context = super::StatusContext {
             cwd: PathBuf::from("/tmp/project"),
@@ -12704,6 +12777,7 @@ mod tests {
             git_branch: Some("feature/session-lifecycle".to_string()),
             git_summary: GitWorkspaceSummary::default(),
             branch_freshness: test_branch_freshness(),
+            stale_base_state: super::BaseCommitState::NoExpectedBase,
             session_lifecycle: SessionLifecycleSummary {
                 kind: SessionLifecycleKind::RunningProcess,
                 pane_id: Some("%9".to_string()),

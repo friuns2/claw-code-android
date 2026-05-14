@@ -58,7 +58,9 @@ impl PolicyCondition {
             Self::Or(conditions) => conditions
                 .iter()
                 .any(|condition| condition.matches(context)),
-            Self::GreenAt { level } => context.green_level >= *level,
+            Self::GreenAt { level } => {
+                context.green_contract_satisfied && context.green_level >= *level
+            }
             Self::StaleBranch => context.branch_freshness >= STALE_BRANCH_THRESHOLD,
             Self::StartupBlocked => context.blocker == LaneBlocker::Startup,
             Self::LaneCompleted => context.completed,
@@ -134,6 +136,7 @@ pub enum DiffScope {
 pub struct LaneContext {
     pub lane_id: String,
     pub green_level: GreenLevel,
+    pub green_contract_satisfied: bool,
     pub branch_freshness: Duration,
     pub blocker: LaneBlocker,
     pub review_status: ReviewStatus,
@@ -156,6 +159,7 @@ impl LaneContext {
         Self {
             lane_id: lane_id.into(),
             green_level,
+            green_contract_satisfied: false,
             branch_freshness,
             blocker,
             review_status,
@@ -171,6 +175,7 @@ impl LaneContext {
         Self {
             lane_id: lane_id.into(),
             green_level: 0,
+            green_contract_satisfied: false,
             branch_freshness: Duration::from_secs(0),
             blocker: LaneBlocker::None,
             review_status: ReviewStatus::Pending,
@@ -178,6 +183,12 @@ impl LaneContext {
             completed: true,
             reconciled: true,
         }
+    }
+
+    #[must_use]
+    pub fn with_green_contract_satisfied(mut self, satisfied: bool) -> Self {
+        self.green_contract_satisfied = satisfied;
+        self
     }
 }
 
@@ -257,13 +268,44 @@ mod tests {
             ReviewStatus::Approved,
             DiffScope::Scoped,
             false,
-        );
+        )
+        .with_green_contract_satisfied(true);
 
         // when
         let actions = engine.evaluate(&context);
 
         // then
         assert_eq!(actions, vec![PolicyAction::MergeToDev]);
+    }
+
+    #[test]
+    fn merge_rule_blocks_when_green_tests_lack_contract_provenance() {
+        // given
+        let engine = PolicyEngine::new(vec![PolicyRule::new(
+            "merge-to-dev",
+            PolicyCondition::And(vec![
+                PolicyCondition::GreenAt { level: 2 },
+                PolicyCondition::ScopedDiff,
+                PolicyCondition::ReviewPassed,
+            ]),
+            PolicyAction::MergeToDev,
+            20,
+        )]);
+        let context = LaneContext::new(
+            "lane-7",
+            3,
+            Duration::from_secs(5),
+            LaneBlocker::None,
+            ReviewStatus::Approved,
+            DiffScope::Scoped,
+            false,
+        );
+
+        // when
+        let actions = engine.evaluate(&context);
+
+        // then
+        assert!(actions.is_empty());
     }
 
     #[test]
@@ -468,7 +510,8 @@ mod tests {
             ReviewStatus::Pending,
             DiffScope::Full,
             false,
-        );
+        )
+        .with_green_contract_satisfied(true);
 
         // when
         let actions = engine.evaluate(&context);

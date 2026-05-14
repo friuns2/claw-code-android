@@ -56,6 +56,7 @@ pub(crate) fn detect_lane_completion(
     Some(LaneContext {
         lane_id: output.agent_id.clone(),
         green_level: 3, // Workspace green
+        green_contract_satisfied: true,
         branch_freshness: std::time::Duration::from_secs(0),
         blocker: LaneBlocker::None,
         review_status: ReviewStatus::Approved,
@@ -165,6 +166,7 @@ mod tests {
         let context = LaneContext {
             lane_id: "completed-lane".to_string(),
             green_level: 3,
+            green_contract_satisfied: true,
             branch_freshness: std::time::Duration::from_secs(0),
             blocker: LaneBlocker::None,
             review_status: ReviewStatus::Approved,

@@ -96,9 +96,7 @@ fn green_contract_unsatisfied_blocks_merge() {
         false,
     );
 
-    // This is a conceptual test — we need a way to express "requires workspace green"
-    // Currently LaneContext has raw green_level: u8, not a contract
-    // For now we just verify the policy condition works
+    // The context has a test level but lacks the full green contract, so merge stays blocked.
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "workspace-green-required",
         PolicyCondition::GreenAt { level: 3 }, // GreenLevel::Workspace
@@ -267,7 +265,8 @@ fn fresh_approved_lane_gets_merge_action() {
         ReviewStatus::Approved,
         DiffScope::Scoped,
         false,
-    );
+    )
+    .with_green_contract_satisfied(true);
 
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "merge-if-green-approved-not-stale",
@@ -357,7 +356,8 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
         ReviewStatus::Approved,
         DiffScope::Scoped,
         false,
-    );
+    )
+    .with_green_contract_satisfied(true);
 
     let policy_engine = PolicyEngine::new(vec![
         // Rule: if recovered from failure + green + approved -> merge

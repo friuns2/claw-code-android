@@ -1503,8 +1503,10 @@ fn run_worker_create(input: WorkerCreateInput) -> Result<String, String> {
     let merged_roots: Vec<String> = ConfigLoader::default_for(&input.cwd)
         .load()
         .ok()
-        .map(|config| config.trusted_roots_with_overrides(&input.trusted_roots))
-        .unwrap_or_else(|| input.trusted_roots.clone());
+        .map_or_else(
+            || input.trusted_roots.clone(),
+            |config| config.trusted_roots_with_overrides(&input.trusted_roots),
+        );
     let worker = global_worker_registry().create(
         &input.cwd,
         &merged_roots,
@@ -6212,6 +6214,8 @@ Command exceeded timeout of {timeout_ms} ms",
                         stderr.trim_end()
                     )
                 };
+                let is_test = is_test_command(command);
+                let return_code_interpretation = if is_test { "test.hung" } else { "timeout" };
                 return Ok(runtime::BashCommandOutput {
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr,
@@ -6222,9 +6226,11 @@ Command exceeded timeout of {timeout_ms} ms",
                     backgrounded_by_user: None,
                     assistant_auto_backgrounded: None,
                     dangerously_disable_sandbox: None,
-                    return_code_interpretation: Some(String::from("timeout")),
+                    return_code_interpretation: Some(String::from(return_code_interpretation)),
                     no_output_expected: Some(false),
-                    structured_content: None,
+                    structured_content: Some(vec![test_timeout_provenance(
+                        command, timeout_ms, is_test,
+                    )]),
                     persisted_output_path: None,
                     persisted_output_size: None,
                     sandbox_status: None,
@@ -6255,6 +6261,37 @@ Command exceeded timeout of {timeout_ms} ms",
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
+    })
+}
+
+fn is_test_command(command: &str) -> bool {
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    normalized.contains("cargo test")
+        || normalized.contains("cargo nextest")
+        || normalized.contains("npm test")
+        || normalized.contains("pnpm test")
+        || normalized.contains("yarn test")
+        || normalized.contains("pytest")
+}
+
+fn test_timeout_provenance(
+    command: &str,
+    timeout_ms: u64,
+    classified_as_test_hang: bool,
+) -> serde_json::Value {
+    json!({
+        "event": if classified_as_test_hang { "test.hung" } else { "command.timeout" },
+        "failureClass": if classified_as_test_hang { "test_hang" } else { "timeout" },
+        "data": {
+            "command": command,
+            "timeoutMs": timeout_ms,
+            "provenance": "shell.timeout",
+            "classification": if classified_as_test_hang { "test.hung" } else { "timeout" }
+        }
     })
 }
 
@@ -9025,6 +9062,23 @@ mod tests {
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
         assert_eq!(background_output["noOutputExpected"], true);
+    }
+
+    #[test]
+    fn bash_tool_classifies_test_timeout_as_hung_with_provenance() {
+        let timeout = execute_tool(
+            "bash",
+            &json!({ "command": "sleep 1 # cargo test slow_case", "timeout": 10 }),
+        )
+        .expect("bash timeout should return output");
+        let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
+        assert_eq!(timeout_output["interrupted"], true);
+        assert_eq!(timeout_output["returnCodeInterpretation"], "test.hung");
+        assert_eq!(timeout_output["structuredContent"][0]["event"], "test.hung");
+        assert_eq!(
+            timeout_output["structuredContent"][0]["data"]["provenance"],
+            "bash.timeout"
+        );
     }
 
     #[test]
