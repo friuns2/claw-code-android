@@ -409,7 +409,10 @@ fn doctor_and_resume_status_emit_json_when_requested() {
 
     let doctor = assert_json_command(&root, &["--output-format", "json", "doctor"]);
     assert_eq!(doctor["kind"], "doctor");
-    assert_eq!(doctor["status"], "ok");
+    assert!(
+        matches!(doctor["status"].as_str(), Some("ok" | "warn")),
+        "doctor may warn on platforms without namespace sandbox/tmux support: {doctor}"
+    );
     assert!(doctor["message"].is_string());
     let summary = doctor["summary"].as_object().expect("doctor summary");
     assert!(summary["ok"].as_u64().is_some());

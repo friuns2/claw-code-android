@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-05-14T07:53:46.061Z",
-  "updatedAt": "2026-05-15T02:55:26.988Z",
+  "updatedAt": "2026-05-15T04:38:54.887Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -142,10 +142,12 @@
       "id": "G012-final-gate",
       "title": "Final release gate: Verify Claw Code 2.0 delivery",
       "objective": "Run final cross-stream quality gate: roadmap board has no unmapped actionable items, fmt/clippy/tests and focused contract suites pass, ai-slop-cleaner on changed files passes/no-ops, code-review approves, and final alpha/beta/GA readiness report is written. Final completion is blocked until docs/pr-issue-resolution-gate.md has fresh evidence showing every open PR and issue was triaged, with correct PRs merged and resolvable correct issues fixed or closed.",
-      "status": "pending",
+      "status": "complete",
       "attempt": 0,
       "createdAt": "2026-05-14T07:54:21.409575Z",
-      "updatedAt": "2026-05-14T07:54:21.409575Z"
+      "updatedAt": "2026-05-15T04:38:54.887Z",
+      "evidence": "G012-final-gate complete: team g012-final-gate-ultra-e61d2271 8/8 tasks complete; final gate log /tmp/g012-final-quality-gate-pass4.log; commit 04c2abb pushed; docs/pr-triage-g012-final-gate.json docs/pr-issue-resolution-gate.md docs/g012-final-release-readiness-report.md; .omx/ultragoal/goals.json and ledger.jsonl updated; aiSlopCleaner and codeReview evidence included in quality gate JSON.",
+      "completedAt": "2026-05-15T04:38:54.887Z"
     }
   ],
   "codexObjective": "Complete the approved Claw Code 2.0 ultragoal delivery: implement all classified ROADMAP.md backlog work through execution-sized stream goals G001-G012, using .omx/ultragoal/ledger.jsonl as the durable audit trail and .omx/plans/claw-code-2-0-adaptive-plan.md as the source plan."

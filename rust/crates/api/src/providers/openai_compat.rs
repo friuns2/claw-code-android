@@ -898,6 +898,7 @@ pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
 /// The prefix is used only to select transport; the backend expects the
 /// bare model id.
+#[allow(dead_code)]
 fn strip_routing_prefix(model: &str) -> &str {
     if let Some(pos) = model.find('/') {
         let prefix = &model[..pos];

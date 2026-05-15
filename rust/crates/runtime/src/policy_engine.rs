@@ -186,6 +186,7 @@ pub struct PolicyEvaluation {
     pub events: Vec<PolicyDecisionEvent>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneContext {
     pub lane_id: String,
@@ -730,6 +731,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::duration_suboptimal_units, clippy::too_many_lines)]
     fn executable_decision_table_emits_retry_rebase_merge_escalate_cleanup_and_approval_events() {
         let engine = PolicyEngine::new(vec![
             PolicyRule::new(

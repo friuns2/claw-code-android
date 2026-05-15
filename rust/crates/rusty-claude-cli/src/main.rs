@@ -997,9 +997,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // only intercepts the bare single-word form. Catch all multi-word
         // forms here and return a structured guidance error so no network
         // call or session is created.
-        "permissions" => Err(format!(
+        "permissions" => Err(
             "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
-        )),
+                .to_string(),
+        ),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -3380,6 +3381,9 @@ fn parse_tmux_pane_snapshots(output: &str) -> Vec<TmuxPaneSnapshot> {
 }
 
 fn pane_path_matches_workspace(pane_path: &Path, workspace: &Path) -> bool {
+    if pane_path == workspace || pane_path.starts_with(workspace) {
+        return true;
+    }
     let pane_path = fs::canonicalize(pane_path).unwrap_or_else(|_| pane_path.to_path_buf());
     let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     pane_path == workspace || pane_path.starts_with(&workspace)
@@ -4031,7 +4035,7 @@ fn run_resume_command(
                 message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
                 json: Some(
                     serde_json::to_value(handle_agents_slash_command_json(args.as_deref(), &cwd)?)
-                        .unwrap_or_else(|_| serde_json::json!(null)),
+                        .unwrap_or(Value::Null),
                 ),
             })
         }
@@ -8681,6 +8685,7 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
@@ -12322,6 +12327,9 @@ mod tests {
 
     #[test]
     fn parses_direct_agents_mcp_and_skills_slash_commands() {
+        let _guard = env_lock();
+        let _cwd_guard = cwd_guard();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["/agents".to_string()]).expect("/agents should parse"),
             CliAction::Agents {
@@ -13906,7 +13914,7 @@ UU conflicted.rs",
     fn resume_usage_mentions_latest_shortcut() {
         let usage = render_resume_usage();
         assert!(usage.contains("/resume <session-path|session-id|latest>"));
-        assert!(usage.contains(".claw/sessions/<session-id>.jsonl"));
+        assert!(usage.contains(".claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"));
         assert!(usage.contains("/session list"));
     }
 

@@ -41,6 +41,17 @@ The anti-slop classifications are: `actionable-bug`, `actionable-docs`, `actiona
 
 Automation lanes may recommend labels, comments, defer/close rationales, or merge candidates, but must not merge or close remote PRs/issues without maintainer-owned approval.
 
+
+## G012 final PR reconciliation snapshot
+
+Worker-3 captured a fresh PR ledger for the final Claw Code 2.0 gate in `docs/pr-triage-g012-final-gate.json`.
+
+- Captured on: 2026-05-15T02:58:00Z during G012 final-gate execution.
+- Commands: `gh pr list --state open --limit 100 ...` plus `gh pr view <number> ...` for per-PR file and merge-state evidence.
+- Observed count: 51 open PR records.
+- Merge action taken by worker-3: none. The safety policy requires correct, safe, non-conflicting, resolvable PRs with evidence; this snapshot found 32 PRs in `CONFLICTING`/`DIRTY` state and 19 `MERGEABLE` PRs that GitHub reported as `UNSTABLE` with no fresh check-rollup evidence in the live snapshot.
+- Docs-only candidate-review PRs: #3021 and #2824 remain deferred until content/source-of-truth review and fresh verification are available.
+
 ## Required final evidence
 
 The final report must include:

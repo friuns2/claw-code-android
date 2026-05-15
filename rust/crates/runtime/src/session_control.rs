@@ -163,6 +163,7 @@ impl SessionStore {
         })
     }
 
+    #[must_use]
     pub fn session_exists(&self, reference: &str) -> bool {
         self.resolve_reference(reference).is_ok()
     }

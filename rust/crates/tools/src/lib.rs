@@ -1214,7 +1214,7 @@ fn execute_tool_with_enforcer(
         }
         "read_file" => {
             let file_input: ReadFileInput = from_value(input)?;
-            let required_mode = classify_file_path_permission(&file_input.path, false);
+            let required_mode = classify_read_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             run_read_file(file_input)
         }
@@ -2219,6 +2219,14 @@ fn classify_file_path_permission(path: &str, allow_missing: bool) -> PermissionM
     }
 }
 
+fn classify_read_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
+    if path_within_current_workspace(path, allow_missing) {
+        PermissionMode::ReadOnly
+    } else {
+        PermissionMode::DangerFullAccess
+    }
+}
+
 fn classify_glob_permission(input: &GlobSearchInputValue) -> PermissionMode {
     let base_allowed = input
         .path
@@ -2226,7 +2234,7 @@ fn classify_glob_permission(input: &GlobSearchInputValue) -> PermissionMode {
         .is_none_or(|path| path_within_current_workspace(path, false));
     let pattern_allowed = path_within_current_workspace(&input.pattern, true);
     if base_allowed && pattern_allowed {
-        PermissionMode::WorkspaceWrite
+        PermissionMode::ReadOnly
     } else {
         PermissionMode::DangerFullAccess
     }
@@ -2238,7 +2246,7 @@ fn classify_grep_permission(input: &GrepSearchInput) -> PermissionMode {
         .as_deref()
         .is_none_or(|path| path_within_current_workspace(path, false))
     {
-        PermissionMode::WorkspaceWrite
+        PermissionMode::ReadOnly
     } else {
         PermissionMode::DangerFullAccess
     }
@@ -7126,7 +7134,7 @@ mod tests {
             .expect_err("write tool should be denied before dispatch");
 
         // then
-        assert!(error.contains("requires workspace-write permission"));
+        assert!(error.contains("requires 'workspace-write' permission"));
     }
 
     #[test]
@@ -7151,7 +7159,7 @@ mod tests {
         // then
         assert!(error
             .to_string()
-            .contains("requires workspace-write permission"));
+            .contains("requires 'workspace-write' permission"));
     }
 
     #[test]
@@ -9926,7 +9934,7 @@ printf 'pwsh:%s' "$1"
             )
             .expect_err("write_file should be denied in read-only mode");
         assert!(
-            err.contains("current mode is read-only"),
+            err.contains("current mode is 'read-only'"),
             "should cite active mode: {err}"
         );
     }
@@ -9941,7 +9949,7 @@ printf 'pwsh:%s' "$1"
             )
             .expect_err("edit_file should be denied in read-only mode");
         assert!(
-            err.contains("current mode is read-only"),
+            err.contains("current mode is 'read-only'"),
             "should cite active mode: {err}"
         );
     }
