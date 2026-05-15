@@ -36,7 +36,8 @@ use commands::{
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
+    slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
+    SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -328,6 +329,59 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
         return trimmed.to_string();
     }
     format!("{prompt}\n\n{trimmed}")
+}
+
+fn plugin_command_json(
+    action: &str,
+    target: Option<&str>,
+    result: &commands::PluginsCommandResult,
+    report: &plugins::PluginRegistryReport,
+) -> Value {
+    let failures = report.failures();
+    json!({
+        "kind": "plugin",
+        "action": action,
+        "target": target,
+        "status": if failures.is_empty() { "ok" } else { "degraded" },
+        "message": result.message,
+        "reload_runtime": result.reload_runtime,
+        "plugins": report.summaries().iter().map(plugin_summary_json).collect::<Vec<_>>(),
+        "load_failures": failures.iter().map(plugin_load_failure_json).collect::<Vec<_>>(),
+    })
+}
+
+fn plugin_summary_json(plugin: &plugins::PluginSummary) -> Value {
+    json!({
+        "id": &plugin.metadata.id,
+        "name": &plugin.metadata.name,
+        "version": &plugin.metadata.version,
+        "description": &plugin.metadata.description,
+        "kind": plugin.metadata.kind.to_string(),
+        "source": &plugin.metadata.source,
+        "enabled": plugin.enabled,
+        "lifecycle_state": plugin.lifecycle_state(),
+        "lifecycle": {
+            "configured": !plugin.lifecycle.is_empty(),
+            "init": {
+                "configured": !plugin.lifecycle.init.is_empty(),
+                "command_count": plugin.lifecycle.init.len(),
+            },
+            "shutdown": {
+                "configured": !plugin.lifecycle.shutdown.is_empty(),
+                "command_count": plugin.lifecycle.shutdown.len(),
+            },
+        },
+    })
+}
+
+fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
+    json!({
+        "plugin_root": failure.plugin_root.display().to_string(),
+        "kind": failure.kind.to_string(),
+        "source": &failure.source,
+        "lifecycle_state": "load_failed",
+        "error": failure.error().to_string(),
+    })
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -1147,6 +1201,9 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "bootstrap-plan"
             | "agents"
             | "mcp"
+            | "plugin"
+            | "plugins"
+            | "marketplace"
             | "skills"
             | "system-prompt"
             | "init"
@@ -1914,6 +1971,17 @@ impl DoctorReport {
         self.checks.iter().any(|check| check.level.is_failure())
     }
 
+    fn status(&self) -> &'static str {
+        let (_, warn_count, fail_count) = self.counts();
+        if fail_count > 0 {
+            "fail"
+        } else if warn_count > 0 {
+            "warn"
+        } else {
+            "ok"
+        }
+    }
+
     fn render(&self) -> String {
         let (ok_count, warn_count, fail_count) = self.counts();
         let mut lines = vec![
@@ -1931,6 +1999,7 @@ impl DoctorReport {
         let (ok_count, warn_count, fail_count) = self.counts();
         json!({
             "kind": "doctor",
+            "status": self.status(),
             "message": report,
             "report": report,
             "has_failures": self.has_failures(),
@@ -3427,18 +3496,21 @@ fn format_permissions_switch_report(previous: &str, next: &str) -> String {
 }
 
 fn format_cost_report(usage: TokenUsage) -> String {
+    let estimated_cost = usage.estimate_cost_usd();
     format!(
         "Cost
   Input tokens     {}
   Output tokens    {}
   Cache create     {}
   Cache read       {}
-  Total tokens     {}",
+  Total tokens     {}
+  Estimated cost   {}",
         usage.input_tokens,
         usage.output_tokens,
         usage.cache_creation_input_tokens,
         usage.cache_read_input_tokens,
         usage.total_tokens(),
+        format_usd(estimated_cost.total_cost_usd()),
     )
 }
 
@@ -3842,6 +3914,8 @@ fn run_resume_command(
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                     "total_tokens": usage.total_tokens(),
+                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()),
+                    "pricing": "estimated-default",
                 })),
             })
         }
@@ -3954,22 +4028,22 @@ fn run_resume_command(
                 _ => {}
             }
             let cwd = env::current_dir()?;
-            let loader = ConfigLoader::default_for(&cwd);
-            let runtime_config = loader.load()?;
-            let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-            let result =
-                handle_plugins_slash_command(action.as_deref(), target.as_deref(), &mut manager)?;
+            let payload = plugins_command_payload_for(&cwd, action.as_deref(), target.as_deref())?;
             let action_str = action.as_deref().unwrap_or("list");
             let json = serde_json::json!({
                 "kind": "plugin",
                 "action": action_str,
                 "target": target,
-                "message": &result.message,
-                "reload_runtime": result.reload_runtime,
+                "status": payload.status,
+                "config_load_error": payload.config_load_error,
+                "message": &payload.message,
+                "reload_runtime": payload.reload_runtime,
+                "plugins": payload.plugins,
+                "load_failures": payload.load_failures,
             });
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(result.message),
+                message: Some(payload.message),
                 json: Some(json),
             })
         }
@@ -3993,6 +4067,8 @@ fn run_resume_command(
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                     "total_tokens": usage.total_tokens(),
+                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()),
+                    "pricing": "estimated-default",
                 })),
             })
         }
@@ -4475,7 +4551,10 @@ impl RuntimeMcpState {
                         runtime::McpLifecyclePhase::ToolDiscovery,
                         Some(failure.server_name.clone()),
                         failure.error.clone(),
-                        std::collections::BTreeMap::new(),
+                        std::collections::BTreeMap::from([(
+                            "required".to_string(),
+                            failure.required.to_string(),
+                        )]),
                         true,
                     ),
                 })
@@ -4487,10 +4566,13 @@ impl RuntimeMcpState {
                             runtime::McpLifecyclePhase::ServerRegistration,
                             Some(server.server_name.clone()),
                             server.reason.clone(),
-                            std::collections::BTreeMap::from([(
-                                "transport".to_string(),
-                                format!("{:?}", server.transport).to_ascii_lowercase(),
-                            )]),
+                            std::collections::BTreeMap::from([
+                                (
+                                    "transport".to_string(),
+                                    format!("{:?}", server.transport).to_ascii_lowercase(),
+                                ),
+                                ("required".to_string(), server.required.to_string()),
+                            ]),
                             false,
                         ),
                     }
@@ -5550,20 +5632,21 @@ impl LiveCli {
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        let loader = ConfigLoader::default_for(&cwd);
-        let runtime_config = loader.load()?;
-        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-        let result = handle_plugins_slash_command(action, target, &mut manager)?;
+        let payload = plugins_command_payload_for(&cwd, action, target)?;
         match output_format {
-            CliOutputFormat::Text => println!("{}", result.message),
+            CliOutputFormat::Text => println!("{}", payload.message),
             CliOutputFormat::Json => println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "kind": "plugin",
                     "action": action.unwrap_or("list"),
                     "target": target,
-                    "message": result.message,
-                    "reload_runtime": result.reload_runtime,
+                    "status": payload.status,
+                    "config_load_error": payload.config_load_error,
+                    "message": payload.message,
+                    "reload_runtime": payload.reload_runtime,
+                    "plugins": payload.plugins,
+                    "load_failures": payload.load_failures,
                 }))?
             ),
         }
@@ -5731,12 +5814,9 @@ impl LiveCli {
         target: Option<&str>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        let loader = ConfigLoader::default_for(&cwd);
-        let runtime_config = loader.load()?;
-        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-        let result = handle_plugins_slash_command(action, target, &mut manager)?;
-        println!("{}", result.message);
-        if result.reload_runtime {
+        let payload = plugins_command_payload_for(&cwd, action, target)?;
+        println!("{}", payload.message);
+        if payload.reload_runtime {
             self.reload_runtime_features()?;
         }
         Ok(false)
@@ -6171,11 +6251,26 @@ fn status_json_value(
         "usage": {
             "messages": usage.message_count,
             "turns": usage.turns,
+            "latest_input": usage.latest.input_tokens,
+            "latest_output": usage.latest.output_tokens,
+            "latest_cache_creation_input": usage.latest.cache_creation_input_tokens,
+            "latest_cache_read_input": usage.latest.cache_read_input_tokens,
             "latest_total": usage.latest.total_tokens(),
             "cumulative_input": usage.cumulative.input_tokens,
             "cumulative_output": usage.cumulative.output_tokens,
+            "cumulative_cache_creation_input": usage.cumulative.cache_creation_input_tokens,
+            "cumulative_cache_read_input": usage.cumulative.cache_read_input_tokens,
             "cumulative_total": usage.cumulative.total_tokens(),
+            "estimated_cost_usd": format_usd(usage.cumulative.estimate_cost_usd().total_cost_usd()),
+            "pricing": "estimated-default",
             "estimated_tokens": usage.estimated_tokens,
+        },
+        "lane_board": {
+            "schema": "task_registry_v1",
+            "status_json_supported": true,
+            "heartbeat_freshness_supported": true,
+            "states": ["active", "blocked", "finished"],
+            "freshness_states": ["healthy", "stalled", "transport_dead", "unknown"],
         },
         "workspace": {
             "cwd": context.cwd,
@@ -6328,11 +6423,17 @@ fn format_status_report(
   Latest total     {}
   Cumulative input {}
   Cumulative output {}
-  Cumulative total {}",
+  Cache create     {}
+  Cache read       {}
+  Cumulative total {}
+  Estimated cost   {}",
             usage.latest.total_tokens(),
             usage.cumulative.input_tokens,
             usage.cumulative.output_tokens,
+            usage.cumulative.cache_creation_input_tokens,
+            usage.cumulative.cache_read_input_tokens,
             usage.cumulative.total_tokens(),
+            format_usd(usage.cumulative.estimate_cost_usd().total_cost_usd()),
         ),
         format!(
             "Workspace
@@ -7676,6 +7777,63 @@ fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::E
         "unknown",
         model_family_identity_for(model),
     )?)
+}
+
+struct PluginsCommandPayload {
+    message: String,
+    reload_runtime: bool,
+    status: &'static str,
+    config_load_error: Option<String>,
+    plugins: Vec<Value>,
+    load_failures: Vec<Value>,
+}
+
+fn plugins_command_payload_for(
+    cwd: &Path,
+    action: Option<&str>,
+    target: Option<&str>,
+) -> Result<PluginsCommandPayload, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let (runtime_config, config_load_error) = match loader.load() {
+        Ok(runtime_config) => (runtime_config, None),
+        Err(error) => (runtime::RuntimeConfig::empty(), Some(error.to_string())),
+    };
+    let mut manager = build_plugin_manager(cwd, &loader, &runtime_config);
+    let result = handle_plugins_slash_command(action, target, &mut manager)?;
+    let report = manager.installed_plugin_registry_report()?;
+    Ok(plugins_command_payload_from_result(
+        result,
+        config_load_error,
+        &report,
+    ))
+}
+
+fn plugins_command_payload_from_result(
+    result: PluginsCommandResult,
+    config_load_error: Option<String>,
+    report: &plugins::PluginRegistryReport,
+) -> PluginsCommandPayload {
+    let failures = report.failures();
+    let status = if config_load_error.is_some() || !failures.is_empty() {
+        "degraded"
+    } else {
+        "ok"
+    };
+    let message = match config_load_error.as_deref() {
+        Some(error) => format!(
+            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial plugins view\n  Details          {error}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
+            result.message
+        ),
+        None => result.message,
+    };
+    PluginsCommandPayload {
+        message,
+        reload_runtime: result.reload_runtime,
+        status,
+        config_load_error,
+        plugins: report.summaries().iter().map(plugin_summary_json).collect(),
+        load_failures: failures.iter().map(plugin_load_failure_json).collect(),
+    }
 }
 
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
@@ -10868,6 +11026,41 @@ mod tests {
                 output_format: CliOutputFormat::Json,
             }
         );
+        for alias in ["plugin", "marketplace"] {
+            assert_eq!(
+                parse_args(&[alias.to_string()]).expect("plugin alias should parse"),
+                CliAction::Plugins {
+                    action: None,
+                    target: None,
+                    output_format: CliOutputFormat::Text,
+                },
+                "{alias} should route to local plugin handling, not Prompt"
+            );
+            assert_eq!(
+                parse_args(&[alias.to_string(), "list".to_string()])
+                    .expect("plugin alias list should parse"),
+                CliAction::Plugins {
+                    action: Some("list".to_string()),
+                    target: None,
+                    output_format: CliOutputFormat::Text,
+                },
+                "{alias} list should route to local plugin handling, not Prompt"
+            );
+            assert_eq!(
+                parse_args(&[
+                    alias.to_string(),
+                    "install".to_string(),
+                    "./fixtures/plugin-demo".to_string(),
+                ])
+                .expect("plugin alias install should parse"),
+                CliAction::Plugins {
+                    action: Some("install".to_string()),
+                    target: Some("./fixtures/plugin-demo".to_string()),
+                    output_format: CliOutputFormat::Text,
+                },
+                "{alias} install should route to local plugin handling, not Prompt"
+            );
+        }
         // #146: `config` and `diff` must parse as standalone CLI actions,
         // not fall through to the "is a slash command" error. Both are
         // pure-local read-only introspection.
@@ -11164,6 +11357,52 @@ mod tests {
     }
 
     #[test]
+    fn plugins_degrades_gracefully_on_malformed_mcp_config() {
+        // Keep the plugins surface consistent with status/doctor/mcp: a bad
+        // MCP entry should not make local plugin introspection unusable.
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project-with-malformed-mcp-for-plugins");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw.json"),
+            r#"{
+  "mcpServers": {
+    "missing-command": {"args": ["arg-only-no-command"]}
+  }
+}
+"#,
+        )
+        .expect("write malformed .claw.json");
+
+        let previous_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let payload = super::plugins_command_payload_for(&cwd, None, None)
+            .expect("plugins list should not hard-fail on malformed MCP config");
+        match previous_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+
+        assert_eq!(payload.status, "degraded");
+        let err = payload
+            .config_load_error
+            .as_deref()
+            .expect("config_load_error should be populated");
+        assert!(
+            err.contains("mcpServers.missing-command"),
+            "config_load_error should name the malformed MCP field: {err}"
+        );
+        assert!(payload.message.contains("Config load error"));
+        assert!(payload.message.contains("partial plugins view"));
+        assert!(payload.message.contains("Plugins"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn status_degrades_gracefully_on_malformed_mcp_config_143() {
         // #143: previously `claw status` hard-failed on any config parse error,
         // taking down the entire health surface for one malformed MCP entry.
@@ -11252,6 +11491,18 @@ mod tests {
         assert!(
             json.get("workspace").is_some(),
             "workspace field still reported"
+        );
+        assert_eq!(
+            json.pointer("/lane_board/status_json_supported")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "status JSON should advertise lane board support: {json}"
+        );
+        assert_eq!(
+            json.pointer("/lane_board/freshness_states/2")
+                .and_then(|v| v.as_str()),
+            Some("transport_dead"),
+            "status JSON should advertise transport-dead freshness: {json}"
         );
         assert!(
             json.get("sandbox").is_some(),
@@ -11960,6 +12211,15 @@ mod tests {
         .expect_err("invalid /plugins list shape should be rejected");
         assert!(plugins_error.contains("Usage: /plugin list"));
         assert!(plugins_error.contains("Aliases          /plugins, /marketplace"));
+
+        for alias in ["/plugin", "/plugins", "/marketplace"] {
+            let error = parse_args(&[alias.to_string()])
+                .expect_err("valid plugin slash aliases are local/interactive, never prompts");
+            assert!(
+                error.contains("interactive-only"),
+                "{alias} should reject as an interactive plugin command outside the REPL, got: {error}"
+            );
+        }
     }
 
     #[test]
@@ -12472,6 +12732,7 @@ mod tests {
         assert!(report.contains("Cache create     3"));
         assert!(report.contains("Cache read       1"));
         assert!(report.contains("Total tokens     32"));
+        assert!(report.contains("Estimated cost"));
     }
 
     #[test]
@@ -12619,7 +12880,10 @@ mod tests {
         assert!(status.contains("Permission mode  workspace-write"));
         assert!(status.contains("Messages         7"));
         assert!(status.contains("Latest total     10"));
+        assert!(status.contains("Cache create     2"));
+        assert!(status.contains("Cache read       1"));
         assert!(status.contains("Cumulative total 31"));
+        assert!(status.contains("Estimated cost"));
         assert!(status.contains("Cwd              /tmp/project"));
         assert!(status.contains("Project root     /tmp"));
         assert!(status.contains("Git branch       main"));

@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
+use serde::{Deserialize, Serialize};
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
@@ -80,6 +81,25 @@ pub struct SessionPromptEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPersistence {
     path: PathBuf,
+}
+
+/// Running-state liveness classification for a session heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLiveness {
+    Healthy,
+    Stalled,
+    TransportDead,
+    Unknown,
+}
+
+/// Heartbeat emitted from canonical session state, independent of terminal rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHeartbeat {
+    pub session_id: String,
+    pub observed_at_ms: u64,
+    pub transport_alive: bool,
+    pub liveness: SessionLiveness,
 }
 
 /// Persisted conversational state for the runtime and CLI session manager.
@@ -248,6 +268,35 @@ impl Session {
 
     pub fn push_user_text(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
         self.push_message(ConversationMessage::user_text(text))
+    }
+
+    pub fn record_health_check(&mut self, timestamp_ms: u64) {
+        self.last_health_check_ms = Some(timestamp_ms);
+        self.touch();
+    }
+
+    #[must_use]
+    pub fn heartbeat_at(
+        &self,
+        now_ms: u64,
+        stalled_after_ms: u64,
+        transport_alive: bool,
+    ) -> SessionHeartbeat {
+        let liveness = match (transport_alive, self.last_health_check_ms) {
+            (false, _) => SessionLiveness::TransportDead,
+            (true, Some(last)) if now_ms.saturating_sub(last) <= stalled_after_ms => {
+                SessionLiveness::Healthy
+            }
+            (true, Some(_)) => SessionLiveness::Stalled,
+            (true, None) => SessionLiveness::Unknown,
+        };
+
+        SessionHeartbeat {
+            session_id: self.session_id.clone(),
+            observed_at_ms: now_ms,
+            transport_alive,
+            liveness,
+        }
     }
 
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
@@ -1598,5 +1647,27 @@ mod workspace_sessions_dir_tests {
 
         fs::remove_dir_all(&tmp_a).ok();
         fs::remove_dir_all(&tmp_b).ok();
+    }
+    #[test]
+    fn session_heartbeat_classifies_healthy_stalled_transport_dead_and_unknown() {
+        let mut session = Session::new();
+        assert_eq!(
+            session.heartbeat_at(1_000, 500, true).liveness,
+            SessionLiveness::Unknown
+        );
+
+        session.record_health_check(800);
+        assert_eq!(
+            session.heartbeat_at(1_000, 500, true).liveness,
+            SessionLiveness::Healthy
+        );
+        assert_eq!(
+            session.heartbeat_at(2_000, 500, true).liveness,
+            SessionLiveness::Stalled
+        );
+        assert_eq!(
+            session.heartbeat_at(1_000, 500, false).liveness,
+            SessionLiveness::TransportDead
+        );
     }
 }

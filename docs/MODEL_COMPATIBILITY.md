@@ -9,7 +9,8 @@ This document describes model-specific handling in the OpenAI-compatible provide
   - [Kimi Models (is_error Exclusion)](#kimi-models-is_error-exclusion)
   - [Reasoning Models (Tuning Parameter Stripping)](#reasoning-models-tuning-parameter-stripping)
   - [GPT-5 (max_completion_tokens)](#gpt-5-max_completion_tokens)
-  - [Qwen Models (DashScope Routing)](#qwen-models-dashscope-routing)
+  - [Qwen and Kimi Models (DashScope Routing)](#qwen-and-kimi-models-dashscope-routing)
+  - [OpenAI-Compatible Usage Accounting](#openai-compatible-usage-accounting)
 - [Implementation Details](#implementation-details)
 - [Adding New Models](#adding-new-models)
 - [Testing](#testing)
@@ -46,7 +47,7 @@ The `openai_compat.rs` provider translates Claude Code's internal message format
 fn model_rejects_is_error_field(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
-    canonical.starts_with("kimi-")
+    canonical.starts_with("kimi")
 }
 ```
 
@@ -120,13 +121,13 @@ let max_tokens_key = if wire_model.starts_with("gpt-5") {
 
 ---
 
-### Qwen Models (DashScope Routing)
+### Qwen and Kimi Models (DashScope Routing)
 
-**Affected models:** All models with `qwen` prefix
+**Affected models:** All models with `qwen` or `kimi` prefixes, including `qwen/`, `qwen-`, `kimi/`, and `kimi-` forms.
 
-**Behavior:** Routed to DashScope (`https://dashscope.aliyuncs.com/compatible-mode/v1`) rather than default providers.
+**Behavior:** Routed to DashScope (`https://dashscope.aliyuncs.com/compatible-mode/v1`) rather than ambient-credential fallback providers. Known routing prefixes are stripped before sending the wire model.
 
-**Rationale:** Qwen models are hosted by Alibaba Cloud's DashScope service, not OpenAI or Anthropic.
+**Rationale:** Qwen and Kimi compatible-mode models are hosted through Alibaba Cloud's DashScope service, not OpenAI or Anthropic.
 
 **Configuration:**
 ```rust
@@ -136,6 +137,17 @@ pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/com
 **Authentication:** Uses `DASHSCOPE_API_KEY` environment variable.
 
 **Note:** Some Qwen models are also reasoning models (see [Reasoning Models](#reasoning-models-tuning-parameter-stripping) above) and receive both treatments.
+
+
+---
+
+### OpenAI-Compatible Usage Accounting
+
+**Affected providers:** OpenAI-compatible, xAI, DashScope, OpenRouter/Ollama/local gateways that return Chat Completions `usage`.
+
+**Behavior:** `prompt_tokens` and `completion_tokens` are normalized into the shared `Usage` shape used by Anthropic. If a provider includes `prompt_tokens_details.cached_tokens`, cached prompt tokens are recorded as `cache_read_input_tokens` and subtracted from uncached `input_tokens`, preserving an accurate `total_tokens()` without double-counting. Streaming OpenAI responses request `stream_options.include_usage` where supported so final usage chunks feed the same accounting path.
+
+**Status/cost surfaces:** `/status`, `/cost`, and JSON output expose cumulative input/output/cache/total token fields plus an estimated cost marker. Unknown third-party model pricing uses the `estimated-default` pricing label rather than pretending provider-specific prices are known.
 
 ## Implementation Details
 
@@ -153,6 +165,7 @@ rust/crates/api/src/providers/openai_compat.rs
 | `is_reasoning_model()` | Detects reasoning models that need tuning param stripping |
 | `translate_message()` | Converts internal messages to OpenAI format (applies `is_error` logic) |
 | `build_chat_completion_request()` | Constructs full request payload (applies all model-specific logic) |
+| `OpenAiUsage::normalized()` | Maps Chat Completions usage and cached prompt token details into shared token/cost accounting fields |
 
 ### Provider Prefix Handling
 

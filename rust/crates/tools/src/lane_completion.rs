@@ -63,6 +63,11 @@ pub(crate) fn detect_lane_completion(
         diff_scope: runtime::DiffScope::Scoped,
         completed: true,
         reconciled: false,
+        retry_count: 0,
+        retry_limit: 1,
+        rebase_required: false,
+        stale_cleanup_required: false,
+        approval_token: None,
     })
 }
 
@@ -173,6 +178,11 @@ mod tests {
             diff_scope: DiffScope::Scoped,
             completed: true,
             reconciled: false,
+            retry_count: 0,
+            retry_limit: 1,
+            rebase_required: false,
+            stale_cleanup_required: false,
+            approval_token: None,
         };
 
         let actions = evaluate_completed_lane(&context);

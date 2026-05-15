@@ -135,8 +135,9 @@ pub use plugin_lifecycle::{
     PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
 };
 pub use policy_engine::{
-    evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
-    PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
+    evaluate, evaluate_with_events, ApprovalToken, DiffScope, GreenLevel, LaneBlocker, LaneContext,
+    PolicyAction, PolicyCondition, PolicyDecisionEvent, PolicyDecisionKind, PolicyEngine,
+    PolicyEvaluation, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ModelFamilyIdentity, ProjectContext,
@@ -167,7 +168,7 @@ pub use sandbox::{
 };
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionPromptEntry,
+    SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
@@ -178,7 +179,10 @@ pub use stale_branch::{
     apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,
 };
-pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
+pub use task_packet::{
+    validate_packet, TaskPacket, TaskPacketValidationError, TaskResource, ValidatedPacket,
+};
+pub use task_registry::{LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat};
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{

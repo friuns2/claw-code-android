@@ -28,7 +28,8 @@ pub trait Provider {
     ) -> ProviderFuture<'a, Self::Stream>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Anthropic,
     Xai,
@@ -47,6 +48,55 @@ pub struct ProviderMetadata {
 pub struct ModelTokenLimit {
     pub max_output_tokens: u32,
     pub context_window_tokens: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderWireProtocol {
+    AnthropicMessages,
+    OpenAiChatCompletions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFeatureSupport {
+    Supported,
+    Unsupported,
+    PassthroughAsTool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderCapabilityReport {
+    pub provider: ProviderKind,
+    pub wire_protocol: ProviderWireProtocol,
+    pub auth_env: &'static str,
+    pub base_url_env: &'static str,
+    pub default_base_url: &'static str,
+    pub tool_calls: ProviderFeatureSupport,
+    pub streaming: ProviderFeatureSupport,
+    pub streaming_usage: ProviderFeatureSupport,
+    pub prompt_cache: ProviderFeatureSupport,
+    pub custom_parameters: ProviderFeatureSupport,
+    pub reasoning_effort: ProviderFeatureSupport,
+    pub reasoning_content_history: ProviderFeatureSupport,
+    pub fixed_sampling_reasoning_models: ProviderFeatureSupport,
+    pub web_search: ProviderFeatureSupport,
+    pub web_fetch: ProviderFeatureSupport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDiagnosticSeverity {
+    Info,
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderDiagnostic {
+    pub code: &'static str,
+    pub severity: ProviderDiagnosticSeverity,
+    pub message: String,
+    pub action: String,
 }
 
 const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
@@ -261,6 +311,208 @@ pub const fn model_family_identity_for_kind(kind: ProviderKind) -> runtime::Mode
 #[must_use]
 pub fn model_family_identity_for(model: &str) -> runtime::ModelFamilyIdentity {
     model_family_identity_for_kind(detect_provider_kind(model))
+}
+
+#[must_use]
+pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
+    let metadata = metadata_for_model(model).unwrap_or_else(|| {
+        let provider = detect_provider_kind(model);
+        metadata_for_provider_kind(provider)
+    });
+
+    let (
+        wire_protocol,
+        streaming_usage,
+        prompt_cache,
+        custom_parameters,
+        reasoning_effort,
+        reasoning_content_history,
+        fixed_sampling_reasoning_models,
+    ) = match metadata.provider {
+        ProviderKind::Anthropic => (
+            ProviderWireProtocol::AnthropicMessages,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Supported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
+        ),
+        ProviderKind::Xai => (
+            ProviderWireProtocol::OpenAiChatCompletions,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Supported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Supported,
+        ),
+        ProviderKind::OpenAi => (
+            ProviderWireProtocol::OpenAiChatCompletions,
+            ProviderFeatureSupport::Supported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Supported,
+            ProviderFeatureSupport::Supported,
+            if openai_compat::model_requires_reasoning_content_in_history(model) {
+                ProviderFeatureSupport::Supported
+            } else {
+                ProviderFeatureSupport::Unsupported
+            },
+            ProviderFeatureSupport::Supported,
+        ),
+    };
+
+    ProviderCapabilityReport {
+        provider: metadata.provider,
+        wire_protocol,
+        auth_env: metadata.auth_env,
+        base_url_env: metadata.base_url_env,
+        default_base_url: metadata.default_base_url,
+        tool_calls: ProviderFeatureSupport::Supported,
+        streaming: ProviderFeatureSupport::Supported,
+        streaming_usage,
+        prompt_cache,
+        custom_parameters,
+        reasoning_effort,
+        reasoning_content_history,
+        fixed_sampling_reasoning_models,
+        web_search: ProviderFeatureSupport::PassthroughAsTool,
+        web_fetch: ProviderFeatureSupport::PassthroughAsTool,
+    }
+}
+
+#[must_use]
+pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {
+    let capabilities = provider_capabilities_for_model(&request.model);
+    let mut diagnostics = Vec::new();
+
+    if request.reasoning_effort.is_some()
+        && capabilities.reasoning_effort == ProviderFeatureSupport::Unsupported
+    {
+        diagnostics.push(ProviderDiagnostic {
+            code: "reasoning_effort_unsupported",
+            severity: ProviderDiagnosticSeverity::Warning,
+            message: format!(
+                "{} does not map `reasoning_effort` for model `{}`.",
+                provider_label(capabilities.provider),
+                request.model
+            ),
+            action: "Remove `reasoning_effort` or route to an OpenAI-compatible reasoning model such as `openai/o4-mini`.".to_string(),
+        });
+    }
+
+    if openai_compat::is_reasoning_model(&request.model)
+        && has_openai_tuning_parameters(request)
+        && capabilities.fixed_sampling_reasoning_models == ProviderFeatureSupport::Supported
+    {
+        diagnostics.push(ProviderDiagnostic {
+            code: "reasoning_model_fixed_sampling",
+            severity: ProviderDiagnosticSeverity::Info,
+            message: format!(
+                "Model `{}` is treated as a fixed-sampling reasoning model; tuning parameters are omitted before the provider call.",
+                request.model
+            ),
+            action: "Leave temperature/top_p/frequency_penalty/presence_penalty unset for reasoning models to match provider validation rules.".to_string(),
+        });
+    }
+
+    if openai_compat::model_requires_reasoning_content_in_history(&request.model) {
+        diagnostics.push(ProviderDiagnostic {
+            code: "deepseek_v4_reasoning_history",
+            severity: ProviderDiagnosticSeverity::Info,
+            message: format!(
+                "Model `{}` requires assistant thinking history to be echoed as `reasoning_content`.",
+                request.model
+            ),
+            action: "Keep prior assistant Thinking blocks in history; the OpenAI-compatible serializer will emit `reasoning_content` for DeepSeek V4 models.".to_string(),
+        });
+    }
+
+    if declares_tool(request, "web_search") {
+        diagnostics.push(web_passthrough_diagnostic(
+            "web_search_passthrough_tool",
+            "web_search",
+            capabilities.provider,
+        ));
+    }
+    if declares_tool(request, "web_fetch") {
+        diagnostics.push(web_passthrough_diagnostic(
+            "web_fetch_passthrough_tool",
+            "web_fetch",
+            capabilities.provider,
+        ));
+    }
+
+    diagnostics
+}
+
+#[must_use]
+fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
+    match provider {
+        ProviderKind::Anthropic => ProviderMetadata {
+            provider,
+            auth_env: "ANTHROPIC_API_KEY",
+            base_url_env: "ANTHROPIC_BASE_URL",
+            default_base_url: anthropic::DEFAULT_BASE_URL,
+        },
+        ProviderKind::Xai => ProviderMetadata {
+            provider,
+            auth_env: "XAI_API_KEY",
+            base_url_env: "XAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
+        },
+        ProviderKind::OpenAi => ProviderMetadata {
+            provider,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        },
+    }
+}
+
+#[must_use]
+const fn provider_label(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Anthropic => "Anthropic",
+        ProviderKind::Xai => "xAI",
+        ProviderKind::OpenAi => "OpenAI-compatible",
+    }
+}
+
+#[must_use]
+fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {
+    request.temperature.is_some()
+        || request.top_p.is_some()
+        || request.frequency_penalty.is_some()
+        || request.presence_penalty.is_some()
+}
+
+#[must_use]
+fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {
+    request.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool.name.eq_ignore_ascii_case(tool_name))
+    })
+}
+
+#[must_use]
+fn web_passthrough_diagnostic(
+    code: &'static str,
+    tool_name: &'static str,
+    provider: ProviderKind,
+) -> ProviderDiagnostic {
+    ProviderDiagnostic {
+        code,
+        severity: ProviderDiagnosticSeverity::Info,
+        message: format!(
+            "`{tool_name}` is exposed to {} as a normal function tool, not as a provider-native web capability.",
+            provider_label(provider)
+        ),
+        action: format!(
+            "Provide a local `{tool_name}` tool implementation or route through a provider adapter that explicitly supports native web tools."
+        ),
+    }
 }
 
 #[must_use]
@@ -498,7 +750,9 @@ mod tests {
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
         model_family_identity_for, model_family_identity_for_kind, model_token_limit, parse_dotenv,
-        preflight_message_request, resolve_model_alias, ProviderKind,
+        preflight_message_request, provider_capabilities_for_model,
+        provider_diagnostics_for_request, resolve_model_alias, ProviderFeatureSupport,
+        ProviderKind, ProviderWireProtocol,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -591,6 +845,105 @@ mod tests {
         assert_eq!(claude_identity, runtime::ModelFamilyIdentity::Claude);
         assert_eq!(openai_identity, runtime::ModelFamilyIdentity::Generic);
         assert_eq!(xai_identity, runtime::ModelFamilyIdentity::Generic);
+    }
+
+    #[test]
+    fn provider_capability_matrix_snapshots_openai_compat_differences() {
+        let openai = provider_capabilities_for_model("openai/gpt-4.1-mini");
+        assert_eq!(openai.provider, ProviderKind::OpenAi);
+        assert_eq!(
+            openai.wire_protocol,
+            ProviderWireProtocol::OpenAiChatCompletions
+        );
+        assert_eq!(openai.auth_env, "OPENAI_API_KEY");
+        assert_eq!(openai.streaming_usage, ProviderFeatureSupport::Supported);
+        assert_eq!(openai.reasoning_effort, ProviderFeatureSupport::Supported);
+        assert_eq!(openai.web_search, ProviderFeatureSupport::PassthroughAsTool);
+        assert_eq!(openai.web_fetch, ProviderFeatureSupport::PassthroughAsTool);
+
+        let deepseek = provider_capabilities_for_model("openai/deepseek-v4-pro");
+        assert_eq!(
+            deepseek.reasoning_content_history,
+            ProviderFeatureSupport::Supported
+        );
+
+        let xai = provider_capabilities_for_model("grok-3");
+        assert_eq!(xai.provider, ProviderKind::Xai);
+        assert_eq!(xai.auth_env, "XAI_API_KEY");
+        assert_eq!(xai.reasoning_effort, ProviderFeatureSupport::Unsupported);
+        assert_eq!(xai.streaming_usage, ProviderFeatureSupport::Unsupported);
+
+        let anthropic = provider_capabilities_for_model("claude-sonnet-4-6");
+        assert_eq!(anthropic.provider, ProviderKind::Anthropic);
+        assert_eq!(
+            anthropic.wire_protocol,
+            ProviderWireProtocol::AnthropicMessages
+        );
+        assert_eq!(anthropic.prompt_cache, ProviderFeatureSupport::Supported);
+        assert_eq!(
+            anthropic.custom_parameters,
+            ProviderFeatureSupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn provider_diagnostics_explain_deepseek_reasoning_and_web_tool_passthrough() {
+        let request = MessageRequest {
+            model: "openai/deepseek-v4-pro".to_string(),
+            max_tokens: 1024,
+            messages: vec![InputMessage::user_text("research this")],
+            tools: Some(vec![
+                ToolDefinition {
+                    name: "web_search".to_string(),
+                    description: Some("Search the web".to_string()),
+                    input_schema: json!({"type": "object"}),
+                },
+                ToolDefinition {
+                    name: "web_fetch".to_string(),
+                    description: Some("Fetch a URL".to_string()),
+                    input_schema: json!({"type": "object"}),
+                },
+            ]),
+            stream: true,
+            ..Default::default()
+        };
+
+        let diagnostics = provider_diagnostics_for_request(&request);
+        let codes = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"deepseek_v4_reasoning_history"));
+        assert!(codes.contains(&"web_search_passthrough_tool"));
+        assert!(codes.contains(&"web_fetch_passthrough_tool"));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.action.contains("provider adapter")));
+    }
+
+    #[test]
+    fn provider_diagnostics_warn_for_unsupported_reasoning_effort() {
+        let request = MessageRequest {
+            model: "grok-3-mini".to_string(),
+            max_tokens: 1024,
+            messages: vec![InputMessage::user_text("think")],
+            reasoning_effort: Some("high".to_string()),
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+
+        let diagnostics = provider_diagnostics_for_request(&request);
+        let codes = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"reasoning_effort_unsupported"));
+        assert!(codes.contains(&"reasoning_model_fixed_sampling"));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("does not map `reasoning_effort`")));
     }
 
     #[test]

@@ -306,7 +306,9 @@ Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `te
 
 The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — just point `OPENAI_BASE_URL` at the service.
 
-**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
+**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, `qwen-`, `kimi/`, or `kimi-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment. Kimi and Qwen prefixes route to DashScope compatible mode; `openai/` is stripped before the Chat Completions request is sent.
+
+**Token and cost accounting:** Anthropic usage fields are recorded directly, including cache create/read tokens. OpenAI-compatible responses normalize `prompt_tokens` / `completion_tokens` into the same internal usage fields; when a provider reports `prompt_tokens_details.cached_tokens`, cached prompt tokens are counted as cache reads and subtracted from uncached input tokens so totals are not double-counted. `/status`, `/cost`, and `/usage` expose cumulative token totals and an estimated cost; unknown third-party prices use the built-in estimated-default pricing marker.
 
 ### Tested models and aliases
 
@@ -320,6 +322,9 @@ These are the models registered in the built-in alias table with known token lim
 | `grok` / `grok-3` | `grok-3` | xAI | 64 000 | 131 072 |
 | `grok-mini` / `grok-3-mini` | `grok-3-mini` | xAI | 64 000 | 131 072 |
 | `grok-2` | `grok-2` | xAI | — | — |
+| `kimi` | `kimi-k2.5` | DashScope | 16 384 | 256 000 |
+| `gpt-4.1` / `gpt-4.1-mini` / `gpt-4.1-nano` | same | OpenAI-compatible | 32 768 | 1 047 576 |
+| `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.4-nano` | same | OpenAI-compatible | 128 000 | 1 000 000 / 400 000 |
 
 Any model name that does not match an alias is passed through verbatim. This is how you use OpenRouter model slugs (`openai/gpt-4.1-mini`), Ollama tags (`llama3.2`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
 
@@ -343,8 +348,10 @@ Local project settings override user-level settings. Aliases resolve through the
 
 1. If the resolved model name starts with `claude` → Anthropic.
 2. If it starts with `grok` → xAI.
-3. Otherwise, `claw` checks which credential is set: `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` first, then `OPENAI_API_KEY`, then `XAI_API_KEY`.
-4. If nothing matches, it defaults to Anthropic.
+3. If it starts with `openai/` or `gpt-` → OpenAI-compatible.
+4. If it starts with `qwen/`, `qwen-`, `kimi/`, or `kimi-` → DashScope compatible mode.
+5. If `OPENAI_BASE_URL` is set with `OPENAI_API_KEY`, route unprefixed custom/local model names to OpenAI-compatible.
+6. Otherwise, `claw` checks which credential is set: Anthropic first, then OpenAI, then xAI; if nothing matches, it defaults to Anthropic.
 
 ## FAQ
 

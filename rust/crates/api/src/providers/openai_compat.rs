@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -267,14 +268,18 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         // Pre-flight check: verify request body size against provider limits
-        check_request_body_size(request, self.config())?;
+        check_request_body_size_for_base_url(request, self.config(), &self.base_url)?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&build_chat_completion_request_for_base_url(
+                request,
+                self.config(),
+                &self.base_url,
+            ))
             .send()
             .await
             .map_err(ApiError::from)
@@ -488,12 +493,7 @@ impl StreamState {
         }
 
         if let Some(usage) = chunk.usage {
-            self.usage = Some(Usage {
-                input_tokens: usage.prompt_tokens,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-                output_tokens: usage.completion_tokens,
-            });
+            self.usage = Some(usage.normalized());
         }
 
         for choice in chunk.choices {
@@ -771,6 +771,29 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+impl OpenAiUsage {
+    fn normalized(&self) -> Usage {
+        let cached_tokens = self
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens);
+        Usage {
+            input_tokens: self.prompt_tokens.saturating_sub(cached_tokens),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cached_tokens,
+            output_tokens: self.completion_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -882,10 +905,50 @@ fn strip_routing_prefix(model: &str) -> &str {
     }
 }
 
+fn wire_model_for_base_url<'a>(
+    model: &'a str,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Cow<'a, str> {
+    let Some(pos) = model.find('/') else {
+        return Cow::Borrowed(model);
+    };
+    let prefix = &model[..pos];
+    let lowered_prefix = prefix.to_ascii_lowercase();
+
+    if lowered_prefix == "openai" {
+        let trimmed_base_url = base_url.trim_end_matches('/');
+        let default_openai = DEFAULT_OPENAI_BASE_URL.trim_end_matches('/');
+        if config.provider_name == "OpenAI" && trimmed_base_url != default_openai {
+            // OpenAI-compatible gateways such as OpenRouter commonly use
+            // slash-containing model slugs (for example `openai/gpt-4.1-mini`).
+            // Preserve the slug when the user configured a non-default OpenAI
+            // base URL; the prefix still routed to the OpenAI-compatible client,
+            // but the gateway owns the final model namespace.
+            return Cow::Borrowed(model);
+        }
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+
+    if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
+        return Cow::Borrowed(strip_routing_prefix(model));
+    }
+
+    Cow::Borrowed(model)
+}
+
 /// Estimate the serialized JSON size of a request payload in bytes.
 /// This is a pre-flight check to avoid hitting provider-specific size limits.
 pub fn estimate_request_body_size(request: &MessageRequest, config: OpenAiCompatConfig) -> usize {
-    let payload = build_chat_completion_request(request, config);
+    estimate_request_body_size_for_base_url(request, config, &read_base_url(config))
+}
+
+fn estimate_request_body_size_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> usize {
+    let payload = build_chat_completion_request_for_base_url(request, config, base_url);
     // serde_json::to_vec gives us the exact byte size of the serialized JSON
     serde_json::to_vec(&payload).map_or(0, |v| v.len())
 }
@@ -897,7 +960,15 @@ pub fn check_request_body_size(
     request: &MessageRequest,
     config: OpenAiCompatConfig,
 ) -> Result<(), ApiError> {
-    let estimated_bytes = estimate_request_body_size(request, config);
+    check_request_body_size_for_base_url(request, config, &read_base_url(config))
+}
+
+fn check_request_body_size_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Result<(), ApiError> {
+    let estimated_bytes = estimate_request_body_size_for_base_url(request, config, base_url);
     let max_bytes = config.max_request_body_bytes;
 
     if estimated_bytes > max_bytes {
@@ -917,6 +988,14 @@ pub fn build_chat_completion_request(
     request: &MessageRequest,
     config: OpenAiCompatConfig,
 ) -> Value {
+    build_chat_completion_request_for_base_url(request, config, &read_base_url(config))
+}
+
+fn build_chat_completion_request_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -924,8 +1003,10 @@ pub fn build_chat_completion_request(
             "content": system,
         }));
     }
-    // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
-    let wire_model = strip_routing_prefix(&request.model);
+    // Resolve the transport routing prefix into the wire model. Custom
+    // OpenAI-compatible gateways may require slash-containing slugs intact.
+    let wire_model = wire_model_for_base_url(&request.model, config, base_url);
+    let wire_model = wire_model.as_ref();
     for message in &request.messages {
         messages.extend(translate_message(message, wire_model));
     }
@@ -994,7 +1075,27 @@ pub fn build_chat_completion_request(
         payload["reasoning_effort"] = json!(effort);
     }
 
+    for (key, value) in &request.extra_body {
+        if is_protected_extra_body_key(key) {
+            continue;
+        }
+        payload[key] = value.clone();
+    }
+
     payload
+}
+
+fn is_protected_extra_body_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "messages"
+            | "stream"
+            | "tools"
+            | "tool_choice"
+            | "max_tokens"
+            | "max_completion_tokens"
+    )
 }
 
 /// Returns true for models that do NOT support the `is_error` field in tool results.
@@ -1294,18 +1395,10 @@ fn normalize_response(
             .finish_reason
             .map(|value| normalize_finish_reason(&value)),
         stop_sequence: None,
-        usage: Usage {
-            input_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.prompt_tokens),
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.completion_tokens),
-        },
+        usage: response
+            .usage
+            .as_ref()
+            .map_or_else(Usage::default, OpenAiUsage::normalized),
         request_id: None,
     })
 }
@@ -1515,6 +1608,7 @@ mod tests {
         ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -1949,6 +2043,7 @@ mod tests {
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
             reasoning_effort: None,
+            extra_body: BTreeMap::new(),
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);

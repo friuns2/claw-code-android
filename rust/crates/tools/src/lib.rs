@@ -10148,9 +10148,20 @@ printf 'pwsh:%s' "$1"
                 "cargo build --workspace".to_string(),
                 "cargo test --workspace".to_string(),
             ],
+            acceptance_criteria: vec!["task packet is accepted".to_string()],
+            resources: vec![runtime::TaskResource {
+                kind: "module".to_string(),
+                value: "runtime/task system".to_string(),
+            }],
+            model: Some("gpt-5.5".to_string()),
+            provider: Some("openai".to_string()),
+            permission_profile: Some("workspace-write".to_string()),
             commit_policy: "single commit".to_string(),
             reporting_contract: "print build/test result and sha".to_string(),
+            reporting_targets: vec!["leader".to_string()],
             escalation_policy: "manual escalation".to_string(),
+            recovery_policy: Some("retry once".to_string()),
+            verification_plan: vec!["cargo test --workspace".to_string()],
         })
         .expect("task packet should create a task");
 
@@ -10159,6 +10170,26 @@ printf 'pwsh:%s' "$1"
         assert_eq!(output["prompt"], "Ship packetized runtime task");
         assert_eq!(output["description"], "runtime/task system");
         assert_eq!(output["task_packet"]["repo"], "claw-code-parity");
+        assert_eq!(output["task_packet"]["resources"][0]["kind"], "module");
+        assert_eq!(
+            output["task_packet"]["resources"][0]["value"],
+            "runtime/task system"
+        );
+        assert_eq!(
+            output["task_packet"]["acceptance_criteria"][0],
+            "task packet is accepted"
+        );
+        assert_eq!(output["task_packet"]["model"], "gpt-5.5");
+        assert_eq!(output["task_packet"]["provider"], "openai");
+        assert_eq!(
+            output["task_packet"]["permission_profile"],
+            "workspace-write"
+        );
+        assert_eq!(
+            output["task_packet"]["verification_plan"][0],
+            "cargo test --workspace"
+        );
+        assert_eq!(output["task_packet"]["reporting_targets"][0], "leader");
         assert_eq!(
             output["task_packet"]["acceptance_tests"][1],
             "cargo test --workspace"
