@@ -221,11 +221,11 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "session",
         aliases: &[],
-        summary: "List, switch, fork, or delete managed local sessions",
+        summary: "List, check, switch, fork, or delete managed local sessions",
         argument_hint: Some(
-            "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+            "[list|exists <session-id>|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
         ),
-        resume_supported: false,
+        resume_supported: true,
     },
     SlashCommandSpec {
         name: "plugin",
@@ -1590,7 +1590,17 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             action: Some("list".to_string()),
             target: None,
         }),
-        ["list", ..] => Err(usage_error("session", "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]")),
+        ["list", ..] => Err(usage_error("session", "[list|exists <session-id>|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]")),
+        ["exists"] => Err(usage_error("session exists", "<session-id>")),
+        ["exists", target] => Ok(SlashCommand::Session {
+            action: Some("exists".to_string()),
+            target: Some((*target).to_string()),
+        }),
+        ["exists", ..] => Err(command_error(
+            "Unexpected arguments for /session exists.",
+            "session",
+            "/session exists <session-id>",
+        )),
         ["switch"] => Err(usage_error("session switch", "<session-id>")),
         ["switch", target] => Ok(SlashCommand::Session {
             action: Some("switch".to_string()),
@@ -1637,10 +1647,10 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
         )),
         [action, ..] => Err(command_error(
             &format!(
-                "Unknown /session action '{action}'. Use list, switch <session-id>, fork [branch-name], or delete <session-id> [--force]."
+                "Unknown /session action '{action}'. Use list, exists <session-id>, switch <session-id>, fork [branch-name], or delete <session-id> [--force]."
             ),
             "session",
-            "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+            "/session [list|exists <session-id>|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
         )),
     }
 }
@@ -4589,6 +4599,13 @@ mod tests {
             SlashCommand::parse("/session switch abc123"),
             Ok(Some(SlashCommand::Session {
                 action: Some("switch".to_string()),
+                target: Some("abc123".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/session exists abc123"),
+            Ok(Some(SlashCommand::Session {
+                action: Some("exists".to_string()),
                 target: Some("abc123".to_string())
             }))
         );

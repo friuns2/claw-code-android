@@ -29,7 +29,6 @@ pub trait Provider {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Anthropic,
     Xai,
@@ -97,6 +96,25 @@ pub struct ProviderDiagnostic {
     pub severity: ProviderDiagnosticSeverity,
     pub message: String,
     pub action: String,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderDiagnostics {
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub provider: ProviderKind,
+    pub auth_env: &'static str,
+    pub base_url_env: &'static str,
+    pub default_base_url: &'static str,
+    pub openai_compatible: bool,
+    pub reasoning_model: bool,
+    pub preserves_reasoning_content_in_history: bool,
+    pub strips_tuning_params: bool,
+    pub supports_stream_usage: bool,
+    pub honors_proxy_env: bool,
+    pub supports_extra_body_params: bool,
+    pub preserves_slash_model_ids_on_custom_base_url: bool,
 }
 
 const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
@@ -267,6 +285,55 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
         });
     }
     None
+}
+
+#[must_use]
+pub fn provider_diagnostics_for_model(model: &str) -> ProviderDiagnostics {
+    let resolved_model = resolve_model_alias(model);
+    let metadata =
+        metadata_for_model(&resolved_model).unwrap_or_else(|| {
+            match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => ProviderMetadata {
+                    provider: ProviderKind::Anthropic,
+                    auth_env: "ANTHROPIC_API_KEY",
+                    base_url_env: "ANTHROPIC_BASE_URL",
+                    default_base_url: anthropic::DEFAULT_BASE_URL,
+                },
+                ProviderKind::Xai => ProviderMetadata {
+                    provider: ProviderKind::Xai,
+                    auth_env: "XAI_API_KEY",
+                    base_url_env: "XAI_BASE_URL",
+                    default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
+                },
+                ProviderKind::OpenAi => ProviderMetadata {
+                    provider: ProviderKind::OpenAi,
+                    auth_env: "OPENAI_API_KEY",
+                    base_url_env: "OPENAI_BASE_URL",
+                    default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+                },
+            }
+        });
+    let openai_compatible = matches!(metadata.provider, ProviderKind::OpenAi | ProviderKind::Xai);
+    let reasoning_model = openai_compatible && openai_compat::is_reasoning_model(&resolved_model);
+
+    ProviderDiagnostics {
+        requested_model: model.to_string(),
+        resolved_model: resolved_model.clone(),
+        provider: metadata.provider,
+        auth_env: metadata.auth_env,
+        base_url_env: metadata.base_url_env,
+        default_base_url: metadata.default_base_url,
+        openai_compatible,
+        reasoning_model,
+        preserves_reasoning_content_in_history: openai_compatible
+            && openai_compat::model_requires_reasoning_content_in_history(&resolved_model),
+        strips_tuning_params: reasoning_model,
+        supports_stream_usage: metadata.provider == ProviderKind::OpenAi
+            && metadata.default_base_url == openai_compat::DEFAULT_OPENAI_BASE_URL,
+        honors_proxy_env: true,
+        supports_extra_body_params: openai_compatible,
+        preserves_slash_model_ids_on_custom_base_url: metadata.provider == ProviderKind::OpenAi,
+    }
 }
 
 #[must_use]
@@ -524,9 +591,7 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
         64_000
     };
 
-    model_token_limit(model)
-        .map(|limit| heuristic.min(limit.max_output_tokens))
-        .unwrap_or(heuristic)
+    model_token_limit(model).map_or(heuristic, |limit| heuristic.min(limit.max_output_tokens))
 }
 
 /// Returns the effective max output tokens for a model, preferring a plugin
@@ -1024,6 +1089,19 @@ mod tests {
     fn kimi_alias_resolves_to_kimi_k2_5() {
         assert_eq!(super::resolve_model_alias("kimi"), "kimi-k2.5");
         assert_eq!(super::resolve_model_alias("KIMI"), "kimi-k2.5"); // case insensitive
+    }
+
+    #[test]
+    fn provider_diagnostics_explain_openai_compatible_capabilities() {
+        let diagnostics = super::provider_diagnostics_for_model("openai/deepseek-v4-pro");
+
+        assert_eq!(diagnostics.provider, ProviderKind::OpenAi);
+        assert_eq!(diagnostics.auth_env, "OPENAI_API_KEY");
+        assert!(diagnostics.openai_compatible);
+        assert!(diagnostics.preserves_reasoning_content_in_history);
+        assert!(diagnostics.supports_extra_body_params);
+        assert!(diagnostics.honors_proxy_env);
+        assert!(diagnostics.preserves_slash_model_ids_on_custom_base_url);
     }
 
     #[test]

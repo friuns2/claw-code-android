@@ -10,7 +10,7 @@ This document describes model-specific handling in the OpenAI-compatible provide
   - [Reasoning Models (Tuning Parameter Stripping)](#reasoning-models-tuning-parameter-stripping)
   - [GPT-5 (max_completion_tokens)](#gpt-5-max_completion_tokens)
   - [Qwen and Kimi Models (DashScope Routing)](#qwen-and-kimi-models-dashscope-routing)
-  - [OpenAI-Compatible Usage Accounting](#openai-compatible-usage-accounting)
+  - [Custom Gateway Slugs and Extra Body Parameters](#custom-gateway-slugs-and-extra-body-parameters)
 - [Implementation Details](#implementation-details)
 - [Adding New Models](#adding-new-models)
 - [Testing](#testing)
@@ -23,6 +23,8 @@ The `openai_compat.rs` provider translates Claude Code's internal message format
 - Sampling parameters (temperature, top_p, etc.)
 - Token limit fields (`max_tokens` vs `max_completion_tokens`)
 - Base URL routing
+- Provider-specific extra body parameters (`web_search_options`, `parallel_tool_calls`, local-server switches, etc.)
+- Provider diagnostics for status/doctor-style surfaces
 
 ## Model-Specific Handling
 
@@ -141,13 +143,17 @@ pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/com
 
 ---
 
-### OpenAI-Compatible Usage Accounting
+### Custom Gateway Slugs and Extra Body Parameters
 
-**Affected providers:** OpenAI-compatible, xAI, DashScope, OpenRouter/Ollama/local gateways that return Chat Completions `usage`.
+**Affected models:** Slash-containing model IDs routed through the OpenAI-compatible provider, especially custom gateways configured with `OPENAI_BASE_URL` such as OpenRouter, local routers, or other `/v1/chat/completions` services.
 
-**Behavior:** `prompt_tokens` and `completion_tokens` are normalized into the shared `Usage` shape used by Anthropic. If a provider includes `prompt_tokens_details.cached_tokens`, cached prompt tokens are recorded as `cache_read_input_tokens` and subtracted from uncached `input_tokens`, preserving an accurate `total_tokens()` without double-counting. Streaming OpenAI responses request `stream_options.include_usage` where supported so final usage chunks feed the same accounting path.
+**Behavior:**
+- The default OpenAI API treats `openai/` as a routing prefix and sends the bare model name on the wire.
+- Custom OpenAI-compatible base URLs preserve slash-containing slugs such as `openai/gpt-4.1-mini` so the gateway receives the exact model ID it expects.
+- `MessageRequest::extra_body` passes through custom request JSON after core fields are populated. This supports provider-specific options such as `web_search_options` and `parallel_tool_calls`.
+- Protected core fields (`model`, `messages`, `stream`, `tools`, `tool_choice`, `max_tokens`, `max_completion_tokens`) cannot be overridden through `extra_body`.
 
-**Status/cost surfaces:** `/status`, `/cost`, and JSON output expose cumulative input/output/cache/total token fields plus an estimated cost marker. Unknown third-party model pricing uses the `estimated-default` pricing label rather than pretending provider-specific prices are known.
+**Testing:** See `custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params` in `openai_compat_integration.rs` and `extra_body_params_are_passed_through_without_overriding_core_fields` in `openai_compat.rs`.
 
 ## Implementation Details
 
@@ -164,8 +170,8 @@ rust/crates/api/src/providers/openai_compat.rs
 | `model_rejects_is_error_field()` | Detects models that don't support `is_error` in tool results |
 | `is_reasoning_model()` | Detects reasoning models that need tuning param stripping |
 | `translate_message()` | Converts internal messages to OpenAI format (applies `is_error` logic) |
-| `build_chat_completion_request()` | Constructs full request payload (applies all model-specific logic) |
-| `OpenAiUsage::normalized()` | Maps Chat Completions usage and cached prompt token details into shared token/cost accounting fields |
+| `build_chat_completion_request()` | Constructs full request payload (applies all model-specific logic and safe `extra_body` passthrough) |
+| `provider_diagnostics_for_model()` | Produces provider/status diagnostics including auth/base-url vars, reasoning behavior, proxy support, extra-body support, and slash-model preservation |
 
 ### Provider Prefix Handling
 
@@ -178,7 +184,7 @@ let canonical = model.to_ascii_lowercase()
     .unwrap_or(model);
 ```
 
-This ensures consistent detection regardless of whether models are referenced with or without provider prefixes.
+This ensures consistent detection regardless of whether models are referenced with or without provider prefixes. Wire-model handling is more specific: known routing prefixes are stripped for provider-native defaults, while custom OpenAI-compatible base URLs preserve slash-containing gateway slugs.
 
 ## Adding New Models
 
@@ -196,11 +202,15 @@ When adding support for new models:
    - Does it require `max_completion_tokens` instead of `max_tokens`?
    - Update the `max_tokens_key` logic
 
-4. **Add tests**
+4. **Check custom gateway behavior**
+   - Should slash-containing IDs be preserved for custom `OPENAI_BASE_URL` gateways?
+   - Does the feature belong in a typed request field or `extra_body` passthrough?
+
+5. **Add tests**
    - Unit test for detection function
    - Integration test in `build_chat_completion_request`
 
-5. **Update this documentation**
+6. **Update this documentation**
    - Add the model to the affected lists
    - Document any special behavior
 
@@ -217,6 +227,8 @@ cargo test --package api model_rejects_is_error_field
 cargo test --package api reasoning_model
 cargo test --package api gpt5
 cargo test --package api qwen
+cargo test --package api custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params
+cargo test --package api provider_diagnostics_explain_openai_compatible_capabilities
 ```
 
 ### Test Files
@@ -244,6 +256,6 @@ fn my_new_model_is_detected() {
 
 ---
 
-*Last updated: 2026-04-16*
+*Last updated: 2026-05-15*
 
 For questions or updates, see the implementation in `rust/crates/api/src/providers/openai_compat.rs`.

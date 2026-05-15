@@ -124,11 +124,21 @@ fn acp_guidance_emits_json_when_requested() {
 
     let acp = assert_json_command(&root, &["--output-format", "json", "acp"]);
     assert_eq!(acp["kind"], "acp");
-    assert_eq!(acp["status"], "discoverability_only");
+    assert_eq!(acp["schema_version"], "1.0");
+    assert_eq!(acp["status"], "unsupported");
+    assert_eq!(acp["phase"], "discoverability_only");
     assert_eq!(acp["supported"], false);
+    assert_eq!(acp["exit_code"], 0);
     assert_eq!(acp["serve_alias_only"], true);
+    assert_eq!(acp["protocol"]["json_rpc"], false);
+    assert_eq!(acp["protocol"]["daemon"], false);
+    assert!(acp["protocol"]["endpoint"].is_null());
+    assert_eq!(
+        acp["contracts"]["unsupported_invocation_kind"],
+        "unsupported_acp_invocation"
+    );
     assert_eq!(acp["discoverability_tracking"], "ROADMAP #64a");
-    assert_eq!(acp["tracking"], "ROADMAP #76");
+    assert_eq!(acp["tracking"], "ROADMAP #76 / #3033 / #3004");
     assert!(acp["message"]
         .as_str()
         .expect("acp message")

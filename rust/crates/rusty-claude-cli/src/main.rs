@@ -219,6 +219,7 @@ fn main() {
                     "error": short_reason,
                     "kind": kind,
                     "hint": hint,
+                    "exit_code": 1,
                 })
             );
         } else {
@@ -262,6 +263,8 @@ fn classify_error_kind(message: &str) -> &'static str {
         "session_load_failed"
     } else if message.contains("no managed sessions found") {
         "no_managed_sessions"
+    } else if message.contains("unsupported ACP invocation") {
+        "unsupported_acp_invocation"
     } else if message.contains("unrecognized argument") || message.contains("unknown option") {
         "cli_parse"
     } else if message.contains("invalid model syntax") {
@@ -3527,7 +3530,7 @@ fn render_resume_usage() -> String {
     format!(
         "Resume
   Usage            /resume <session-path|session-id|{LATEST_SESSION_REFERENCE}>
-  Auto-save        .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}
+  Auto-save        .claw/sessions/<workspace-fingerprint>/<session-id>.{PRIMARY_SESSION_EXTENSION}
   Tip              use /session list to inspect saved sessions"
     )
 }
@@ -3791,6 +3794,35 @@ fn run_resume_command(
     session: &Session,
     command: &SlashCommand,
 ) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
+    let session_list_outcome = || -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
+        let sessions = list_managed_sessions().unwrap_or_default();
+        let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
+        let session_details: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|session| {
+                serde_json::json!({
+                    "id": session.id,
+                    "path": session.path.display().to_string(),
+                    "message_count": session.message_count,
+                    "updated_at_ms": session.updated_at_ms,
+                    "lifecycle": session.lifecycle.json_value(),
+                })
+            })
+            .collect();
+        let active_id = session.session_id.clone();
+        let text = render_session_list(&active_id).unwrap_or_else(|e| format!("error: {e}"));
+        Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(text),
+            json: Some(serde_json::json!({
+                "kind": "session_list",
+                "sessions": session_ids,
+                "session_details": session_details,
+                "active": active_id,
+            })),
+        })
+    };
+
     match command {
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
@@ -4092,37 +4124,11 @@ fn run_resume_command(
             })
         }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
-        // /session list can be served from the sessions directory without a live session.
-        SlashCommand::Session {
-            action: Some(ref act),
-            ..
-        } if act == "list" => {
-            let sessions = list_managed_sessions().unwrap_or_default();
-            let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
-            let session_details: Vec<serde_json::Value> = sessions
-                .iter()
-                .map(|session| {
-                    serde_json::json!({
-                        "id": session.id,
-                        "path": session.path.display().to_string(),
-                        "message_count": session.message_count,
-                        "updated_at_ms": session.updated_at_ms,
-                        "lifecycle": session.lifecycle.json_value(),
-                    })
-                })
-                .collect();
-            let active_id = session.session_id.clone();
-            let text = render_session_list(&active_id).unwrap_or_else(|e| format!("error: {e}"));
-            Ok(ResumeCommandOutcome {
-                session: session.clone(),
-                message: Some(text),
-                json: Some(serde_json::json!({
-                    "kind": "session_list",
-                    "sessions": session_ids,
-                    "session_details": session_details,
-                    "active": active_id,
-                })),
-            })
+        // /session list/exists/delete can be served from the managed sessions directory
+        // in resume mode without starting an interactive REPL. Mutating delete remains
+        // opt-in through /session delete <id> --force so JSON callers never hang on a prompt.
+        SlashCommand::Session { action, target } => {
+            run_resumed_session_command(session_path, session, action.as_deref(), target.as_deref())
         }
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -4134,7 +4140,6 @@ fn run_resume_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
-        | SlashCommand::Session { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -5687,6 +5692,22 @@ impl LiveCli {
                 println!("{}", render_session_list(&self.session.id)?);
                 Ok(false)
             }
+            Some("exists") => {
+                let Some(target) = target else {
+                    println!("Usage: /session exists <session-id>");
+                    return Ok(false);
+                };
+                let exists = session_reference_exists(target)?;
+                let handle = resolve_session_reference(target).ok();
+                println!(
+                    "Session exists\n  Session          {target}\n  Exists           {exists}{}",
+                    handle
+                        .as_ref()
+                        .map(|handle| format!("\n  File             {}", handle.path.display()))
+                        .unwrap_or_default()
+                );
+                Ok(false)
+            }
             Some("switch") => {
                 let Some(target) = target else {
                     println!("Usage: /session switch <session-id>");
@@ -5801,7 +5822,7 @@ impl LiveCli {
             }
             Some(other) => {
                 println!(
-                    "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
+                    "Unknown /session action '{other}'. Use /session list, /session exists <session-id>, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
                 );
                 Ok(false)
             }
@@ -5982,6 +6003,10 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
     })
 }
 
+fn session_reference_exists(reference: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(current_session_store()?.session_exists(reference))
+}
+
 fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     current_session_store()?
         .resolve_managed_path(session_id)
@@ -6057,6 +6082,140 @@ fn confirm_session_deletion(session_id: &str) -> bool {
         return false;
     }
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+}
+
+fn session_details_json(sessions: &[ManagedSessionSummary]) -> Vec<serde_json::Value> {
+    sessions
+        .iter()
+        .map(|session| {
+            serde_json::json!({
+                "id": session.id,
+                "path": session.path.display().to_string(),
+                "message_count": session.message_count,
+                "updated_at_ms": session.updated_at_ms,
+                "modified_epoch_millis": session.modified_epoch_millis,
+                "parent_session_id": session.parent_session_id,
+                "branch_name": session.branch_name,
+                "lifecycle": session.lifecycle.json_value(),
+            })
+        })
+        .collect()
+}
+
+fn session_exists_json(
+    target: &str,
+    active_session_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let handle = create_managed_session_handle(target)?;
+    let resolved = resolve_session_reference(target).ok();
+    let exists = resolved.is_some();
+    let resolved_id = resolved
+        .as_ref()
+        .map_or(target, |handle| handle.id.as_str());
+    Ok(serde_json::json!({
+        "kind": "session_exists",
+        "session_id": resolved_id,
+        "session": target,
+        "requested": target,
+        "exists": exists,
+        "active": resolved_id == active_session_id,
+        "path": resolved
+            .as_ref()
+            .map(|handle| handle.path.display().to_string()),
+        "candidate_path": handle.path.display().to_string(),
+    }))
+}
+
+fn run_resumed_session_command(
+    session_path: &Path,
+    session: &Session,
+    action: Option<&str>,
+    target: Option<&str>,
+) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
+    match action {
+        None | Some("list") => {
+            let sessions = list_managed_sessions().unwrap_or_default();
+            let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
+            let active_id = session.session_id.clone();
+            let text = render_session_list(&active_id).unwrap_or_else(|e| format!("error: {e}"));
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(text),
+                json: Some(serde_json::json!({
+                    "kind": "session_list",
+                    "sessions": session_ids,
+                    "session_details": session_details_json(&sessions),
+                    "active": active_id,
+                })),
+            })
+        }
+        Some("exists") => {
+            let Some(target) = target else {
+                return Err("/session exists requires a session id".into());
+            };
+            let value = session_exists_json(target, &session.session_id)?;
+            let exists = value
+                .get("exists")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "Session exists\n  Session          {}\n  Exists           {}",
+                    target,
+                    if exists { "yes" } else { "no" }
+                )),
+                json: Some(value),
+            })
+        }
+        Some("delete") => {
+            let Some(target) = target else {
+                return Err("/session delete requires a session id".into());
+            };
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "delete: confirmation required; rerun with /session delete {target} --force"
+                )),
+                json: Some(serde_json::json!({
+                    "kind": "error",
+                    "error": "confirmation required",
+                    "hint": format!("rerun with /session delete {target} --force"),
+                    "session_id": target,
+                })),
+            })
+        }
+        Some("delete-force") => {
+            let Some(target) = target else {
+                return Err("/session delete requires a session id".into());
+            };
+            let handle = resolve_session_reference(target)?;
+            if handle.id == session.session_id || handle.path == session_path {
+                return Err(format!(
+                    "delete: refusing to delete the active session '{}'. Resume or switch to another session first.",
+                    handle.id
+                )
+                .into());
+            }
+            delete_managed_session(&handle.path)?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "Session deleted\n  Deleted session  {}\n  File             {}",
+                    handle.id,
+                    handle.path.display(),
+                )),
+                json: Some(serde_json::json!({
+                    "kind": "session_delete",
+                    "deleted": true,
+                    "session_id": handle.id,
+                    "path": handle.path.display().to_string(),
+                })),
+            })
+        }
+        Some("switch" | "fork") => Err("unsupported resumed slash command".into()),
+        Some(other) => Err(format!("unsupported resumed /session action: {other}").into()),
+    }
 }
 
 fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -6148,7 +6307,8 @@ fn render_repl_help() -> String {
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .claw/sessions/<session-id>.jsonl".to_string(),
+        "  Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
+            .to_string(),
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
@@ -6759,34 +6919,58 @@ fn print_help_topic(
     Ok(())
 }
 
+fn acp_status_message() -> &'static str {
+    "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon, JSON-RPC endpoint, or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support."
+}
+
+fn acp_status_json() -> serde_json::Value {
+    json!({
+        "schema_version": "1.0",
+        "kind": "acp",
+        "status": "unsupported",
+        "phase": "discoverability_only",
+        "supported": false,
+        "exit_code": 0,
+        "serve_alias_only": true,
+        "message": acp_status_message(),
+        "launch_command": serde_json::Value::Null,
+        "protocol": {
+            "name": "ACP/Zed",
+            "json_rpc": false,
+            "daemon": false,
+            "endpoint": serde_json::Value::Null,
+            "serve_starts_daemon": false
+        },
+        "contracts": {
+            "blocking_gates": [
+                "task_packet_schema",
+                "session_control_schema",
+                "event_report_schema"
+            ],
+            "stable_status_surface": "claw acp [serve] --output-format json",
+            "unsupported_invocation_kind": "unsupported_acp_invocation"
+        },
+        "aliases": ["acp", "--acp", "-acp"],
+        "discoverability_tracking": "ROADMAP #64a",
+        "tracking": "ROADMAP #76 / #3033 / #3004",
+        "recommended_workflows": [
+            "claw prompt TEXT",
+            "claw",
+            "claw doctor"
+        ],
+    })
+}
+
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let message = "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
     match output_format {
         CliOutputFormat::Text => {
             println!(
-                "ACP / Zed\n  Status           discoverability only\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76\n  Message          {message}"
+                "ACP / Zed\n  Status           unsupported (discoverability only)\n  Exit code        0 for status queries; unsupported invocations exit 1\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon or JSON-RPC endpoint is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76 / #3033 / #3004\n  Message          {}",
+                acp_status_message()
             );
         }
         CliOutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "kind": "acp",
-                    "status": "discoverability_only",
-                    "supported": false,
-                    "serve_alias_only": true,
-                    "message": message,
-                    "launch_command": serde_json::Value::Null,
-                    "aliases": ["acp", "--acp", "-acp"],
-                    "discoverability_tracking": "ROADMAP #64a",
-                    "tracking": "ROADMAP #76",
-                    "recommended_workflows": [
-                        "claw prompt TEXT",
-                        "claw",
-                        "claw doctor"
-                    ],
-                }))?
-            );
+            println!("{}", serde_json::to_string_pretty(&acp_status_json())?);
         }
     }
     Ok(())
@@ -10002,7 +10186,7 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::{
-        build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
+        acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
@@ -11237,6 +11421,41 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+        assert_eq!(
+            parse_args(&[
+                "acp".to_string(),
+                "serve".to_string(),
+                "--output-format".to_string(),
+                "json".to_string()
+            ])
+            .expect("acp serve json should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        let unsupported = parse_args(&["acp".to_string(), "start".to_string()])
+            .expect_err("unknown ACP subcommand should fail with a typed contract");
+        assert!(unsupported.contains("unsupported ACP invocation"));
+    }
+
+    #[test]
+    fn acp_status_json_is_truthful_unsupported_contract() {
+        let value = acp_status_json();
+        assert_eq!(value["schema_version"], "1.0");
+        assert_eq!(value["kind"], "acp");
+        assert_eq!(value["status"], "unsupported");
+        assert_eq!(value["phase"], "discoverability_only");
+        assert_eq!(value["supported"], false);
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["serve_alias_only"], true);
+        assert_eq!(value["protocol"]["json_rpc"], false);
+        assert_eq!(value["protocol"]["daemon"], false);
+        assert_eq!(value["protocol"]["serve_starts_daemon"], false);
+        assert!(value["protocol"]["endpoint"].is_null());
+        assert_eq!(
+            value["contracts"]["unsupported_invocation_kind"],
+            "unsupported_acp_invocation"
+        );
     }
 
     #[test]
@@ -11734,6 +11953,10 @@ mod tests {
         assert_eq!(
             classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"),
             "cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("unsupported ACP invocation. Use `claw acp`."),
+            "unsupported_acp_invocation"
         );
         assert_eq!(
             classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."),
@@ -12561,7 +12784,8 @@ mod tests {
         assert!(help.contains("/export [file]"));
         // Batch 5 added `/session delete`; match on the stable core rather than
         // the trailing bracket so future additions don't re-break this.
-        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]"));
+        assert!(help
+            .contains("/session [list|exists <session-id>|switch <session-id>|fork [branch-name]"));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
@@ -12569,7 +12793,9 @@ mod tests {
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
-        assert!(help.contains("Auto-save            .claw/sessions/<session-id>.jsonl"));
+        assert!(help.contains(
+            "Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
+        ));
         assert!(help.contains("Resume latest        /resume latest"));
     }
 
@@ -12697,6 +12923,26 @@ mod tests {
         assert!(names.contains(&"help"));
         assert!(names.contains(&"status"));
         assert!(names.contains(&"compact"));
+    }
+
+    #[test]
+    fn session_exists_resume_command_reports_json_contract() {
+        let session = Session::new();
+        let path = PathBuf::from("missing-session.jsonl");
+        let outcome = run_resume_command(
+            &path,
+            &session,
+            &SlashCommand::Session {
+                action: Some("exists".to_string()),
+                target: Some("definitely-missing-session".to_string()),
+            },
+        )
+        .expect("exists command should not fail for missing sessions");
+
+        let json = outcome.json.expect("json contract");
+        assert_eq!(json["kind"], "session_exists");
+        assert_eq!(json["exists"], false);
+        assert_eq!(json["session"], "definitely-missing-session");
     }
 
     #[test]
@@ -13493,6 +13739,68 @@ UU conflicted.rs",
                 .canonicalize()
                 .expect("legacy path should exist")
         );
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn resumed_session_exists_and_delete_have_json_contracts() {
+        let _guard = cwd_guard();
+        let workspace = temp_workspace("resume-session-json-contracts");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let active = create_managed_session_handle("session-active").expect("active handle");
+        let active_session = Session::new()
+            .with_workspace_root(workspace.clone())
+            .with_persistence_path(active.path.clone());
+        active_session
+            .save_to_path(&active.path)
+            .expect("active session should save");
+        let saved = create_managed_session_handle("session-saved").expect("saved handle");
+        Session::new()
+            .with_workspace_root(workspace.clone())
+            .with_persistence_path(saved.path.clone())
+            .save_to_path(&saved.path)
+            .expect("saved session should save");
+
+        let exists_command = SlashCommand::parse("/session exists session-saved")
+            .expect("parse should succeed")
+            .expect("command should exist");
+        let exists = run_resume_command(&active.path, &active_session, &exists_command)
+            .expect("exists should run")
+            .json
+            .expect("exists should return json");
+        assert_eq!(exists["kind"], "session_exists");
+        assert_eq!(exists["session_id"], "session-saved");
+        assert_eq!(exists["exists"], true);
+        assert_eq!(exists["active"], false);
+        assert!(exists["path"].as_str().is_some());
+
+        let missing_command = SlashCommand::parse("/session exists missing-session")
+            .expect("parse should succeed")
+            .expect("command should exist");
+        let missing = run_resume_command(&active.path, &active_session, &missing_command)
+            .expect("missing exists should run")
+            .json
+            .expect("missing exists should return json");
+        assert_eq!(missing["kind"], "session_exists");
+        assert_eq!(missing["exists"], false);
+        assert_eq!(missing["session_id"], "missing-session");
+        assert!(missing["candidate_path"].as_str().is_some());
+
+        let delete_command = SlashCommand::parse("/session delete session-saved --force")
+            .expect("parse should succeed")
+            .expect("command should exist");
+        let deleted = run_resume_command(&active.path, &active_session, &delete_command)
+            .expect("delete should run")
+            .json
+            .expect("delete should return json");
+        assert_eq!(deleted["kind"], "session_delete");
+        assert_eq!(deleted["deleted"], true);
+        assert!(!saved.path.exists(), "saved session should be deleted");
 
         std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");

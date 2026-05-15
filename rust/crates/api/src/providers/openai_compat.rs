@@ -147,6 +147,12 @@ impl OpenAiCompatClient {
     }
 
     #[must_use]
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
+    }
+
+    #[must_use]
     pub fn with_retry_policy(
         mut self,
         max_retries: u32,
@@ -332,8 +338,9 @@ fn jitter_for_base(base: Duration) -> Duration {
     }
     let raw_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
     let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut mixed = raw_nanos
         .wrapping_add(tick)
@@ -468,6 +475,7 @@ impl StreamState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
         if !self.message_started {
@@ -878,7 +886,7 @@ pub fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
-/// Returns true for OpenAI-compatible DeepSeek V4 models that require prior
+/// Returns true for OpenAI-compatible `DeepSeek` V4 models that require prior
 /// assistant reasoning to be echoed back as `reasoning_content` in history.
 #[must_use]
 pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
@@ -931,7 +939,7 @@ fn wire_model_for_base_url<'a>(
     }
 
     if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
-        return Cow::Borrowed(strip_routing_prefix(model));
+        return Cow::Borrowed(&model[pos + 1..]);
     }
 
     Cow::Borrowed(model)
@@ -939,6 +947,7 @@ fn wire_model_for_base_url<'a>(
 
 /// Estimate the serialized JSON size of a request payload in bytes.
 /// This is a pre-flight check to avoid hitting provider-specific size limits.
+#[must_use]
 pub fn estimate_request_body_size(request: &MessageRequest, config: OpenAiCompatConfig) -> usize {
     estimate_request_body_size_for_base_url(request, config, &read_base_url(config))
 }
@@ -984,6 +993,7 @@ fn check_request_body_size_for_base_url(
 
 /// Builds a chat completion request payload from a `MessageRequest`.
 /// Public for benchmarking purposes.
+#[must_use]
 pub fn build_chat_completion_request(
     request: &MessageRequest,
     config: OpenAiCompatConfig,
@@ -1184,8 +1194,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     }
                     Some(msg)
                 }
-                InputContentBlock::Thinking { .. } => None,
-                InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
             })
             .collect(),
     }
@@ -2051,6 +2060,39 @@ mod tests {
         assert_eq!(payload["frequency_penalty"], 0.5);
         assert_eq!(payload["presence_penalty"], 0.3);
         assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn extra_body_params_are_passed_through_without_overriding_core_fields() {
+        let mut extra_body = BTreeMap::new();
+        extra_body.insert(
+            "web_search_options".to_string(),
+            json!({"search_context_size": "medium"}),
+        );
+        extra_body.insert("parallel_tool_calls".to_string(), json!(false));
+        extra_body.insert("model".to_string(), json!("bad-override"));
+        extra_body.insert("messages".to_string(), json!([]));
+        extra_body.insert("max_tokens".to_string(), json!(1));
+
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                extra_body,
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["model"], json!("gpt-4o"));
+        assert_eq!(payload["max_tokens"], json!(1024));
+        assert_eq!(payload["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            payload["web_search_options"],
+            json!({"search_context_size": "medium"})
+        );
+        assert_eq!(payload["parallel_tool_calls"], json!(false));
     }
 
     #[test]

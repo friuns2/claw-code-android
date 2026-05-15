@@ -5,10 +5,10 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use api::{
-    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
-    ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent,
-    ToolChoice, ToolDefinition,
+    build_http_client_with, ApiError, ContentBlockDelta, ContentBlockDeltaEvent,
+    ContentBlockStartEvent, ContentBlockStopEvent, InputContentBlock, InputMessage,
+    MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock,
+    ProviderClient, ProxyConfig, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -159,6 +159,59 @@ async fn send_message_preserves_deepseek_reasoning_content_before_text() {
             },
         ]
     );
+}
+
+#[tokio::test]
+async fn custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_slash_model\",",
+        "\"model\":\"openai/gpt-4.1-mini\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Gateway accepted slug\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let mut extra_body = std::collections::BTreeMap::new();
+    extra_body.insert(
+        "web_search_options".to_string(),
+        json!({"search_context_size": "low"}),
+    );
+    extra_body.insert("parallel_tool_calls".to_string(), json!(false));
+    extra_body.insert("model".to_string(), json!("malicious-override"));
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/gpt-4.1-mini".to_string(),
+            extra_body,
+            ..sample_request(false)
+        })
+        .await
+        .expect("gateway request should succeed");
+
+    assert_eq!(response.model, "openai/gpt-4.1-mini");
+    assert_eq!(response.total_tokens(), 5);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("openai/gpt-4.1-mini"));
+    assert_eq!(
+        body["web_search_options"],
+        json!({"search_context_size": "low"})
+    );
+    assert_eq!(body["parallel_tool_calls"], json!(false));
 }
 
 #[tokio::test]
@@ -482,14 +535,11 @@ async fn openai_compatible_client_honors_http_proxy_for_requests() {
         )],
     )
     .await;
-    let _http_proxy = ScopedEnvVar::set("HTTP_PROXY", proxy.base_url());
-    let _https_proxy = ScopedEnvVar::unset("HTTPS_PROXY");
-    let _no_proxy = ScopedEnvVar::unset("NO_PROXY");
-    let _http_proxy_lower = ScopedEnvVar::unset("http_proxy");
-    let _https_proxy_lower = ScopedEnvVar::unset("https_proxy");
-    let _no_proxy_lower = ScopedEnvVar::unset("no_proxy");
+    let proxied_http = build_http_client_with(&ProxyConfig::from_proxy_url(proxy.base_url()))
+        .expect("proxy client should build");
 
     let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_http_client(proxied_http)
         .with_base_url("http://origin.invalid/v1");
     let response = client
         .send_message(&MessageRequest {
@@ -717,12 +767,6 @@ impl ScopedEnvVar {
     fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);
-        Self { key, previous }
-    }
-
-    fn unset(key: &'static str) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::remove_var(key);
         Self { key, previous }
     }
 }
